@@ -218,8 +218,16 @@ class SaleOrder(models.Model):
                 f"Created new sale order {sale_order.name} for Square order {square_order_id}"
             )
 
-            # Fetch full order details from Square API and process order lines
-            self._fetch_and_create_order_lines(sale_order, square_order_id)
+            # Lines: webhook payload first (tests / offline), else Square API
+            if square_data.get("line_items"):
+                payment_id = self._extract_payment_id_from_square_order(square_data)
+                upd = {"square_order_data": str(square_data)}
+                if payment_id:
+                    upd["square_payment_id"] = payment_id
+                sale_order.write(upd)
+                self._create_order_lines_from_square(sale_order, square_data)
+            else:
+                self._fetch_and_create_order_lines(sale_order, square_order_id)
 
             # Add chatter message for order creation
             try:
@@ -665,12 +673,21 @@ class SaleOrder(models.Model):
         sku = None
 
         if catalog_object_id:
-            # Get the actual SKU from Square catalog using the catalog_object_id
+            product = self.env["product.product"].search(
+                [("default_code", "=", catalog_object_id)], limit=1
+            )
+            if product:
+                sku = catalog_object_id
+                _logger.info(
+                    f"Matched product by default_code == catalog_object_id '{catalog_object_id}'"
+                )
+
+        if catalog_object_id and not product:
             square_api = self.env["square.api.client"]
             catalog_result = square_api.get_catalog_object(catalog_object_id)
 
-            if catalog_result["success"] and not catalog_result["not_found"]:
-                sku = catalog_result["sku"]
+            if catalog_result["success"] and not catalog_result.get("not_found"):
+                sku = catalog_result.get("sku")
                 _logger.info(
                     f"Retrieved SKU '{sku}' for catalog object '{catalog_object_id}'"
                 )
@@ -679,15 +696,15 @@ class SaleOrder(models.Model):
                     f"Could not retrieve catalog object details for '{catalog_object_id}': {catalog_result}"
                 )
 
-        # If we have a SKU, search for the product in Odoo
-        if sku:
+        if sku and not product:
             product = self.env["product.product"].search(
                 [("default_code", "=", sku)], limit=1
             )
             _logger.info(
                 f"Product search for SKU '{sku}': {'Found' if product else 'Not found'}"
             )
-        else:
+
+        if not sku and not product:
             _logger.warning(
                 f"No SKU found for item: {item_name} (catalog_object_id: {catalog_object_id})"
             )
@@ -709,7 +726,10 @@ class SaleOrder(models.Model):
                 product = self._get_or_create_square_default_product()
                 is_placeholder_product = True
 
-        # Assume VAT tax is fetched (configure appropriately, e.g., via XML ID or search)
+        quantity = int(quantity) if quantity else 1
+        if quantity <= 0:
+            quantity = 1
+
         vat_tax = self.env["account.tax"].search(
             [
                 ("amount", "=", 20.0),
@@ -719,32 +739,32 @@ class SaleOrder(models.Model):
             ],
             limit=1,
         )
-        if not vat_tax:
-            raise ValueError("20% VAT tax not found in Odoo configuration")
 
-        # Use Decimal for precise calculations to avoid floating-point issues
-        total_dec = Decimal(str(total_amount))
-        rate_dec = Decimal("1.2")
-        tax_rate_dec = Decimal("0.2")
-
-        # Calculate exact subtotal and tax
-        subtotal_precise = total_dec / rate_dec
-        tax_calc = subtotal_precise * tax_rate_dec
-        subtotal_amount_dec = total_dec - tax_calc
-
-        quantity = int(quantity) if quantity else 1
-        if quantity <= 0:
-            quantity = 1
-
-        unit_price = subtotal_amount_dec / Decimal(quantity)
+        if vat_tax:
+            total_dec = Decimal(str(total_amount))
+            rate_dec = Decimal("1.2")
+            tax_rate_dec = Decimal("0.2")
+            subtotal_precise = total_dec / rate_dec
+            tax_calc = subtotal_precise * tax_rate_dec
+            subtotal_amount_dec = total_dec - tax_calc
+            unit_price = float(subtotal_amount_dec / Decimal(quantity))
+            tax_cmds = [(6, 0, vat_tax.ids)]
+        else:
+            base_money = line_item.get("base_price_money") or {}
+            base_cents = base_money.get("amount")
+            if base_cents is not None:
+                unit_price = (float(base_cents) / 100.0) / quantity
+            else:
+                unit_price = total_amount / quantity if quantity else total_amount
+            tax_cmds = [(6, 0, product.taxes_id.ids)] if product.taxes_id else [(5, 0, 0)]
 
         line_vals = {
             "order_id": sale_order.id,
             "product_id": product.id,
             "name": product.name,
             "product_uom_qty": quantity,
-            "price_unit": float(unit_price),
-            "tax_id": [(6, 0, vat_tax.ids)],
+            "price_unit": unit_price,
+            "tax_id": tax_cmds,
         }
 
         square_line_id = line_item.get("uid")

@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:17.4
+    environment:
+      POSTGRES_DB: ${DB_NAME:-odoo}
+      POSTGRES_USER: ${DB_USER:-odoo}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - odoo_square_test_pg:/var/lib/postgresql/data
+    networks:
+      - odoo-test-net
+
+  odoo:
+    build: .
+    depends_on:
+      - db
+    environment:
+      - HOST=${DB_HOST:-db}
+      - USER=${DB_USER:-odoo}
+      - PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - odoo_square_test_data:/var/lib/odoo
+      - ./config:/etc/odoo
+      - ./addons:/mnt/extra-addons
+    networks:
+      - odoo-test-net
+
+networks:
+  odoo-test-net:
+    driver: bridge
+
+volumes:
+  odoo_square_test_pg:
+  odoo_square_test_data:
