@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Square Integration Log Tree View -->
+    <record id="view_square_integration_log_tree" model="ir.ui.view">
+        <field name="name">square.integration.log.tree</field>
+        <field name="model">square.integration.log</field>
+        <field name="arch" type="xml">
+            <tree string="Square Integration Activity" 
+                  decoration-success="status == 'success'" 
+                  decoration-warning="status == 'warning'" 
+                  decoration-danger="status == 'error'"
+                  decoration-muted="status == 'info'">
+                <field name="create_date" string="Date/Time"/>
+                <field name="event_type" string="Event"/>
+                <field name="status" widget="badge"/>
+                <field name="title" string="Summary"/>
+                <field name="square_order_id" string="Square Order" optional="hide"/>
+                <field name="sale_order_id" string="Odoo Order" optional="hide"/>
+                <field name="processing_time" string="Time (s)" optional="hide" widget="float_time"/>
+            </tree>
+        </field>
+    </record>
+
+    <!-- Square Integration Log Form View -->
+    <record id="view_square_integration_log_form" model="ir.ui.view">
+        <field name="name">square.integration.log.form</field>
+        <field name="model">square.integration.log</field>
+        <field name="arch" type="xml">
+            <form string="Square Integration Log Entry" create="false" edit="false">
+                <header>
+                    <field name="status" widget="statusbar" statusbar_visible="info,success,warning,error"/>
+                </header>
+                <sheet>
+                    <div class="oe_title">
+                        <h1>
+                            <field name="title" readonly="1"/>
+                        </h1>
+                        <h2>
+                            <field name="event_type" readonly="1"/>
+                        </h2>
+                    </div>
+                    
+                    <group>
+                        <group string="Event Information">
+                            <field name="create_date" string="Timestamp"/>
+                            <field name="webhook_event_id" string="Webhook Event ID"/>
+                            <field name="processing_time" string="Processing Time (seconds)" widget="float_time"/>
+                        </group>
+                        <group string="Related Records">
+                            <field name="square_order_id"/>
+                            <field name="square_refund_id"/>
+                            <field name="sale_order_id"/>
+                        </group>
+                    </group>
+                    
+                    <notebook>
+                        <page string="Description" name="description">
+                            <field name="description" widget="html" readonly="1"/>
+                        </page>
+                        <page string="Technical Details" name="technical" invisible="not technical_details">
+                            <field name="technical_details" readonly="1"/>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <!-- Square Integration Log Search View -->
+    <record id="view_square_integration_log_search" model="ir.ui.view">
+        <field name="name">square.integration.log.search</field>
+        <field name="model">square.integration.log</field>
+        <field name="arch" type="xml">
+            <search string="Square Integration Logs">
+                <field name="title" string="Summary" filter_domain="[('title', 'ilike', self)]"/>
+                <field name="square_order_id" string="Square Order" filter_domain="[('square_order_id', 'ilike', self)]"/>
+                <field name="sale_order_id" string="Sale Order"/>
+                
+                <separator/>
+                <filter name="filter_success" string="Success" domain="[('status', '=', 'success')]"/>
+                <filter name="filter_error" string="Errors" domain="[('status', '=', 'error')]"/>
+                <filter name="filter_warning" string="Warnings" domain="[('status', '=', 'warning')]"/>
+                
+                <separator/>
+                <filter name="filter_today" string="Today" domain="[('create_date', '&gt;=', datetime.datetime.combine(context_today(), datetime.time(0,0,0)))]"/>
+                <filter name="filter_week" string="This Week" domain="[('create_date', '&gt;=', (context_today() - datetime.timedelta(days=7)).strftime('%Y-%m-%d'))]"/>
+                
+                <separator/>
+                <filter name="filter_orders" string="Orders" domain="[('event_type', 'in', ['order_created', 'order_updated'])]"/>
+                <filter name="filter_refunds" string="Refunds" domain="[('event_type', '=', 'refund_processed')]"/>
+                <filter name="filter_exchanges" string="Exchanges" domain="[('event_type', '=', 'exchange_processed')]"/>
+                <filter name="filter_webhooks" string="Webhooks" domain="[('event_type', '=', 'webhook_received')]"/>
+                
+                <group expand="0" string="Group By">
+                    <filter name="group_event_type" string="Event Type" context="{'group_by': 'event_type'}"/>
+                    <filter name="group_status" string="Status" context="{'group_by': 'status'}"/>
+                    <filter name="group_date" string="Date" context="{'group_by': 'create_date:day'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <!-- Square Integration Dashboard (Kanban View) -->
+    <record id="view_square_integration_log_kanban" model="ir.ui.view">
+        <field name="name">square.integration.log.kanban</field>
+        <field name="model">square.integration.log</field>
+        <field name="arch" type="xml">
+            <kanban class="o_kanban_mobile">
+                <field name="event_type"/>
+                <field name="status"/>
+                <field name="title"/>
+                <field name="create_date"/>
+                <field name="square_order_id"/>
+                <field name="sale_order_id"/>
+                
+                <templates>
+                    <t t-name="kanban-box">
+                        <div class="oe_kanban_card oe_kanban_global_click">
+                            <div class="o_kanban_record_top">
+                                <div class="o_kanban_record_headings">
+                                    <strong class="o_kanban_record_title">
+                                        <t t-esc="record.title.value"/>
+                                    </strong>
+                                    <div class="o_kanban_record_subtitle">
+                                        <t t-esc="record.event_type.value.replace('_', ' ')"/>
+                                    </div>
+                                </div>
+                                <div class="o_kanban_record_top_right">
+                                    <span t-att-class="'badge ' + (record.status.raw_value == 'success' ? 'badge-success' : record.status.raw_value == 'error' ? 'badge-danger' : record.status.raw_value == 'warning' ? 'badge-warning' : 'badge-info')">
+                                        <t t-esc="record.status.value"/>
+                                    </span>
+                                </div>
+                            </div>
+                            <div class="o_kanban_record_body">
+                                <div class="o_kanban_tags_section">
+                                    <span t-if="record.square_order_id.value" class="badge badge-pill badge-light">
+                                        Square: <t t-esc="record.square_order_id.value"/>
+                                    </span>
+                                    <span t-if="record.sale_order_id.value" class="badge badge-pill badge-secondary">
+                                        <t t-esc="record.sale_order_id.value"/>
+                                    </span>
+                                </div>
+                            </div>
+                            <div class="o_kanban_record_bottom">
+                                <div class="oe_kanban_bottom_left">
+                                    <time t-esc="record.create_date.value" class="text-muted"/>
+                                </div>
+                            </div>
+                        </div>
+                    </t>
+                </templates>
+            </kanban>
+        </field>
+    </record>
+
+    <!-- Square Integration Log Action -->
+    <record id="action_square_integration_log" model="ir.actions.act_window">
+        <field name="name">Activité de l'Intégration Square</field>
+        <field name="res_model">square.integration.log</field>
+        <field name="view_mode">tree,form</field>
+        <field name="context">{
+            'search_default_filter_today': 1,
+        }</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">
+                No Square integration activity at this time !
+            </p>
+            <p>
+                This dashboard displays all Square integration activity including :
+                <ul>
+                    <li>Order creation from Square</li>
+                    <li>Refund processing</li>
+                    <li>Exchange management</li>
+                    <li>Webhook events</li>
+                    <li>Stock synchronization</li>
+                    <li>Integration errors</li>
+                </ul>
+            </p>
+        </field>
+    </record>
+
+    <!-- Add to Square Menu -->
+    <menuitem id="menu_square_logs"
+              name="Activity"
+              parent="menu_square_main"
+              action="action_square_integration_log"
+              sequence="30"/>
+</odoo>

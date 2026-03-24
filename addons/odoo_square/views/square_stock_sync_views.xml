@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Square Stock Sync Form View -->
+    <record id="view_square_stock_sync_form" model="ir.ui.view">
+        <field name="name">square.stock.sync.form</field>
+        <field name="model">square.stock.sync</field>
+        <field name="arch" type="xml">
+            <form string="Square Stock Synchronization">
+                <header>
+                    <button name="manual_sync_all_products" type="object" string="Synchronize All Products"
+                            class="btn-primary" confirm="This will synchronize all products to Square. Continue?"/>
+                </header>
+                <sheet>
+                    <div class="oe_title">
+                        <h1>
+                            <field name="name"/>
+                        </h1>
+                    </div>
+
+                    <group>
+                        <group string="Configuration">
+                            <field name="auto_sync_enabled"/>
+                        </group>
+                        <group string="Statistics">
+                            <field name="last_sync_date"/>
+                            <field name="total_syncs"/>
+                            <field name="successful_syncs"/>
+                            <field name="failed_syncs"/>
+                        </group>
+                    </group>
+
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <!-- Square Stock Sync Tree View -->
+    <record id="view_square_stock_sync_tree" model="ir.ui.view">
+        <field name="name">square.stock.sync.tree</field>
+        <field name="model">square.stock.sync</field>
+        <field name="arch" type="xml">
+            <tree string="Square Stock Synchronization">
+                <field name="name"/>
+                <field name="auto_sync_enabled"/>
+                <field name="last_sync_date"/>
+                <field name="total_syncs"/>
+                <field name="successful_syncs"/>
+                <field name="failed_syncs"/>
+            </tree>
+        </field>
+    </record>
+
+    <!-- Square Stock Sync Action -->
+    <record id="action_square_stock_sync" model="ir.actions.act_window">
+        <field name="name">Actions</field>
+        <field name="type">ir.actions.act_window</field>
+        <field name="res_model">square.stock.sync</field>
+        <field name="view_mode">tree,form</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">
+                Square Actions
+            </p>
+        </field>
+    </record>
+
+    <!-- Add to Square Menu -->
+    <menuitem id="menu_square_actions"
+              name="Actions"
+              parent="menu_square_main"
+              action="action_square_stock_sync"
+              sequence="20"/>
+
+</odoo>

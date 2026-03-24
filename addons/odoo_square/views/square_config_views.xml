@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <!-- Square Configuration Form View -->
+        <record id="view_square_config_form" model="ir.ui.view">
+            <field name="name">square.config.form</field>
+            <field name="model">square.config</field>
+            <field name="arch" type="xml">
+                <form string="Square Configuration">
+                    <header>
+                        <button name="test_square_connection"
+                                string="Test Connection"
+                                type="object"
+                                class="oe_highlight"
+                                invisible="not square_application_id or not square_access_token"/>
+                        <button name="sync_square_locations"
+                                string="Synchronize Locations"
+                                type="object"
+                                class="btn-secondary"
+                                invisible="not square_application_id or not square_access_token or connection_status != 'connected'"/>
+                    </header>
+                    <sheet>
+                        <group>
+                            <group>
+                                <field name="square_environment"/>
+                                <field name="square_application_id"/>
+                                <field name="square_access_token" password="True"/>
+                                <field name="square_webhook_signature_key" password="True"/>
+                                <field name="location_mapping_ids">
+                                    <tree string="Square Location Mappings" editable="bottom">
+                                        <field name="square_location_name" readonly="1"/>
+                                        <field name="square_location_id" readonly="1"/>
+                                        <field name="warehouse_id" required="1"/>
+                                    </tree>
+                                </field>
+                                <field name="payment_journal_id" options="{'no_create_edit': False, 'no_open': False}"/>
+                            </group>
+                            <group>
+                                <field name="connection_status"/>
+                            </group>
+                        </group>
+                    </sheet>
+                </form>
+            </field>
+        </record>
+
+        <!-- Square Configuration Tree View -->
+        <record id="view_square_config_tree" model="ir.ui.view">
+            <field name="name">square.config.tree</field>
+            <field name="model">square.config</field>
+            <field name="arch" type="xml">
+                <tree>
+                    <field name="square_environment"/>
+                    <field name="payment_journal_id"/>
+                    <field name="connection_status"/>
+                </tree>
+            </field>
+        </record>
+
+        <!-- Square Configuration Action -->
+        <record id="action_square_config" model="ir.actions.act_window">
+            <field name="name">Configuration</field>
+            <field name="type">ir.actions.act_window</field>
+            <field name="res_model">square.config</field>
+            <field name="view_mode">tree,form</field>
+        </record>
+
+        <!-- Menu Items -->
+        <menuitem id="menu_square_main"
+                  name="Square"
+                  sequence="10"/>
+
+        <menuitem id="menu_square_config"
+                  name="Configuration"
+                  parent="menu_square_main"
+                  action="action_square_config"
+                  sequence="10"/>
+
+    </data>
+</odoo>

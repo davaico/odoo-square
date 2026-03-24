@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:17.4
+    environment:
+      POSTGRES_DB: ${DB_NAME:-odoo}
+      POSTGRES_USER: ${DB_USER:-odoo}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - odoo_db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - odoo-network
+
+  odoo:
+    build: .
+    depends_on:
+      - db
+    restart: unless-stopped
+    environment:
+      - HOST=${DB_HOST:-db}
+      - USER=${DB_USER:-odoo}
+      - PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required}
+    volumes:
+      - odoo_data:/var/lib/odoo
+      - ./config:/etc/odoo
+      - ./addons:/mnt/extra-addons
+      - ./logs:/var/log/odoo
+    ports:
+      - "8069:8069"
+    command:
+      - odoo
+      - --addons-path=/mnt/extra-addons,/usr/lib/python3/dist-packages/odoo/addons
+      - --database=${DB_NAME:-odoo}
+      - --db_host=${DB_HOST:-db}
+      - --db_port=5432
+      - --db_user=${DB_USER:-odoo}
+      - --db_password=${DB_PASSWORD:?DB_PASSWORD is required}
+      - --data-dir=/var/lib/odoo
+      - --logfile=/var/log/odoo/odoo.log
+    networks:
+      - odoo-network
+  
+networks:
+  odoo-network:
+    name: odoo-network
+    driver: bridge
+
+volumes:
+  odoo_db_data:
+  odoo_data:

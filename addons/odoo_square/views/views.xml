@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <!-- Square Integration Root Menu -->
+        <menuitem id="menu_square_root"
+                  name="Square"
+                  web_icon="odoo_square,static/description/icon.png"
+                  sequence="100"
+                  groups="base.group_user"/>
+
+    </data>
+</odoo>
