@@ -159,6 +159,72 @@ class SaleOrder(models.Model):
         # Fallback to default warehouse
         return self._get_configured_warehouse()
 
+    def _sales_team_matches_company(self, team, company):
+        if not team or not team.exists():
+            return False
+        if not company:
+            return True
+        if not team.company_id:
+            return True
+        return team.company_id.id == company.id
+
+    @api.model
+    def _normalize_square_metadata(self, raw):
+        if not raw:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, list):
+            out = {}
+            for item in raw:
+                if isinstance(item, dict) and item.get("key") is not None:
+                    out[item["key"]] = item.get("value")
+            return out
+        return {}
+
+    @api.model
+    def _resolve_sales_team_from_square_metadata(self, square_data, company):
+        """Use metadata key odoo_sales_team_id (numeric crm.team id) if present."""
+        Team = self.env["crm.team"]
+        if not isinstance(square_data, dict):
+            return Team.browse()
+        meta = self._normalize_square_metadata(square_data.get("metadata"))
+        raw = meta.get("odoo_sales_team_id")
+        if raw is None or raw == "":
+            return Team.browse()
+        try:
+            tid = int(str(raw).strip())
+        except (ValueError, TypeError):
+            _logger.warning("Invalid odoo_sales_team_id in Square metadata: %s", raw)
+            return Team.browse()
+        team = Team.browse(tid)
+        if team.exists() and self._sales_team_matches_company(team, company):
+            _logger.info("Using Sales Team %s from Square metadata", team.name)
+            return team
+        return Team.browse()
+
+    @api.model
+    def _get_sales_team_for_square_location(self, square_location_id, company):
+        config = self.env["square.config"].search([], limit=1)
+        if config:
+            return config.get_sales_team_for_location(
+                square_location_id, company=company
+            )
+        return self.env["crm.team"].browse()
+
+    def _apply_square_sales_team_override_from_full_order(self, sale_order, full_order_data):
+        team = sale_order._resolve_sales_team_from_square_metadata(
+            full_order_data, sale_order.company_id
+        )
+        if team:
+            sale_order.write({"team_id": team.id})
+
+    def _prepare_invoice(self):
+        vals = super()._prepare_invoice()
+        if self.team_id:
+            vals["team_id"] = self.team_id.id
+        return vals
+
     @api.model
     def create_from_square(self, square_data):
         """
@@ -200,6 +266,17 @@ class SaleOrder(models.Model):
                     "Please configure a mapping d'entrepôt dans les paramètres Square."
                 )
 
+            meta_team = self._resolve_sales_team_from_square_metadata(
+                square_data, company
+            )
+            map_team = (
+                meta_team
+                if meta_team
+                else self._get_sales_team_for_square_location(
+                    square_location_id, company
+                )
+            )
+
             # Create sale order
             order_vals = {
                 "partner_id": customer.id,
@@ -211,6 +288,8 @@ class SaleOrder(models.Model):
                 "currency_id": company.currency_id.id,
                 "warehouse_id": warehouse.id,
             }
+            if map_team:
+                order_vals["team_id"] = map_team.id
 
             # Create the sale order - any duplicate constraint errors will be handled at processor level
             sale_order = self.create(order_vals)
@@ -572,6 +651,10 @@ class SaleOrder(models.Model):
 
             # Create order lines from full Square data
             self._create_order_lines_from_square(sale_order, full_order_data)
+
+            self._apply_square_sales_team_override_from_full_order(
+                sale_order, full_order_data
+            )
 
         except Exception as e:
             _logger.error(

@@ -26,11 +26,15 @@
                                 <field name="square_application_id"/>
                                 <field name="square_access_token" password="True"/>
                                 <field name="square_webhook_signature_key" password="True"/>
+                                <field name="default_sales_team_id"
+                                       options="{'no_create_edit': True}"/>
                                 <field name="location_mapping_ids">
                                     <tree string="Square Location Mappings" editable="bottom">
-                                        <field name="square_location_name" readonly="1"/>
-                                        <field name="square_location_id" readonly="1"/>
+                                        <field name="square_location_id"/>
+                                        <field name="square_location_name"/>
                                         <field name="warehouse_id" required="1"/>
+                                        <field name="sales_team_id" optional="show"
+                                               options="{'no_create_edit': True}"/>
                                     </tree>
                                 </field>
                                 <field name="payment_journal_id" options="{'no_create_edit': False, 'no_open': False}"/>

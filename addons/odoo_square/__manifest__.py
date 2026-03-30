@@ -3,7 +3,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 {
     "name": "Odoo Square Integration",
-    "version": "17.0.1.0.0",
+    "version": "17.0.1.1.0",
     "category": "Sales",
     "summary": "Complete Odoo-Square integration for orders, refunds, exchanges and inventory sync",
     "description": """
@@ -20,7 +20,7 @@ Features:
     """,
     "author": "Davai",
     "website": "https://github.com/davai/odoo-square",
-    "depends": ["base", "web", "sale", "account", "stock", "payment"],
+    "depends": ["base", "web", "sale", "sales_team", "account", "stock", "payment"],
     "external_dependencies": {
         "python": ["requests"],
     },

@@ -46,7 +46,14 @@ class SquareConfig(models.Model):
         "square.location.mapping",
         "config_id",
         string="Square Location Mappings",
-        help="Map each Square location to an Odoo warehouse",
+        help="Map each Square location to an Odoo warehouse and optional Sales Team",
+    )
+
+    default_sales_team_id = fields.Many2one(
+        "crm.team",
+        string="Default Sales Team",
+        help="Used when a location mapping has no Sales Team, or for unknown locations "
+        "(same fallback order as warehouse).",
     )
 
     # Payment Journal Configuration
@@ -105,6 +112,61 @@ class SquareConfig(models.Model):
             return warehouse
         return None
 
+    def _sales_team_matches_company(self, team, company):
+        if not team:
+            return False
+        if not company:
+            return True
+        if not team.company_id:
+            return True
+        return team.company_id.id == company.id
+
+    def get_sales_team_for_location(self, square_location_id, company=None):
+        """Sales Team for a Square location: mapping → first mapping → default."""
+        self.ensure_one()
+        company = company or self.env.company
+
+        def pick(team):
+            return team if self._sales_team_matches_company(team, company) else False
+
+        mapping = self.location_mapping_ids.filtered(
+            lambda m: m.square_location_id == square_location_id
+        )[:1]
+
+        if mapping and mapping.sales_team_id:
+            team = pick(mapping.sales_team_id)
+            if team:
+                _logger.info(
+                    "Square: sales team '%s' for location '%s'",
+                    team.name,
+                    square_location_id,
+                )
+                return team
+
+        if self.location_mapping_ids:
+            first = self.location_mapping_ids[0]
+            if first.sales_team_id:
+                team = pick(first.sales_team_id)
+                if team:
+                    _logger.warning(
+                        "Square: no team for location '%s'; using first mapping team '%s'",
+                        square_location_id,
+                        team.name,
+                    )
+                    return team
+
+        if self.default_sales_team_id:
+            team = pick(self.default_sales_team_id)
+            if team:
+                _logger.warning(
+                    "Square: using default sales team '%s' for location '%s'",
+                    team.name,
+                    square_location_id,
+                )
+                return team
+
+        return self.env["crm.team"].browse()
+
     def get_configured_warehouse(self):
         """Get the configured warehouse for Square operations (legacy method)"""
         self.ensure_one()
@@ -160,7 +222,6 @@ class SquareConfig(models.Model):
         self.ensure_one()
 
         try:
-            # Use the Square API client to test connection
             square_api = self.env["square.api.client"]
             result = square_api.test_connection()
 
