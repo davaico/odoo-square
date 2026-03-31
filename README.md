@@ -42,7 +42,7 @@ A complete Odoo module for integrating with Square POS, featuring webhook proces
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/davai/odoo-square.git
+git clone https://github.com/davaico/odoo-square.git
 cd odoo-square
 ```
 
@@ -97,7 +97,7 @@ Default credentials (change in production):
 
 ```bash
 # Clone the repo
-git clone https://github.com/davai/odoo-square.git
+git clone https://github.com/davaico/odoo-square.git
 cd odoo-square
 
 # Copy environment file
@@ -237,10 +237,9 @@ This project is licensed under the **GNU Affero General Public License v3.0** - 
 
 ## Support
 
-- **Issues**: https://github.com/davai/odoo-square/issues
-- **Documentation**: https://github.com/davai/odoo-square/wiki
+- **Issues**: https://github.com/davaico/odoo-square/issues
+- **Documentation** (To Complete): https://github.com/davaico/odoo-square/wiki
 
 ## Authors
 
 - **Davai** - https://davai.co
-
