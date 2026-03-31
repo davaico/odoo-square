@@ -19,7 +19,7 @@ Features:
 - Support for full refunds, equivalent exchanges, and price-difference exchanges
     """,
     "author": "Davai",
-    "website": "https://github.com/davai/odoo-square",
+    "website": "https://github.com/davaico/odoo-square",
     "depends": ["base", "web", "sale", "sales_team", "account", "stock", "payment"],
     "external_dependencies": {
         "python": ["requests"],
