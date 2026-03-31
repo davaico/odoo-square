@@ -34,7 +34,7 @@ class StockPicking(models.Model):
         """
         force_validate = self.env.context.get("force_validate", False)
 
-        if force_validate and self.picking_type_code == "outgoing":
+        if force_validate and self.picking_type_code in ("outgoing", "incoming"):
             self._force_quantity_for_square()
 
         return super().button_validate()
