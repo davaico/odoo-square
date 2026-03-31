@@ -246,8 +246,16 @@ class SquareOrderProcessor(models.Model):
                 self._process_order_completion(sale_order, square_order_data)
 
             elif square_order_state in ["OPEN", "DRAFT"]:
-                # Check for line changes and sync them
-                self._sync_order_line_changes(sale_order, square_order_data)
+                # Skip line sync when the payload carries return/exchange data;
+                # these must go through the dedicated refund/exchange flows only.
+                returns = square_order_data.get("returns") or square_order_data.get("return_line_items")
+                if returns:
+                    _logger.info(
+                        f"Order {square_order_id} contains return data in OPEN/DRAFT state, "
+                        f"skipping line sync (will be handled by refund/exchange flow)"
+                    )
+                else:
+                    self._sync_order_line_changes(sale_order, square_order_data)
 
             elif square_order_state in ("CANCELED", "CANCELLED"):
                 # Handle order cancellation (Square uses both spellings)
@@ -381,6 +389,13 @@ class SquareOrderProcessor(models.Model):
             quantity = int(square_line.get("quantity", "1"))
             price_data = square_line.get("total_money", {})
             amount = round(float(price_data.get("amount", 0)) / 100.0, 2)
+
+            if quantity <= 0:
+                _logger.info(
+                    f"Skipping line {square_line.get('name', 'Unknown')} with non-positive "
+                    f"quantity {quantity} (return/exchange line)"
+                )
+                continue
 
             if square_line_id in odoo_lines:
                 # Update existing line
