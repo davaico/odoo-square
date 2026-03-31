@@ -45,6 +45,13 @@ class SquareLocationMapping(models.Model):
         help="The Odoo warehouse to map to this Square location",
     )
 
+    sales_team_id = fields.Many2one(
+        "crm.team",
+        string="Sales Team",
+        help="Sales Team for orders and invoices from this Square location. "
+        "Leave empty to use the default on Square configuration.",
+    )
+
     active = fields.Boolean(default=True)
 
     _sql_constraints = [
