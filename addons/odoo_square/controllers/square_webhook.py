@@ -240,9 +240,14 @@ class SquareWebhookController(http.Controller):
     def _process_order(self, order_data, event_type, event_id=None):
         """Process Square order with event-level deduplication"""
 
+        if order_data:
+            order_data = dict(order_data)
+            if order_data.get("id") and not order_data.get("order_id"):
+                order_data["order_id"] = order_data["id"]
+
         # 1. Extract event and order IDs
         # Event ID comes from the webhook root level, passed as parameter
-        order_id = order_data.get("order_id")
+        order_id = order_data.get("order_id") if order_data else None
 
         # 2. Deduplication check based on order_id + state combination
         order_state = order_data.get("state")
@@ -331,6 +336,10 @@ class SquareWebhookController(http.Controller):
                             result = square_processor.process_square_order_update(
                                 order_data, existing_order
                             )
+                        elif order_state == "COMPLETED":
+                            # Square may send order.updated(COMPLETED) before order.created in tests
+                            # or without a prior Odoo record — create + complete from payload.
+                            result = square_processor.process_square_order(order_data)
                         else:
                             # Order doesn't exist yet - queue this update event for retry
                             _logger.info(
@@ -622,8 +631,12 @@ class SquareWebhookController(http.Controller):
 
         return False
 
-    def _process_refund(self, refund_data, event_type, webhook_event_id=None):
-        """Process refund data from webhook using the new refund model"""
+    def _process_refund(self, refund_data, event_type, webhook_event_id=None, env=None):
+        """Process refund data from webhook using the new refund model.
+
+        ``env`` allows unit tests to call this without a bound HTTP ``request``.
+        """
+        req_env = env if env is not None else request.env
         try:
             if not refund_data:
                 _logger.warning(f"No refund data in {event_type} webhook")
@@ -646,7 +659,7 @@ class SquareWebhookController(http.Controller):
             # First check by webhook event ID (most specific)
             if webhook_event_id:
                 existing_log = (
-                    request.env["square.integration.log"]
+                    req_env["square.integration.log"]
                     .sudo()
                     .search(
                         [
@@ -670,7 +683,7 @@ class SquareWebhookController(http.Controller):
             # Second check: look for existing refund record by Square refund ID
             # This handles the case where Square sends multiple webhooks for the same refund
             existing_refund = (
-                request.env["square.refund"]
+                req_env["square.refund"]
                 .sudo()
                 .search([("square_refund_id", "=", refund_id)], limit=1)
             )
@@ -707,7 +720,7 @@ class SquareWebhookController(http.Controller):
 
             # Strategy 1: Search by order_id (most common case)
             sale_order = (
-                request.env["sale.order"]
+                req_env["sale.order"]
                 .sudo()
                 .search([("square_order_id", "=", order_id)], limit=1)
             )
@@ -716,7 +729,7 @@ class SquareWebhookController(http.Controller):
             if not sale_order and refund_data.get("payment_id"):
                 payment_id = refund_data.get("payment_id")
                 sale_order = (
-                    request.env["sale.order"]
+                    req_env["sale.order"]
                     .sudo()
                     .search([("square_payment_id", "=", payment_id)], limit=1)
                 )
@@ -729,13 +742,15 @@ class SquareWebhookController(http.Controller):
             # Strategy 3: If still not found, try to fetch refund details from Square API
             if not sale_order:
                 try:
-                    refund_details = self._fetch_refund_details_from_square(refund_id)
+                    refund_details = self._fetch_refund_details_from_square(
+                        refund_id, env=req_env
+                    )
                     if refund_details:
                         # Try to find order by payment_id from refund details
                         payment_id = refund_details.get("payment_id")
                         if payment_id:
                             sale_order = (
-                                request.env["sale.order"]
+                                req_env["sale.order"]
                                 .sudo()
                                 .search(
                                     [("square_payment_id", "=", payment_id)], limit=1
@@ -752,7 +767,7 @@ class SquareWebhookController(http.Controller):
                             api_order_id = refund_details.get("order_id")
                             if api_order_id and api_order_id != order_id:
                                 sale_order = (
-                                    request.env["sale.order"]
+                                    req_env["sale.order"]
                                     .sudo()
                                     .search(
                                         [("square_order_id", "=", api_order_id)],
@@ -778,7 +793,7 @@ class SquareWebhookController(http.Controller):
                 )
 
                 # Create a log entry for tracking purposes
-                request.env["square.integration.log"].sudo().create(
+                req_env["square.integration.log"].sudo().create(
                     {
                         "event_type": "refund_created",
                         "status": "error",
@@ -817,12 +832,12 @@ class SquareWebhookController(http.Controller):
                 # Get bot user for operations to ensure proper tracking messages
                 bot_user = None
                 try:
-                    bot_user = request.env.ref("odoo_square.user_square_bot")
+                    bot_user = req_env.ref("odoo_square.user_square_bot")
                 except ValueError:
-                    bot_user = request.env.ref("base.user_admin")
-                
+                    bot_user = req_env.ref("base.user_admin")
+
                 refund_record = (
-                    request.env["square.refund"]
+                    req_env["square.refund"]
                     .sudo()
                     .with_user(bot_user)
                     .create_from_square_data(refund_data, sale_order)
@@ -838,11 +853,12 @@ class SquareWebhookController(http.Controller):
             if webhook_event_id:
                 refund_record.webhook_event_id = webhook_event_id
 
-            # Update refund record status based on webhook
-            refund_record.status = refund_status.lower()
+            rs = (refund_status or "PENDING").strip()
+            rs_upper = rs.upper()
+            refund_record.status = rs.lower()
 
             # Process the refund based on status
-            if refund_status.upper() == "PENDING":
+            if rs_upper == "PENDING":
                 # Create pending refund actions but don't complete them yet
                 if (
                     not refund_record.return_picking_ids
@@ -854,7 +870,7 @@ class SquareWebhookController(http.Controller):
                 else:
                     result_message = "Actions de remboursement déjà préparées (en attente de confirmation Square)"
 
-            elif refund_status.upper() == "COMPLETED":
+            elif rs_upper == "COMPLETED":
                 # Check if refund has already been fully processed
                 if (
                     refund_record.return_picking_ids
@@ -866,16 +882,21 @@ class SquareWebhookController(http.Controller):
                     )
                     result_message = "Refund already processed successfully"
                 else:
-                    # Process completed refund
+                    # COMPLETED webhooks may arrive before pending actions exist; prepare
+                    # credit note and return picking first, then finalize.
+                    if not refund_record.credit_note_id or not refund_record.return_picking_ids:
+                        refund_record.write({"status": "pending"})
+                        refund_record._create_pending_refund_actions()
+                        refund_record.write({"status": "completed"})
                     refund_record.action_process_refund()
                     result_message = "Refund processed successfully"
 
-            elif refund_status.upper() == "FAILED":
+            elif rs_upper == "FAILED":
                 # Handle failed refund
                 refund_record._handle_failed_refund()
                 result_message = "Failed refund processed"
 
-            elif refund_status.upper() == "CANCELLED":
+            elif rs_upper in ("CANCELLED", "CANCELED"):
                 # Handle cancelled refund
                 refund_record._handle_cancelled_refund()
                 result_message = "Cancelled refund processed"
@@ -885,7 +906,7 @@ class SquareWebhookController(http.Controller):
                 result_message = f"Statut de remboursement inconnu: {refund_status}"
 
             # Log webhook processing
-            request.env["square.integration.log"].sudo().log_square_event(
+            req_env["square.integration.log"].sudo().log_square_event(
                 event_type=f"refund_{event_type}",
                 title=f"Remboursement {event_type} traité pour la commande {sale_order.name}",
                 description=f"""
@@ -893,7 +914,7 @@ class SquareWebhookController(http.Controller):
                     <ul>
                         <li>Odoo Order: <strong>{sale_order.name}</strong></li>
                         <li>ID Square Refund : <code>{refund_id}</code></li>
-                        <li>Statut : {refund_status}</li>
+                        <li>Statut : {rs}</li>
                         <li>Montant : {refund_record.refund_amount} {refund_record.currency_id.name}</li>
                         <li>Type : {'Partiel' if refund_record._is_partial_refund() else 'Complet'}</li>
                         <li>Action : {result_message}</li>
@@ -919,7 +940,7 @@ class SquareWebhookController(http.Controller):
 
             # Log error
             try:
-                request.env["square.integration.log"].sudo().log_error(
+                req_env["square.integration.log"].sudo().log_error(
                     title=f"Refund {event_type} Processing Error",
                     error_message=str(e),
                     square_order_id=(
@@ -932,14 +953,14 @@ class SquareWebhookController(http.Controller):
 
             return {"status": "error", "message": str(e)}
 
-    def _fetch_refund_details_from_square(self, refund_id):
+    def _fetch_refund_details_from_square(self, refund_id, env=None):
         """
         Fetch detailed refund information from Square API
         This helps us find the correct order when webhook data is incomplete
         """
         try:
-            # Use the existing Square API client
-            square_api = self.env["square.api.client"]
+            req_env = env if env is not None else request.env
+            square_api = req_env["square.api.client"]
 
             # Try to get payment details first (refunds are associated with payments)
             payment_data = square_api.get_payment(refund_id)

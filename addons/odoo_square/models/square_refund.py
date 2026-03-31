@@ -110,6 +110,15 @@ class SquareRefund(models.Model):
                 record.display_name = f"Refund - {record.status.title()}"
 
     @api.model
+    def _get_eur_currency(self):
+        cur = self.env.ref("base.EUR", raise_if_not_found=False)
+        if not cur or not cur.exists():
+            cur = self.env["res.currency"].with_context(active_test=False).search(
+                [("name", "=", "EUR")], limit=1
+            )
+        return cur
+
+    @api.model
     def _check_existing_refund(self, square_refund_id):
         """
         Check if a refund with the given Square refund ID already exists.
@@ -164,8 +173,7 @@ class SquareRefund(models.Model):
         amount_money = refund_data.get("amount_money", {})
         refund_amount = float(amount_money.get("amount", 0)) / 100.0
 
-        # Get EUR currency
-        currency = self.env["res.currency"].search([("name", "=", "EUR")], limit=1)
+        currency = self._get_eur_currency()
         if not currency:
             raise ValidationError("EUR currency not found in the system")
 
@@ -241,10 +249,8 @@ class SquareRefund(models.Model):
                 f"Unsupported currency '{currency_code}'. This system only supports EUR refunds."
             )
 
-        # Get EUR currency
-        currency = self.env["res.currency"].search([("name", "=", "EUR")], limit=1)
+        currency = self._get_eur_currency()
 
-        # EUR should always exist in a properly configured Odoo instance
         if not currency:
             raise ValidationError(
                 "EUR currency not found in the system. Please ensure EUR is properly configured."
@@ -476,8 +482,9 @@ class SquareRefund(models.Model):
                                 mail_create_nosubscribe=True,
                             ).button_validate()
 
-                # Update sale order quantities to reflect the refund
-                self._update_sale_order_quantities_after_refund()
+                # Quantities are already updated when the credit note is created
+                # (_update_order_line_quantities_from_square / proportional paths).
+                # Running _update_sale_order_quantities_after_refund again double-counts.
 
                 # Update refund status
                 self.processed_at = fields.Datetime.now()

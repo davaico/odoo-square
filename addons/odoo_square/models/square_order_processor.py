@@ -77,6 +77,10 @@ class SquareOrderProcessor(models.Model):
         Main entry point for processing Square order data from webhooks
         Creates new orders only, keeps them in draft state
         """
+        square_order_data = dict(square_order_data or {})
+        if square_order_data.get("id") and not square_order_data.get("order_id"):
+            square_order_data["order_id"] = square_order_data["id"]
+
         square_order_id = square_order_data.get("order_id")
         _logger.info(f"Processing Square order: {square_order_id}")
 
@@ -137,11 +141,11 @@ class SquareOrderProcessor(models.Model):
                 "message": "Order already exists (idempotent response)",
             }
 
-        # Create new order in draft state (only for OPEN orders)
+        # Create new order for OPEN (draft) or COMPLETED (create + complete flow)
         square_order_state = square_order_data.get("state")
-        if square_order_state != "OPEN":
+        if square_order_state not in ("OPEN", "COMPLETED"):
             _logger.info(
-                f"Skipping order creation for non-OPEN state: {square_order_state}"
+                f"Skipping order creation for state: {square_order_state}"
             )
             return {
                 "status": "success",
@@ -164,6 +168,9 @@ class SquareOrderProcessor(models.Model):
             _logger.info(
                 f"Successfully created draft order {sale_order.name} from Square order {square_order_id}"
             )
+
+            if square_order_state == "COMPLETED":
+                self.process_square_order_update(square_order_data, sale_order)
 
             return {
                 "status": "success",
@@ -211,6 +218,10 @@ class SquareOrderProcessor(models.Model):
         Process updates to existing Square orders
         Only create invoice and stock moves when order state is COMPLETED
         """
+        square_order_data = dict(square_order_data or {})
+        if square_order_data.get("id") and not square_order_data.get("order_id"):
+            square_order_data["order_id"] = square_order_data["id"]
+
         square_order_id = square_order_data.get("order_id")
         square_order_state = square_order_data.get("state")
 
@@ -238,8 +249,8 @@ class SquareOrderProcessor(models.Model):
                 # Check for line changes and sync them
                 self._sync_order_line_changes(sale_order, square_order_data)
 
-            elif square_order_state == "CANCELED":
-                # Handle order cancellation
+            elif square_order_state in ("CANCELED", "CANCELLED"):
+                # Handle order cancellation (Square uses both spellings)
                 self._process_order_cancellation(sale_order, square_order_data)
 
             else:
@@ -428,20 +439,31 @@ class SquareOrderProcessor(models.Model):
             f"Processing cancellation for order {sale_order.name} (current state: {sale_order.state})"
         )
 
+        lines_to_deliver = sale_order.order_line.filtered(
+            lambda l: l.product_id.type in ("product", "consu")
+        )
+        fully_delivered = bool(lines_to_deliver) and all(
+            line.qty_delivered + 0.0001 >= line.product_uom_qty
+            for line in lines_to_deliver
+        )
+
         # Handle different order states
         if sale_order.state == "cancel":
             _logger.info(f"Order {sale_order.name} is already cancelled")
             return
 
-        elif sale_order.state == "done":
+        elif sale_order.state == "done" or (
+            sale_order.state == "sale"
+            and sale_order.invoice_status == "invoiced"
+            and fully_delivered
+        ):
             _logger.warning(
-                f"Order {sale_order.name} is already done/locked - processing refund instead"
+                f"Order {sale_order.name} is invoiced and fulfilled — processing refund/credit note"
             )
-            # For completed orders, we should create a refund/credit note
             self._process_completed_order_cancellation(sale_order, square_order_data)
             return
 
-        # For draft and sale states, we can cancel
+        # For draft and open sale states (not fully delivered/invoiced), standard cancel
         elif sale_order.state in ["draft", "sale"]:
             try:
                 # Get bot user for the cancellation
@@ -572,7 +594,6 @@ class SquareOrderProcessor(models.Model):
                                 "move_ids": [(6, 0, invoice.ids)],
                                 "journal_id": invoice.journal_id.id,
                                 "reason": f"Square Order Cancellation - {square_order_id}",
-                                "refund_method": "cancel",  # This creates a credit note that can be used to reconcile
                             }
                         )
                     )

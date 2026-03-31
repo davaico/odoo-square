@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
 import logging
+import uuid
 from odoo import models, fields, api
 from datetime import timedelta
 
@@ -76,6 +77,15 @@ class SquareWebhookQueue(models.Model):
             order_data: The full order data as dict
             square_order_id: The Square order ID that this event relates to
         """
+        if not webhook_event_id:
+            oid = (
+                square_order_id
+                or (order_data or {}).get("order_id")
+                or (order_data or {}).get("id")
+                or "unknown"
+            )
+            webhook_event_id = f"synthetic-{event_type}-{oid}-{uuid.uuid4().hex[:16]}"
+
         # Check if already queued
         existing = self.search([("webhook_event_id", "=", webhook_event_id)], limit=1)
         if existing:
