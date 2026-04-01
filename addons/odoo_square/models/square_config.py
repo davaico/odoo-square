@@ -2,7 +2,7 @@
 # Copyright 2024 Davai
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import logging
-from odoo import models, fields, api
+from odoo import api, fields, models
 from odoo.exceptions import ValidationError
 
 _logger = logging.getLogger(__name__)
@@ -78,6 +78,30 @@ class SquareConfig(models.Model):
     )
 
     active = fields.Boolean(default=True)
+
+    module_version_display = fields.Char(
+        string="Integration module version",
+        compute="_compute_module_version_display",
+        help="Installed version of the Odoo Square integration module (from Apps).",
+    )
+
+    @api.depends("name")
+    def _compute_module_version_display(self):
+        module = self.env["ir.module.module"].sudo().search(
+            [("name", "=", "odoo_square")], limit=1
+        )
+        raw = (module.latest_version or "").strip()
+        display = self._odoo_version_to_semver(raw) if raw else ""
+        for rec in self:
+            rec.module_version_display = display or "Unknown (upgrade module in Apps)"
+
+    @staticmethod
+    def _odoo_version_to_semver(version):
+        """Map manifest form 17.0.1.0.1 to semantic module part 1.0.1."""
+        parts = version.split(".")
+        if len(parts) >= 5 and all(p.isdigit() for p in parts[:5]):
+            return ".".join(parts[2:5])
+        return version
 
     def get_warehouse_for_location(self, square_location_id):
         """Get the configured warehouse for a specific Square location"""
