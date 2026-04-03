@@ -3,7 +3,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 {
     "name": "Odoo Square Integration",
-    "version": "17.0.1.1.0",
+    "version": "17.0.1.2.0",
     "category": "Sales",
     "summary": "Complete Odoo-Square integration for orders, refunds, exchanges and inventory sync",
     "description": """
