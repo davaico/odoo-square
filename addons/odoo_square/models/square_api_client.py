@@ -425,3 +425,104 @@ class SquareApiClient(models.Model):
         except Exception as e:
             _logger.error(f"Error getting Square location ID: {str(e)}")
             return None
+
+    @api.model
+    def search_orders(
+        self, start_at=None, end_at=None, states=None, location_ids=None, limit=100
+    ):
+        """
+        Search for orders in Square with optional filters
+
+        Args:
+            start_at (datetime): Start date for order search (UTC)
+            end_at (datetime): End date for order search (UTC)
+            states (list): List of order states to filter by (e.g., ['OPEN', 'COMPLETED'])
+            location_ids (list): List of location IDs to filter by
+            limit (int): Maximum number of orders to return per page
+
+        Returns:
+            list: List of orders from Square API
+        """
+        try:
+            endpoint = "/v2/orders/search"
+
+            # Build query filter
+            query_filter = {}
+
+            # Add date range filter if provided
+            if start_at or end_at:
+                created_at_filter = {}
+                if start_at:
+                    # Convert to ISO format for Square API (RFC 3339)
+                    if hasattr(start_at, "isoformat"):
+                        # If it's a datetime object, format as RFC 3339
+                        start_str = start_at.isoformat()
+                        # Ensure it ends with Z for UTC (only if not already timezone-aware)
+                        if not start_str.endswith("Z"):
+                            if "+" in start_str:
+                                # Remove timezone offset and add Z
+                                start_str = start_str.split("+")[0] + "Z"
+                            else:
+                                # No timezone info, add Z
+                                start_str = start_str + "Z"
+                    else:
+                        start_str = str(start_at)
+                    created_at_filter["begin_at"] = start_str
+
+                if end_at:
+                    # Convert to ISO format for Square API (RFC 3339)
+                    if hasattr(end_at, "isoformat"):
+                        # If it's a datetime object, format as RFC 3339
+                        end_str = end_at.isoformat()
+                        # Ensure it ends with Z for UTC (only if not already timezone-aware)
+                        if not end_str.endswith("Z"):
+                            if "+" in end_str:
+                                # Remove timezone offset and add Z
+                                end_str = end_str.split("+")[0] + "Z"
+                            else:
+                                # No timezone info, add Z
+                                end_str = end_str + "Z"
+                    else:
+                        end_str = str(end_at)
+                    created_at_filter["end_at"] = end_str
+
+                query_filter["created_at"] = created_at_filter
+
+            # Add state filter if provided
+            if states:
+                query_filter["states"] = states
+
+            # Build request data
+            data = {"limit": limit, "return_entries": True}
+
+            if query_filter:
+                data["query"] = {"filter": query_filter}
+
+            if location_ids:
+                data["location_ids"] = location_ids
+
+            _logger.info(f"Searching orders with filter: {data}")
+            _logger.info(f"Request payload: {data}")
+
+            # Make initial request
+            response = self._make_api_request(endpoint, method="POST", data=data)
+
+            all_orders = []
+            if "orders" in response:
+                all_orders.extend(response["orders"])
+
+            # Handle pagination
+            cursor = response.get("cursor")
+            while cursor:
+                data["cursor"] = cursor
+                response = self._make_api_request(endpoint, method="POST", data=data)
+                if "orders" in response:
+                    all_orders.extend(response["orders"])
+                cursor = response.get("cursor")
+
+            _logger.info(f"Found {len(all_orders)} orders matching criteria")
+            return all_orders
+
+        except Exception as e:
+            _logger.error(f"Error searching orders in Square: {str(e)}")
+            raise UserError(f"Failed to search orders: {str(e)}")

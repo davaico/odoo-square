@@ -33,6 +33,7 @@ Features:
         "views/square_stock_sync_views.xml",
         "views/square_integration_log_views.xml",
         "views/square_webhook_queue_views.xml",
+        "views/square_manual_resync_views.xml",
     ],
     "images": ["static/description/icon.png"],
     "installable": True,

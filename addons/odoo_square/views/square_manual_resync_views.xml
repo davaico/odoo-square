@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <data>
+        <!-- Manual Resync Wizard Form View -->
+        <record id="view_square_manual_resync_wizard_form" model="ir.ui.view">
+            <field name="name">square.manual.resync.wizard.form</field>
+            <field name="model">square.manual.resync.wizard</field>
+            <field name="arch" type="xml">
+                <form string="Manual Square Order Resync">
+                    <header>
+                        <button name="action_scan_missing_orders"
+                                string="Scan Missing Orders"
+                                type="object"
+                                class="oe_highlight"
+                                invisible="state != 'preview'"
+                                confirm="This will scan Square for orders from the last 7 days and identify missing ones in Odoo. Continue?"/>
+                        <button name="action_validate_resync"
+                                string="Validate and Resync"
+                                type="object"
+                                class="oe_highlight"
+                                invisible="state != 'results'"
+                                confirm="This will resync the selected orders. This may take a few moments. Continue?"/>
+                        <button name="action_close_wizard"
+                                string="Close"
+                                type="object"
+                                invisible="state not in ('results', 'done')"/>
+                        <field name="state" widget="statusbar" statusbar_visible="preview,results,done"/>
+                    </header>
+                    <sheet>
+                        <!-- Preview State -->
+                        <div invisible="state != 'preview'">
+                            <h2>Manual Order Resync</h2>
+                            <p>Scan Square for missing orders that were not processed via webhooks.</p>
+                            <group>
+                                <field name="config_id" required="1"/>
+                                <field name="days_back" help="Resync orders from the last N days"/>
+                                <field name="start_at"/>
+                                <field name="end_at"/>
+                            </group>
+                            <group string="Filters" groups="base.group_no_one">
+                                <field name="location_ids" widget="many2many_tags"/>
+                                <field name="state_filter"/>
+                            </group>
+                        </div>
+
+                        <!-- Results State -->
+                        <div invisible="state not in ('results', 'done')">
+                            <group>
+                                <field name="square_total" widget="integer"/>
+                                <field name="odoo_total" widget="integer"/>
+                                <field name="missing_total" widget="integer"/>
+                                <field name="selected_total" widget="integer"/>
+                            </group>
+                            <separator string="Missing Orders" colspan="4" invisible="state != 'results'"/>
+                            <field name="line_ids" nolabel="1" invisible="state != 'results'">
+                                <tree string="Missing Orders" editable="bottom">
+                                    <field name="selected" widget="boolean"/>
+                                    <field name="square_order_id"/>
+                                    <field name="created_at" optional="show"/>
+                                    <field name="state" optional="show"/>
+                                    <field name="location_id" optional="show"/>
+                                    <field name="total_amount" optional="show"/>
+                                </tree>
+                            </field>
+                        </div>
+
+                        <!-- Done State -->
+                        <div invisible="state != 'done'">
+                            <group>
+                                <field name="processed_count"/>
+                                <field name="error_count"/>
+                            </group>
+                            <separator string="Error Details" colspan="4" invisible="not error_count"/>
+                            <field name="error_details" nolabel="1" colspan="4" invisible="not error_count"/>
+                        </div>
+                    </sheet>
+                </form>
+            </field>
+        </record>
+
+        <!-- Manual Resync Action -->
+        <record id="action_square_manual_resync_wizard" model="ir.actions.act_window">
+            <field name="name">Manual Order Resync</field>
+            <field name="type">ir.actions.act_window</field>
+            <field name="res_model">square.manual.resync.wizard</field>
+            <field name="view_mode">form</field>
+            <field name="target">new</field>
+        </record>
+
+    </data>
+</odoo>

@@ -18,6 +18,11 @@
                                 type="object"
                                 class="btn-secondary"
                                 invisible="not square_application_id or not square_access_token or connection_status != 'connected'"/>
+                        <button name="action_open_manual_resync_wizard"
+                                string="Manual Resync Orders"
+                                type="object"
+                                class="btn-secondary"
+                                invisible="not square_application_id or not square_access_token"/>
                     </header>
                     <sheet>
                         <group>

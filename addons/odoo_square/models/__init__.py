@@ -12,3 +12,4 @@ from . import square_api_client
 from . import stock_move
 from . import stock_quant
 from . import stock_picking
+from . import square_manual_resync
