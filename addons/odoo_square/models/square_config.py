@@ -372,3 +372,24 @@ class SquareConfig(models.Model):
 
         # Fallback to first available warehouse
         return self.env["stock.warehouse"].search([], limit=1)
+
+    def action_open_manual_resync_wizard(self):
+        """Open the manual resync wizard for missing orders"""
+        self.ensure_one()
+
+        # Create or get the wizard
+        wizard = self.env["square.manual.resync.wizard"].create(
+            {
+                "config_id": self.id,
+            }
+        )
+
+        # Return wizard form view
+        return {
+            "type": "ir.actions.act_window",
+            "res_model": "square.manual.resync.wizard",
+            "res_id": wizard.id,
+            "view_mode": "form",
+            "view_type": "form",
+            "target": "new",
+        }
