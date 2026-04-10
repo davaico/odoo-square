@@ -36,7 +36,7 @@ class TestSquareManualResync(TransactionCase):
         )
         self.assertEqual(wizard.state, "preview")
         self.assertEqual(wizard.config_id.id, self.square_config.id)
-        self.assertEqual(wizard.days_back, 7)
+        self.assertEqual(wizard.days_back, 365)
 
     def test_wizard_date_range_computation(self):
         """Test that days_back correctly computes date range"""

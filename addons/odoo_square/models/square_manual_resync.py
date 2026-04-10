@@ -2,13 +2,22 @@
 # Copyright 2024 Davai
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dateutil import parser as dt_parser
-from odoo import api, fields, models
+from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
-from odoo.tools import DEFAULT_SERVER_DATETIME_FORMAT
 
 _logger = logging.getLogger(__name__)
+
+
+def _square_ts_to_odoo_naive(value):
+    """Square timestamps are RFC3339 (timezone-aware). Odoo Datetime = naive UTC."""
+    if not value:
+        return None
+    dt = value if isinstance(value, datetime) else dt_parser.parse(value)
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 class SquareManualResyncLine(models.TransientModel):
@@ -40,15 +49,20 @@ class SquareManualResyncWizard(models.TransientModel):
         ondelete="cascade",
     )
 
-    # Date range filters
-    days_back = fields.Integer(string="Days Back", default=7)
+    # Date range filters (default window must cover typical sandbox / historical POS data)
+    days_back = fields.Integer(
+        string="Days Back",
+        default=7,
+        help="Used to set Start/End when those dates are empty. "
+        "Increase if Square shows orders older than this window.",
+    )
     start_at = fields.Datetime(
         string="Start Date",
-        help="Start date for order search in UTC",
+        help="Inclusive start in UTC (Square SearchOrders created_at).",
     )
     end_at = fields.Datetime(
         string="End Date",
-        help="End date for order search in UTC",
+        help="Inclusive end in UTC. Usually leave with Days Back or set explicitly.",
     )
 
     # Optional filters
@@ -119,6 +133,19 @@ class SquareManualResyncWizard(models.TransientModel):
             record.missing_total = len(record.line_ids)
             record.selected_total = len(record.line_ids.filtered(lambda l: l.selected))
 
+    def _reopen_wizard_action(self):
+        """Re-show this wizard in a dialog (avoids full client reload closing the modal)."""
+        self.ensure_one()
+        return {
+            "type": "ir.actions.act_window",
+            "name": _("Manual Order Resync"),
+            "res_model": self._name,
+            "res_id": self.id,
+            "view_mode": "form",
+            "target": "new",
+            "context": dict(self.env.context),
+        }
+
     @api.onchange("days_back")
     def _onchange_days_back(self):
         """Auto-compute date range from days_back"""
@@ -132,6 +159,11 @@ class SquareManualResyncWizard(models.TransientModel):
         Scan Square for orders and identify missing ones in Odoo
         """
         self.ensure_one()
+        _logger.info("=" * 70)
+        _logger.info("SCAN MISSING ORDERS STARTED")
+        _logger.info(f"Wizard ID: {self.id}, Config: {self.config_id.name if self.config_id else 'None'}")
+        _logger.info(f"Days back: {self.days_back}, Start: {self.start_at}, End: {self.end_at}")
+        _logger.info("=" * 70)
 
         try:
             # Validate configuration
@@ -143,6 +175,9 @@ class SquareManualResyncWizard(models.TransientModel):
                 now = datetime.utcnow()
                 self.end_at = now
                 self.start_at = now - timedelta(days=self.days_back)
+
+            range_start = _square_ts_to_odoo_naive(self.start_at)
+            range_end = _square_ts_to_odoo_naive(self.end_at)
 
             _logger.info(
                 f"Scanning Square orders from {self.start_at} to {self.end_at}"
@@ -181,33 +216,29 @@ class SquareManualResyncWizard(models.TransientModel):
                 for location_id in location_ids_to_search:
                     try:
                         _logger.info(f"Fetching orders for location: {location_id}")
+                        # Square SearchOrders: server-side date + state filter + pagination
+                        # (avoids empty results when >limit orders exist outside the window)
                         loc_orders = api_client.get_location_orders(
                             location_id=location_id,
-                            limit=250
+                            limit=500,
+                            start_at=range_start,
+                            end_at=range_end,
+                            states=states,
+                            square_config=config,
                         )
 
-                        _logger.info(f"Location {location_id} returned {len(loc_orders)} orders")
+                        _logger.info(
+                            f"Location {location_id} returned {len(loc_orders)} orders"
+                        )
 
-                        # Filter by date range
                         for order in loc_orders:
                             order_id = order.get("id")
-                            created_at_str = order.get("created_at")
-
                             if order_id:
-                                # Check if within date range
-                                if created_at_str:
-                                    try:
-                                        created_at = dt_parser.parse(created_at_str)
-                                        if self.start_at <= created_at <= self.end_at:
-                                            square_order_ids.add(order_id)
-                                    except:
-                                        # If date parsing fails, include it
-                                        square_order_ids.add(order_id)
-                                else:
-                                    # No date, include it
-                                    square_order_ids.add(order_id)
+                                square_order_ids.add(order_id)
                     except Exception as e:
-                        _logger.warning(f"Error fetching orders for location {location_id}: {str(e)}")
+                        _logger.warning(
+                            f"Error fetching orders for location {location_id}: {str(e)}"
+                        )
                         continue
 
                 _logger.info(f"Found {len(square_order_ids)} orders in Square")
@@ -234,14 +265,16 @@ class SquareManualResyncWizard(models.TransientModel):
             line_vals = []
             for order_id in sorted(missing_order_ids):
                 try:
-                    order_data = api_client.get_order(order_id)
+                    order_data = api_client.get_order(
+                        order_id, square_config=self.config_id
+                    )
                     if order_data:
                         created_at_str = order_data.get("created_at")
                         created_at = None
                         if created_at_str:
                             try:
-                                created_at = dt_parser.parse(created_at_str)
-                            except:
+                                created_at = _square_ts_to_odoo_naive(created_at_str)
+                            except Exception:
                                 pass
 
                         line_vals.append(
@@ -289,10 +322,7 @@ class SquareManualResyncWizard(models.TransientModel):
                 f"{len(existing_order_ids)} in Odoo, {len(missing_order_ids)} missing"
             )
 
-            return {
-                "type": "ir.actions.client",
-                "tag": "reload",
-            }
+            return self._reopen_wizard_action()
 
         except UserError:
             raise
@@ -336,7 +366,9 @@ class SquareManualResyncWizard(models.TransientModel):
                     _logger.info(f"Fetching full order data for {order_id}")
 
                     # Fetch full order from Square
-                    order_data = api_client.get_order(order_id)
+                    order_data = api_client.get_order(
+                        order_id, square_config=self.config_id
+                    )
                     if not order_data:
                         raise UserError(f"Could not fetch order {order_id} from Square")
 
@@ -421,10 +453,7 @@ class SquareManualResyncWizard(models.TransientModel):
                 f"Resync complete: {processed_count} processed, {error_count} errors"
             )
 
-            return {
-                "type": "ir.actions.client",
-                "tag": "reload",
-            }
+            return self._reopen_wizard_action()
 
         except ValidationError:
             raise
