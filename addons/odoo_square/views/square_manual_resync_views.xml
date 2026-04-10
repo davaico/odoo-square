@@ -12,8 +12,7 @@
                                 string="Scan Missing Orders"
                                 type="object"
                                 class="oe_highlight"
-                                invisible="state != 'preview'"
-                                confirm="This will scan Square for orders from the last 7 days and identify missing ones in Odoo. Continue?"/>
+                                invisible="state != 'preview'"/>
                         <button name="action_validate_resync"
                                 string="Validate and Resync"
                                 type="object"
@@ -33,7 +32,7 @@
                             <p>Scan Square for missing orders that were not processed via webhooks.</p>
                             <group>
                                 <field name="config_id" required="1"/>
-                                <field name="days_back" help="Resync orders from the last N days"/>
+                                <field name="days_back" help="If Start/End are empty, scan uses the last N days (UTC). Use a larger value for older POS orders (e.g. sandbox)."/>
                                 <field name="start_at"/>
                                 <field name="end_at"/>
                             </group>
@@ -45,6 +44,10 @@
 
                         <!-- Results State -->
                         <div invisible="state not in ('results', 'done')">
+                            <p class="text-muted" invisible="state != 'results'">
+                                The table lists only orders that are in Square but not yet in Odoo.
+                                If Square has orders but the list is empty, they may already exist in Odoo.
+                            </p>
                             <group>
                                 <field name="square_total" widget="integer"/>
                                 <field name="odoo_total" widget="integer"/>
