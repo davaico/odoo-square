@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
-from odoo import models, fields, api
+from datetime import datetime, timezone
 from decimal import Decimal
 import logging
+
+from dateutil import parser as dt_parser
+from odoo import api, fields, models
 
 _logger = logging.getLogger(__name__)
 
@@ -226,6 +229,23 @@ class SaleOrder(models.Model):
         return vals
 
     @api.model
+    def _parse_square_order_created_at(self, square_data):
+        """Square ``created_at`` (RFC3339) -> naive UTC datetime for ``date_order``."""
+        if not square_data:
+            return False
+        raw = square_data.get("created_at")
+        if not raw:
+            return False
+        try:
+            dt = raw if isinstance(raw, datetime) else dt_parser.parse(raw)
+            if getattr(dt, "tzinfo", None):
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
+        except Exception:
+            _logger.warning("Could not parse Square created_at: %r", raw)
+            return False
+
+    @api.model
     def create_from_square(self, square_data):
         """
         Create a sale order from Square webhook data.
@@ -288,6 +308,9 @@ class SaleOrder(models.Model):
                 "currency_id": company.currency_id.id,
                 "warehouse_id": warehouse.id,
             }
+            sq_created = self._parse_square_order_created_at(square_data)
+            if sq_created:
+                order_vals["date_order"] = sq_created
             if map_team:
                 order_vals["team_id"] = map_team.id
 
@@ -654,6 +677,9 @@ class SaleOrder(models.Model):
                 _logger.info(
                     f"Extracted payment_id {payment_id} for order {square_order_id}"
                 )
+            sq_created = self._parse_square_order_created_at(full_order_data)
+            if sq_created:
+                update_vals["date_order"] = sq_created
 
             sale_order.write(update_vals)
 
