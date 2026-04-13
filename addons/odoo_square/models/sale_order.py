@@ -245,6 +245,16 @@ class SaleOrder(models.Model):
             _logger.warning("Could not parse Square created_at: %r", raw)
             return False
 
+    def _square_backdate_sale_order_create_date(self, sale_order, create_dt):
+        """Set DB ``create_date`` to Square order time (ORM keeps insert time by default)."""
+        if not sale_order or not create_dt:
+            return
+        self.env.cr.execute(
+            "UPDATE sale_order SET create_date = %s WHERE id = %s",
+            (create_dt, sale_order.id),
+        )
+        sale_order.invalidate_recordset(["create_date"])
+
     @api.model
     def create_from_square(self, square_data):
         """
@@ -258,14 +268,14 @@ class SaleOrder(models.Model):
         )
 
         try:
-            # Extract basic order information
+            # Note: Duplicate check is handled at the processor level for better idempotency
+            # Get or create customer (returns API-enriched payload so created_at / line_items apply)
+            customer, square_data = self._get_or_create_customer_from_square(square_data)
+            if square_data.get("id") and not square_data.get("order_id"):
+                square_data["order_id"] = square_data["id"]
             square_order_id = square_data.get("order_id")
             if not square_order_id:
                 raise ValueError("Missing Order ID in Square data")
-
-            # Note: Duplicate check is handled at the processor level for better idempotency
-            # Get or create customer
-            customer = self._get_or_create_customer_from_square(square_data)
 
             company = (
                 self.env.company
@@ -329,7 +339,15 @@ class SaleOrder(models.Model):
                 sale_order.write(upd)
                 self._create_order_lines_from_square(sale_order, square_data)
             else:
-                self._fetch_and_create_order_lines(sale_order, square_order_id)
+                fetched_order = self._fetch_and_create_order_lines(
+                    sale_order, square_order_id
+                )
+                if fetched_order:
+                    square_data = fetched_order
+
+            sq_created = self._parse_square_order_created_at(square_data)
+            if sq_created:
+                self._square_backdate_sale_order_create_date(sale_order, sq_created)
 
             # Add chatter message for order creation
             try:
@@ -379,56 +397,53 @@ class SaleOrder(models.Model):
 
     def _get_or_create_customer_from_square(self, square_data):
         """
-        Get or create customer from Square order data
-        Matching strategy: email -> phone -> name -> create new
+        Get or create customer from Square order data.
+        Matching strategy: email -> phone -> name -> create new.
+
+        Returns:
+            tuple: (res.partner, order dict) — order dict is Retrieve Order payload when
+            the API call succeeds, otherwise the input payload (so ``created_at`` is not lost).
         """
-        # Get full order data from Square API to access customer information
-        square_order_id = square_data.get("order_id")
+        payload = dict(square_data or {})
+        square_order_id = payload.get("order_id") or payload.get("id")
         if square_order_id:
+            payload.setdefault("order_id", square_order_id)
             _logger.info(
-                f"Fetching full order details from Square API for customer info: {square_order_id}"
+                "Fetching full order details from Square API for customer info: %s",
+                square_order_id,
             )
             try:
                 square_api = self.env["square.api.client"]
                 full_order_data = square_api.get_order(square_order_id)
                 if full_order_data:
-                    square_data = (
-                        full_order_data  # Use full data instead of webhook data
-                    )
+                    payload = dict(full_order_data)
+                    payload.setdefault("order_id", payload.get("id") or square_order_id)
                 else:
-                    _logger.warning(
-                        f"Could not fetch full order data, using webhook data"
-                    )
+                    _logger.warning("Could not fetch full order data, using webhook data")
             except Exception as e:
                 _logger.error(
-                    f"Error fetching full order data for customer info: {str(e)}"
+                    "Error fetching full order data for customer info: %s", str(e)
                 )
-                # Continue with webhook data if API call fails
 
-        # Extract customer info from Square data (now full data if available)
-        customer_info = self._extract_customer_info_from_square(square_data)
+        customer_info = self._extract_customer_info_from_square(payload)
 
         if not customer_info:
-            # Create anonymous customer
-            return self._create_anonymous_customer()
+            return self._create_anonymous_customer(), payload
 
         Partner = self.env["res.partner"]
 
-        # Try to match by email first
         if customer_info.get("email"):
             partner = Partner.search([("email", "=", customer_info["email"])], limit=1)
             if partner:
                 _logger.info(f"Found customer by email: {partner.name}")
-                return partner
+                return partner, payload
 
-        # Try to match by phone
         if customer_info.get("phone"):
             partner = Partner.search([("phone", "=", customer_info["phone"])], limit=1)
             if partner:
                 _logger.info(f"Found customer by phone: {partner.name}")
-                return partner
+                return partner, payload
 
-        # Try to match by name and address
         if customer_info.get("name"):
             domain = [("name", "ilike", customer_info["name"])]
             if customer_info.get("street"):
@@ -439,10 +454,9 @@ class SaleOrder(models.Model):
             partner = Partner.search(domain, limit=1)
             if partner:
                 _logger.info(f"Found customer by name/address: {partner.name}")
-                return partner
+                return partner, payload
 
-        # Create new customer
-        return self._create_customer_from_square_info(customer_info)
+        return self._create_customer_from_square_info(customer_info), payload
 
     def _extract_customer_info_from_square(self, square_data):
         """Extract customer information from Square order data"""
@@ -665,7 +679,7 @@ class SaleOrder(models.Model):
                 _logger.warning(
                     f"Could not fetch full order data from Square API for order {square_order_id}"
                 )
-                return
+                return None
 
             # Extract payment information from full order data
             payment_id = self._extract_payment_id_from_square_order(full_order_data)
@@ -690,6 +704,8 @@ class SaleOrder(models.Model):
                 sale_order, full_order_data
             )
 
+            return full_order_data
+
         except Exception as e:
             _logger.error(
                 f"Error fetching full order details from Square API: {str(e)}",
@@ -697,6 +713,7 @@ class SaleOrder(models.Model):
             )
             # Don't fail the entire process if API call fails
             # The order will be created without lines, which can be handled later
+            return None
 
     def _extract_payment_id_from_square_order(self, square_order_data):
         """

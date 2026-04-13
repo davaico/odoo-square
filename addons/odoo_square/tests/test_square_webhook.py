@@ -413,7 +413,7 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         sale_order = self.env["sale.order"]
-        customer = sale_order._get_or_create_customer_from_square(square_data)
+        customer, _ = sale_order._get_or_create_customer_from_square(square_data)
 
         # Should match existing partner by email
         self.assertEqual(customer, self.partner)
@@ -437,7 +437,7 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         sale_order = self.env["sale.order"]
-        customer = sale_order._get_or_create_customer_from_square(square_data)
+        customer, _ = sale_order._get_or_create_customer_from_square(square_data)
 
         # Should match existing partner by phone
         self.assertEqual(customer, self.partner)
@@ -461,7 +461,7 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         sale_order = self.env["sale.order"]
-        customer = sale_order._get_or_create_customer_from_square(square_data)
+        customer, _ = sale_order._get_or_create_customer_from_square(square_data)
 
         # Should create new partner
         self.assertNotEqual(customer, self.partner)
