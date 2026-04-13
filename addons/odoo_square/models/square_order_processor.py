@@ -310,12 +310,21 @@ class SquareOrderProcessor(models.Model):
         # Step 1: Confirm the order if still in draft using standard Odoo method
         if sale_order.state == "draft":
             try:
+                # Preserve the Square-sourced date_order: Odoo's action_confirm() calls
+                # _prepare_confirmation_values() which hard-codes date_order=now(), overwriting
+                # the historical Square created_at we set during order creation.
+                original_date_order = sale_order.date_order
+
                 # Use Odoo's standard confirmation with proper context
                 sale_order.with_user(bot_user).with_context(
                     mail_auto_subscribe_no_notify=True,
                     mail_create_nosubscribe=True,
                     mail_auto_subscribe=False,
                 ).action_confirm()
+
+                # Restore the original date_order if it was set from Square
+                if original_date_order:
+                    sale_order.write({"date_order": original_date_order})
 
                 _logger.info(
                     f"Confirmed sale order {sale_order.name} using standard action_confirm()"
