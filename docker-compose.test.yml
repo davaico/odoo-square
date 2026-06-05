@@ -21,7 +21,7 @@ services:
     volumes:
       - odoo_square_test_data:/var/lib/odoo
       - ./config:/etc/odoo
-      - ./addons:/mnt/extra-addons
+      - .:/mnt/extra-addons
     networks:
       - odoo-test-net
 
