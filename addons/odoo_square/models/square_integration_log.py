@@ -28,6 +28,7 @@ class SquareIntegrationLog(models.Model):
             ("exchange_processed", "Exchange Processed"),
             ("return_processed", "Return Processed"),
             ("stock_sync", "Stock Synchronization"),
+            ("manual_resync", "Manual Resync"),
             ("webhook_received", "Webhook Received"),
             ("error", "Error"),
         ],
