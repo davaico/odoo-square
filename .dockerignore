@@ -1,0 +1,13 @@
+.git
+.github
+.pytest_cache
+__pycache__
+*.py[cod]
+*.log
+.env
+.env.local
+.env.production
+dump.sql
+data
+logs
+odoo_17.0+e.latest_all.deb

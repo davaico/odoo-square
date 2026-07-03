@@ -338,6 +338,35 @@ class TestSquareWebhook(SquareHttpCase):
         self.assertIn("Content-Type", response_data["message"])
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
+    def test_webhook_signature_required_when_key_configured(self):
+        """Reject webhook requests without a Square signature when a key is configured."""
+
+        self.square_config.square_webhook_signature_key = "test_signature_key"
+        webhook_data = {
+            "type": "order.created",
+            "data": {
+                "object": {
+                    "order_created": {
+                        "id": "test_unsigned_order",
+                        "state": "COMPLETED",
+                        "line_items": [],
+                    }
+                }
+            },
+        }
+
+        response = self.url_open(
+            "/square/webhook",
+            data=json.dumps(webhook_data),
+            headers={"Content-Type": "application/json"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        response_data = response.json()
+        self.assertEqual(response_data["status"], "error")
+        self.assertEqual(response_data["message"], "Invalid signature")
+
+    @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_malformed_json(self):
         """Test webhook with malformed JSON returns error"""
 

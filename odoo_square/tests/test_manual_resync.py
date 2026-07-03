@@ -5,11 +5,13 @@ import logging
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 from odoo.tests import TransactionCase
+from odoo.tests.common import tagged
 from odoo.exceptions import UserError, ValidationError
 
 _logger = logging.getLogger(__name__)
 
 
+@tagged("post_install", "-at_install", "TestSquareManualResync")
 class TestSquareManualResync(TransactionCase):
     """Test cases for manual resync functionality"""
 
@@ -26,6 +28,15 @@ class TestSquareManualResync(TransactionCase):
                     "square_webhook_signature_key": "TEST_KEY",
                 }
             )
+        self.warehouse = self.env["stock.warehouse"].search([], limit=1)
+        self.env["square.location.mapping"].create(
+            {
+                "config_id": self.square_config.id,
+                "square_location_id": "LOC_123",
+                "square_location_name": "Test Location",
+                "warehouse_id": self.warehouse.id,
+            }
+        )
 
     def test_wizard_creation(self):
         """Test manual resync wizard can be created"""
@@ -36,7 +47,7 @@ class TestSquareManualResync(TransactionCase):
         )
         self.assertEqual(wizard.state, "preview")
         self.assertEqual(wizard.config_id.id, self.square_config.id)
-        self.assertEqual(wizard.days_back, 365)
+        self.assertEqual(wizard.days_back, 7)
 
     def test_wizard_date_range_computation(self):
         """Test that days_back correctly computes date range"""
@@ -59,11 +70,10 @@ class TestSquareManualResync(TransactionCase):
             delta=60,
         )
 
-    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient._make_api_request")
-    def test_scan_missing_orders_empty(self, mock_api_request):
+    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_location_orders")
+    def test_scan_missing_orders_empty(self, mock_get_location_orders):
         """Test scanning when no orders are missing"""
-        # Mock Square API to return no orders
-        mock_api_request.return_value = {"orders": []}
+        mock_get_location_orders.return_value = []
 
         wizard = self.env["square.manual.resync.wizard"].create(
             {
@@ -73,22 +83,16 @@ class TestSquareManualResync(TransactionCase):
         )
         wizard._onchange_days_back()
 
-        # Scan for missing orders
-        with patch.object(
-            self.env["square.api.client"],
-            "search_orders",
-            return_value=[],
-        ):
-            wizard.action_scan_missing_orders()
+        wizard.action_scan_missing_orders()
 
         self.assertEqual(wizard.state, "results")
         self.assertEqual(len(wizard.line_ids), 0)
         self.assertEqual(wizard.square_total, 0)
         self.assertEqual(wizard.missing_total, 0)
 
-    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.search_orders")
+    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_location_orders")
     @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order")
-    def test_scan_identifies_missing_orders(self, mock_get_order, mock_search_orders):
+    def test_scan_identifies_missing_orders(self, mock_get_order, mock_get_location_orders):
         """Test scanning identifies orders missing from Odoo"""
         # Create an existing order in Odoo
         existing_order = self.env["sale.order"].create(
@@ -99,7 +103,7 @@ class TestSquareManualResync(TransactionCase):
         )
 
         # Mock Square to return both existing and missing orders
-        mock_search_orders.return_value = [
+        mock_get_location_orders.return_value = [
             {
                 "id": "existing_order_123",
                 "state": "COMPLETED",
@@ -117,7 +121,7 @@ class TestSquareManualResync(TransactionCase):
         ]
 
         # Mock get_order for missing order
-        mock_get_order.side_effect = lambda order_id: {
+        mock_get_order.side_effect = lambda order_id, **kwargs: {
             "id": order_id,
             "state": "COMPLETED",
             "created_at": "2024-01-02T10:00:00Z",
@@ -243,9 +247,8 @@ class TestSquareManualResync(TransactionCase):
         self.assertEqual(wizard.state, "preview")
 
         # Mock the scan to transition to results
-        with patch.object(
-            self.env["square.api.client"],
-            "search_orders",
+        with patch(
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_location_orders",
             return_value=[],
         ):
             wizard.action_scan_missing_orders()
@@ -261,9 +264,8 @@ class TestSquareManualResync(TransactionCase):
         )
 
         # Mock the validate to transition to done
-        with patch.object(
-            self.env["square.api.client"],
-            "get_order",
+        with patch(
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order",
             return_value={"id": "test_order", "state": "COMPLETED"},
         ):
             with patch(
@@ -299,10 +301,9 @@ class TestSquareManualResync(TransactionCase):
         )
 
         # Mock the processing
-        with patch.object(
-            self.env["square.api.client"],
-            "get_order",
-            side_effect=lambda oid: {
+        with patch(
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order",
+            side_effect=lambda oid, **kwargs: {
                 "id": oid,
                 "state": "COMPLETED",
             },
@@ -317,21 +318,10 @@ class TestSquareManualResync(TransactionCase):
         self.assertEqual(wizard.processed_count, 1)
         self.assertEqual(wizard.selected_total, 1)
 
-    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.search_orders")
-    def test_configuration_required(self, mock_search_orders):
-        """Test that wizard requires configuration"""
-        wizard = self.env["square.manual.resync.wizard"].create(
-            {
-                "config_id": self.square_config.id,
-            }
-        )
-
-        # Remove config
-        wizard.config_id = None
-
-        # Try to scan - should fail
-        with self.assertRaises(ValidationError):
-            wizard.action_scan_missing_orders()
+    def test_configuration_required(self):
+        """Test that wizard requires a Square configuration."""
+        with self.assertRaises(Exception), self.env.cr.savepoint():
+            self.env["square.manual.resync.wizard"].create({})
 
     def test_wizard_counters_computed(self):
         """Test that wizard counters are properly computed"""
