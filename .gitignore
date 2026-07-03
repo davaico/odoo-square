@@ -33,7 +33,7 @@ wheels/
 *.egg
 
 # Docker
-.dockerignore
+logs/
 
 # IDE
 .vscode/

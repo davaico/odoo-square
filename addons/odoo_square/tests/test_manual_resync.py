@@ -5,11 +5,13 @@ import logging
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 from odoo.tests import TransactionCase
+from odoo.tests.common import tagged
 from odoo.exceptions import UserError, ValidationError
 
 _logger = logging.getLogger(__name__)
 
 
+@tagged("post_install", "-at_install", "TestSquareManualResync")
 class TestSquareManualResync(TransactionCase):
     """Test cases for manual resync functionality"""
 

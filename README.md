@@ -1,245 +1,220 @@
 # Odoo Square Integration
 
-A complete Odoo module for integrating with Square POS, featuring webhook processing, bidirectional inventory sync, and advanced order management including refunds and exchanges.
+[![CI](https://github.com/davaico/odoo-square/actions/workflows/ci.yml/badge.svg)](https://github.com/davaico/odoo-square/actions/workflows/ci.yml)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+[![Odoo](https://img.shields.io/badge/Odoo-17.0-875A7B.svg)](https://www.odoo.com)
+
+Production-oriented Odoo 17 addon for integrating Square POS with Odoo Sales, Accounting, and Inventory.
+
+The module processes Square webhooks, creates and updates Odoo sales orders, handles refunds and exchanges, maps Square locations to Odoo warehouses, and synchronizes inventory with an auditable activity log.
 
 ## Features
 
-### 1. Webhook Processing (Square → Odoo)
-- **Secure Endpoint**: `/square/webhook` with HMAC-SHA256 signature validation
-- **Supported Events**: 
-  - `order.created` - New orders
-  - `order.updated` - Exchanges and modifications
-  - `refund.created` / `refund.updated` - Refunds
-- **Smart Customer Matching**: Email → Phone → Name → Auto-create
-- **Complete Flow**: Sales Order → Invoices/Credit Notes → Stock Moves → Inventory Updates
-
-### 2. Advanced Returns and Exchanges
-- **Full Refunds**: Order cancellation + Automatic credit note + Stock return
-- **Equivalent Exchanges**: Quantity changes + New line + Simultaneous stock moves
-- **Price-Difference Exchanges**: Additional invoice or credit note based on price difference
-- **History Preservation**: Zero quantities (no deletion) for complete traceability
-
-### 3. Bidirectional Inventory Sync (Odoo ↔ Square)
-- **Real-Time Updates**: Triggered on stock moves and manual adjustments
-- **Shop Warehouse Focus**: Sync only from configured warehouse
-- **Loop Prevention**: Exclude Square-originated moves to avoid conflicts
-- **Square Inventory API**: Catalog search and proper inventory adjustments
-
-### 4. Monitoring and Traceability
-- **Centralized Integration Log**: Complete history of all operations
-- **Chatter Messages**: Automatic trace on each Odoo order
-- **Unified Interface**: Configuration, Actions, and Activities in a single view
-- **Alerts and Errors**: Detailed tracking of integration issues
+- Secure Square webhook endpoint at `/square/webhook` with HMAC-SHA256 validation when a webhook signature key is configured.
+- Order ingestion for `order.created` and `order.updated` events, including customer matching and sale order creation.
+- Refund and exchange handling with invoices, credit notes, stock returns, and preserved order history.
+- Square location to Odoo warehouse mapping for multi-location inventory workflows.
+- Inventory synchronization hooks for Odoo stock movements and manual quantity changes.
+- Manual resync wizard for finding and replaying missing Square orders.
+- Integration log models and views for monitoring webhook, order, refund, exchange, and stock sync activity.
+- Docker Compose development and CI test setup.
 
 ## Requirements
 
-- Odoo 17.0 (Community or Enterprise)
-- Python packages: `requests`
-- Square Developer Account with API credentials
+- Odoo 17.0 Community or Enterprise
+- PostgreSQL supported by Odoo 17.0
+- Python package: `requests`
+- Square Developer account with an application, access token, location IDs, and webhook signature key
+- Docker and Docker Compose for the included local development environment
 
-## Quick Start with Docker
+## Compatibility
 
-### 1. Clone the Repository
+This repository follows Odoo addon versioning. The current manifest version is `17.0.1.3.0`, where `17.0` is the Odoo series and `1.3.0` is the addon release version.
+
+The addon manifest declares the following Odoo dependencies:
+
+- `base`
+- `web`
+- `sale`
+- `sales_team`
+- `account`
+- `stock`
+- `payment`
+
+## Quick Start
+
+Clone the repository:
 
 ```bash
 git clone https://github.com/davaico/odoo-square.git
 cd odoo-square
 ```
 
-### 2. Configure Environment
+Create a local environment file:
 
 ```bash
 cp .env.example .env
-# Edit .env with your settings
 ```
 
-### 3. Start the Services
+Edit `.env` and set a non-default `DB_PASSWORD`.
+
+Start Odoo and PostgreSQL:
 
 ```bash
 docker compose up -d
 ```
 
-### 4. Access Odoo
+Open [http://localhost:8069](http://localhost:8069), create or select a database, update the Apps list, then install **Odoo Square Integration**.
 
-Open http://localhost:8069 in your browser.
+## Square Configuration
 
-Default credentials (change in production):
-- Database: `odoo`
-- Email: `admin`
-- Password: Set during first setup
+In Odoo, open **Settings > Square Configuration** and configure:
 
-### 5. Install the Module
+- Square Application ID
+- Square Access Token
+- Environment: `Sandbox` or `Production`
+- Webhook Signature Key
+- Payment Journal
+- Square Location to Odoo Warehouse mappings
+- Optional Sales Team mappings
 
-1. Go to **Apps** menu
-2. Click **Update Apps List**
-3. Search for "Odoo Square Integration"
-4. Click **Install**
+In the Square Developer Dashboard, create a webhook subscription that points to:
 
-### 6. Configure Square Integration
+```text
+https://your-odoo-domain.example/square/webhook
+```
 
-1. Go to **Settings** → **Square Configuration**
-2. Enter your Square API credentials:
-   - Application ID
-   - Access Token
-   - Location ID
-   - Webhook Signature Key
-3. Configure the shop warehouse for inventory sync
-4. Test the connection
+Configure at least these event types:
 
-## Development Setup
+- `order.created`
+- `order.updated`
+- `payment.updated`
+- `refund.created`
+- `refund.updated`
 
-### Prerequisites
+For production deployments, run Odoo behind HTTPS and keep `proxy_mode = True` in `config/odoo.conf` when a reverse proxy terminates TLS.
 
-- Docker and Docker Compose
-- Git
+## Development
 
-### Local Development
+Start the local stack:
 
 ```bash
-# Clone the repo
-git clone https://github.com/davaico/odoo-square.git
-cd odoo-square
-
-# Copy environment file
-cp .env.example .env
-
-# Start services
 docker compose up -d
+```
 
-# View logs
+Follow Odoo logs:
+
+```bash
 docker compose logs -f odoo
+```
 
-# Run tests
-docker compose exec odoo odoo \
+Restart Odoo after Python changes:
+
+```bash
+docker compose restart odoo
+```
+
+Update the addon after manifest, XML, or model changes:
+
+```bash
+docker compose exec odoo bash -lc 'odoo \
+  --config=/etc/odoo/odoo.conf \
   -d odoo \
-  --db_host=db \
-  --test-enable \
-  --stop-after-init \
-  --test-tags="odoo_square"
+  --db_host="${HOST:-db}" \
+  --db_port=5432 \
+  --db_user="${USER:-odoo}" \
+  --db_password="$PASSWORD" \
+  -u odoo_square \
+  --stop-after-init'
 ```
-
-### Project Structure
-
-```
-odoo-square/
-├── addons/
-│   └── odoo_square/           # Main module
-│       ├── controllers/       # Webhook endpoints
-│       ├── models/            # Business logic
-│       ├── views/             # UI definitions
-│       ├── data/              # Default data
-│       ├── security/          # Access rights
-│       └── tests/             # Unit tests
-├── config/
-│   └── odoo.conf              # Odoo configuration
-├── docker-compose.yml         # Docker services
-├── Dockerfile                 # Odoo image build
-└── README.md
-```
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DB_NAME` | PostgreSQL database name | `odoo` |
-| `DB_HOST` | PostgreSQL host | `db` |
-| `DB_USER` | PostgreSQL user | `odoo` |
-| `DB_PASSWORD` | PostgreSQL password | *(required)* |
-
-### Square API Setup
-
-1. Create a Square Developer account at https://developer.squareup.com
-2. Create an application
-3. Get your credentials from the Developer Dashboard:
-   - **Application ID**: Found in app settings
-   - **Access Token**: Generate in OAuth settings
-   - **Location ID**: Found in Locations tab
-4. Create a webhook subscription pointing to `https://your-odoo-url/square/webhook`
-5. Copy the webhook signature key
 
 ## Testing
 
-Run the test suite:
+Run the same test command used by CI:
 
 ```bash
-docker compose exec odoo odoo \
-  -d odoo \
-  --db_host=db \
-  --test-enable \
-  --stop-after-init \
-  --test-tags="odoo_square" \
-  --log-level=test
+DB_PASSWORD=ci_odoo_test docker compose -f docker-compose.test.yml run --rm odoo \
+  odoo \
+    --config=/etc/odoo/odoo.conf \
+    -d odoo \
+    --db_host=db \
+    --db_port=5432 \
+    --db_user=odoo \
+    --db_password=ci_odoo_test \
+    -i odoo_square \
+    --test-enable \
+    --workers=0 \
+    --stop-after-init \
+    --test-tags=odoo_square \
+    --log-level=test
+```
+
+The suite includes HTTP webhook tests, Square order/refund integration scenarios, stock return behavior, manual resync behavior, and addon contract tests.
+
+## Project Structure
+
+```text
+odoo-square/
+├── addons/
+│   └── odoo_square/
+│       ├── controllers/        # Public webhook endpoint
+│       ├── data/               # Default users and Square products
+│       ├── models/             # Odoo business models and services
+│       ├── security/           # ir.model.access.csv
+│       ├── static/description/ # Odoo app listing assets
+│       ├── tests/              # Odoo TransactionCase and HttpCase tests
+│       └── views/              # Backend UI views and menus
+├── config/                     # Odoo container configuration
+├── .github/workflows/          # CI
+├── docker-compose.yml          # Local development stack
+├── docker-compose.test.yml     # Test stack used by CI
+└── README.md
 ```
 
 ## Architecture
 
 ```mermaid
-graph TB
-    subgraph "Square POS & API"
-        SO[Square Orders]
-        SR[Square Refunds]
-        SI[Square Inventory]
-        SW[Square Webhooks]
-    end
+flowchart TB
+    Square["Square POS and API"]
+    Webhook["/square/webhook"]
+    Queue["square.webhook.queue"]
+    Processor["square.order.processor"]
+    Sale["sale.order"]
+    Accounting["Invoices and credit notes"]
+    Stock["Stock pickings, moves, and quants"]
+    Sync["square.stock.sync"]
+    Log["square.integration.log"]
 
-    subgraph "Odoo"
-        subgraph "Webhook Processing"
-            WH["/square/webhook"]
-            WSV[Signature Validation]
-            OP[Order Processor]
-        end
-        
-        subgraph "Order Management"
-            SOR[Sale Order]
-            INV[Invoices]
-            CN[Credit Notes]
-        end
-        
-        subgraph "Inventory"
-            SM[Stock Moves]
-            SQ[Stock Quantities]
-            SSS[Stock Sync Service]
-        end
-        
-        subgraph "Monitoring"
-            IL[Integration Log]
-        end
-    end
-
-    SO -->|order.created| SW
-    SR -->|refund.created| SW
-    SW --> WH
-    WH --> WSV
-    WSV --> OP
-    OP --> SOR
-    SOR --> INV
-    SOR --> SM
-    SM --> SSS
-    SSS -->|inventory.adjust| SI
-    OP --> IL
+    Square -->|"webhook events"| Webhook
+    Webhook -->|"out-of-order updates"| Queue
+    Queue --> Processor
+    Webhook --> Processor
+    Processor --> Sale
+    Processor --> Accounting
+    Processor --> Stock
+    Stock --> Sync
+    Sync -->|"inventory adjustments"| Square
+    Webhook --> Log
+    Processor --> Log
+    Sync --> Log
 ```
+
+## Operational Notes
+
+- Configure the webhook signature key in Odoo before exposing the endpoint publicly.
+- Keep Square access tokens out of Git. Use Odoo configuration records, environment-specific secrets management, or encrypted backups.
+- Map every active Square location to the intended Odoo warehouse before enabling production inventory sync.
+- Review **Square Integration Logs** after installation and after every Square credential or webhook change.
+- Use the manual resync wizard for missed or delayed Square events instead of replaying raw webhook requests manually.
 
 ## Contributing
 
-Contributions are welcome! Please:
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request.
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests
-5. Submit a pull request
+## Security
+
+Please do not open public issues for vulnerabilities. See [SECURITY.md](SECURITY.md) for the supported version and private reporting process.
 
 ## License
 
-This project is licensed under the **GNU Affero General Public License v3.0** - see the [LICENSE](LICENSE) file for details.
-
-## Support
-
-- **Issues**: https://github.com/davaico/odoo-square/issues
-- **Documentation** (To Complete): https://github.com/davaico/odoo-square/wiki
-
-## Authors
-
-- **Davai** - https://davai.co
+This project is licensed under the GNU Affero General Public License v3.0 or later. See [LICENSE](LICENSE).
