@@ -1,4 +1,4 @@
-# Odoo Square Integration
+# Square POS Integration
 
 [![CI](https://github.com/davaico/odoo-square/actions/workflows/ci.yml/badge.svg)](https://github.com/davaico/odoo-square/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
@@ -29,7 +29,7 @@ The module processes Square webhooks, creates and updates Odoo sales orders, han
 
 ## Compatibility
 
-This repository follows Odoo addon versioning. The current manifest version is `17.0.1.3.0`, where `17.0` is the Odoo series and `1.3.0` is the addon release version.
+This repository follows Odoo addon versioning. The current manifest version is `17.0.1.4.0`, where `17.0` is the Odoo series and `1.4.0` is the addon release version.
 
 The addon manifest declares the following Odoo dependencies:
 
@@ -64,7 +64,7 @@ Start Odoo and PostgreSQL:
 docker compose up -d
 ```
 
-Open [http://localhost:8069](http://localhost:8069), create or select a database, update the Apps list, then install **Odoo Square Integration**.
+Open [http://localhost:8069](http://localhost:8069), create or select a database, update the Apps list, then install **Square POS Integration**.
 
 ## Square Configuration
 
@@ -155,15 +155,14 @@ The suite includes HTTP webhook tests, Square order/refund integration scenarios
 
 ```text
 odoo-square/
-├── addons/
-│   └── odoo_square/
-│       ├── controllers/        # Public webhook endpoint
-│       ├── data/               # Default users and Square products
-│       ├── models/             # Odoo business models and services
-│       ├── security/           # ir.model.access.csv
-│       ├── static/description/ # Odoo app listing assets
-│       ├── tests/              # Odoo TransactionCase and HttpCase tests
-│       └── views/              # Backend UI views and menus
+├── odoo_square/
+│   ├── controllers/            # Public webhook endpoint
+│   ├── data/                   # Default users and Square products
+│   ├── models/                 # Odoo business models and services
+│   ├── security/               # ir.model.access.csv
+│   ├── static/description/     # Odoo app listing assets
+│   ├── tests/                  # Odoo TransactionCase and HttpCase tests
+│   └── views/                  # Backend UI views and menus
 ├── config/                     # Odoo container configuration
 ├── .github/workflows/          # CI
 ├── docker-compose.yml          # Local development stack

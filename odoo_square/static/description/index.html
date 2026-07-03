@@ -1,0 +1,210 @@
+<section class="oe_container">
+    <div class="oe_row oe_spaced">
+        <h2 class="oe_slogan" style="margin-top: 32px;">Square POS Integration</h2>
+        <h3 class="oe_slogan">Connect your Square point of sale with Odoo. Real-time sync of orders, refunds, exchanges, and inventory.</h3>
+    </div>
+</section>
+
+<section class="oe_container oe_dark">
+    <h2 class="oe_slogan">Key Features</h2>
+
+    <div class="oe_row oe_spaced">
+        <div class="oe_span6">
+            <div class="oe_mt32">
+                <h3 class="oe_slogan">Real-Time Webhook Processing</h3>
+                <p class="oe_mt32">
+                    Secure HMAC-SHA256 endpoint receives every Square event:
+                    <code>order.created</code>, <code>order.updated</code>,
+                    <code>refund.created</code>, <code>refund.updated</code>.
+                    Orders, exchanges and refunds appear in Odoo within seconds.
+                </p>
+            </div>
+        </div>
+        <div class="oe_span6">
+            <div class="oe_mt32">
+                <h3 class="oe_slogan">Smart Customer Matching</h3>
+                <p class="oe_mt32">
+                    New Square orders are matched to existing Odoo contacts by email,
+                    then phone, then name. If no match is found, a new contact is created
+                    automatically. No duplicates, no manual cleanup.
+                </p>
+            </div>
+        </div>
+    </div>
+
+    <div class="oe_row oe_spaced">
+        <div class="oe_span6">
+            <div class="oe_mt32">
+                <h3 class="oe_slogan">Refunds and Exchanges</h3>
+                <p class="oe_mt32">
+                    Full refunds generate credit notes and stock returns. Equivalent
+                    exchanges update lines and trigger simultaneous stock moves.
+                    Price-difference exchanges create the appropriate invoice or
+                    credit note based on the price delta.
+                </p>
+            </div>
+        </div>
+        <div class="oe_span6">
+            <div class="oe_mt32">
+                <h3 class="oe_slogan">Bidirectional Inventory Sync</h3>
+                <p class="oe_mt32">
+                    Odoo stock moves push updates to Square through the Square
+                    Inventory API. Loop prevention excludes Square-originated moves
+                    to avoid conflicts. Scoped to a configurable shop warehouse.
+                </p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container">
+    <h2 class="oe_slogan">Audit Trail and Monitoring</h2>
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <p class="oe_mt32">
+                Every webhook, every API call, every refund and every stock adjustment
+                is recorded in a centralized Integration Log. Chatter messages are also
+                added to the source sales order, so the full history is one click away
+                from the order itself.
+            </p>
+            <ul>
+                <li>Centralized Integration Log with filterable status, level, and operation type</li>
+                <li>Automatic chatter messages on each related sales order</li>
+                <li>Webhook queue with retry control and replay</li>
+                <li>Manual resync wizard for orders, refunds, and stock</li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container oe_dark">
+    <h2 class="oe_slogan">Configuration</h2>
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <ol class="oe_mt32">
+                <li>Install the module from the Apps menu.</li>
+                <li>Open <strong>Settings &rarr; Square Configuration</strong>.</li>
+                <li>Enter your Square Application ID, Access Token, Location ID, and Webhook Signature Key.</li>
+                <li>Select the warehouse used for inventory synchronization.</li>
+                <li>In the Square Developer Dashboard, create a webhook subscription pointing to <code>https://your-odoo-domain/square/webhook</code>.</li>
+                <li>Subscribe to the events: <code>order.created</code>, <code>order.updated</code>, <code>refund.created</code>, <code>refund.updated</code>.</li>
+            </ol>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container">
+    <h2 class="oe_slogan">Screenshots</h2>
+
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <h3 class="oe_slogan">Square Configuration</h3>
+            <p class="oe_mt32">Configure API credentials, signing key, and the shop warehouse used for inventory sync.</p>
+            <img class="oe_picture oe_screenshot" src="screen_config.png" alt="Square Configuration screen"/>
+        </div>
+    </div>
+
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <h3 class="oe_slogan">Webhook Queue</h3>
+            <p class="oe_mt32">Inspect, retry, and replay incoming Square events with full payload visibility.</p>
+            <img class="oe_picture oe_screenshot" src="screen_webhook_queue.png" alt="Webhook Queue screen"/>
+        </div>
+    </div>
+
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <h3 class="oe_slogan">Integration Logs</h3>
+            <p class="oe_mt32">Centralized log of every API call, signature check, order processing step, and stock adjustment.</p>
+            <img class="oe_picture oe_screenshot" src="screen_integration_logs.png" alt="Integration Logs screen"/>
+        </div>
+    </div>
+
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <h3 class="oe_slogan">Stock Synchronization</h3>
+            <p class="oe_mt32">Monitor bidirectional inventory sync between Odoo and Square in real time.</p>
+            <img class="oe_picture oe_screenshot" src="screen_stock_sync.png" alt="Stock Sync screen"/>
+        </div>
+    </div>
+
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <h3 class="oe_slogan">Manual Resync</h3>
+            <p class="oe_mt32">Wizard to replay a specific order, refund, or stock state on demand.</p>
+            <img class="oe_picture oe_screenshot" src="screen_manual_resync.png" alt="Manual Resync wizard"/>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container oe_dark">
+    <h2 class="oe_slogan">Requirements</h2>
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <ul class="oe_mt32">
+                <li>Odoo 17.0 (Community or Enterprise)</li>
+                <li>Python package: <code>requests</code></li>
+                <li>Active Square Developer account with API credentials</li>
+                <li>Publicly reachable Odoo URL for the webhook endpoint</li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container">
+    <h2 class="oe_slogan">Supported Square Events</h2>
+    <div class="oe_row oe_spaced">
+        <div class="oe_span6">
+            <h3 class="oe_slogan">Orders</h3>
+            <ul>
+                <li><code>order.created</code> &rarr; new sales order</li>
+                <li><code>order.updated</code> &rarr; line changes, exchanges</li>
+            </ul>
+        </div>
+        <div class="oe_span6">
+            <h3 class="oe_slogan">Refunds</h3>
+            <ul>
+                <li><code>refund.created</code> &rarr; credit note and stock return</li>
+                <li><code>refund.updated</code> &rarr; refund state changes</li>
+            </ul>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container oe_dark">
+    <h2 class="oe_slogan">Data and Privacy</h2>
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <p class="oe_mt32">
+                This module communicates only with the Square API endpoints configured
+                by the administrator. No data is sent to third parties. All customer
+                data remains in your Odoo database. Webhook signatures are verified
+                using HMAC-SHA256 against the signing key you provide.
+            </p>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container">
+    <h2 class="oe_slogan">License</h2>
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <p class="oe_mt32">
+                Released under the GNU Affero General Public License v3.0 (AGPL-3).
+                The source code is available on GitHub.
+            </p>
+        </div>
+    </div>
+</section>
+
+<section class="oe_container oe_dark">
+    <h2 class="oe_slogan">Support</h2>
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <p class="oe_mt32">
+                Questions, bug reports, and feature requests:
+                <a href="mailto:support@davai.co">support@davai.co</a>.
+            </p>
+        </div>
+    </div>
+</section>

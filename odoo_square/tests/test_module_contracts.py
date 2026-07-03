@@ -16,7 +16,7 @@ class TestSquareModuleContracts(TransactionCase):
         manifest = load_information_from_description_file("odoo_square")
 
         self.assertEqual(manifest["license"], "AGPL-3")
-        self.assertEqual(manifest["version"], "17.0.1.3.0")
+        self.assertEqual(manifest["version"], "17.0.1.4.0")
         self.assertTrue(manifest["installable"])
         self.assertTrue(manifest["application"])
         self.assertIn("requests", manifest["external_dependencies"]["python"])
@@ -29,7 +29,7 @@ class TestSquareModuleContracts(TransactionCase):
     def test_config_version_formatter_keeps_odoo_and_semver_forms_clear(self):
         formatter = self.env["square.config"]._odoo_version_to_semver
 
-        self.assertEqual(formatter("17.0.1.3.0"), "1.3.0")
+        self.assertEqual(formatter("17.0.1.4.0"), "1.4.0")
         self.assertEqual(formatter("18.0.2.0.4"), "2.0.4")
         self.assertEqual(formatter("1.3.0"), "1.3.0")
         self.assertEqual(formatter("dev"), "dev")
