@@ -120,16 +120,17 @@ docker compose exec odoo odoo \
 
 ### Project Structure
 
+**Note:** On branch `17.0`, the module is at root for Odoo Apps Store. On `master`, it's in `addons/odoo_square/`.
+
 ```
 odoo-square/
-├── addons/
-│   └── odoo_square/           # Main module
-│       ├── controllers/       # Webhook endpoints
-│       ├── models/            # Business logic
-│       ├── views/             # UI definitions
-│       ├── data/              # Default data
-│       ├── security/          # Access rights
-│       └── tests/             # Unit tests
+├── odoo_square/               # Main module (17.0 branch)
+│   ├── controllers/           # Webhook endpoints
+│   ├── models/                # Business logic
+│   ├── views/                 # UI definitions
+│   ├── data/                  # Default data
+│   ├── security/              # Access rights
+│   └── tests/                 # Unit tests
 ├── config/
 │   └── odoo.conf              # Odoo configuration
 ├── docker-compose.yml         # Docker services
