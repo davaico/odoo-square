@@ -48,7 +48,8 @@ class TestStockReturn(SquareHttpCase):
                 "name": "Cardigan Selmana Jaune S",
                 "default_code": "25FWFESUCARSLMJAC-S",
                 "list_price": 110.00,
-                "type": "product",
+                "type": "consu",
+                "is_storable": True,
             }
         )
 
@@ -98,7 +99,8 @@ class TestStockReturn(SquareHttpCase):
         return quant.quantity if quant else 0.0
 
     def _create_confirmed_so_with_delivery(self):
-        """Create a SO, confirm it, deliver from warehouse, and invoice."""
+        """Create a paid sale with completed delivery from the warehouse."""
+        self.env.company.currency_id = self.env.ref("base.EUR")
         so = self.env["sale.order"].create(
             {
                 "partner_id": self.partner.id,
@@ -111,7 +113,8 @@ class TestStockReturn(SquareHttpCase):
                 "order_id": so.id,
                 "product_id": self.product.id,
                 "product_uom_qty": 1,
-                "price_unit": 91.67,
+                "price_unit": 110.00,
+                "tax_id": False,
                 "name": self.product.name,
             }
         )
@@ -145,6 +148,7 @@ class TestStockReturn(SquareHttpCase):
 
         invoice = so._create_invoices()
         invoice.action_post()
+        self.pay_invoice(invoice, self.payment_journal)
 
         return so
 
@@ -241,12 +245,8 @@ class TestStockReturn(SquareHttpCase):
 
         # Stock must be restored
         stock_after_refund = self._get_stock(self.product, self.warehouse)
-        self.assertGreater(
-            stock_after_refund,
-            stock_after_sale,
-            f"Stock should increase after refund return. "
-            f"Before refund: {stock_after_sale}, after: {stock_after_refund}",
-        )
+        self.assertEqual(stock_after_sale, 4)
+        self.assertEqual(stock_after_refund, 5)
 
     @mute_logger(
         "odoo.addons.odoo_square.models.square_refund",
@@ -270,7 +270,7 @@ class TestStockReturn(SquareHttpCase):
             .with_context(active_id=outgoing.id, active_model="stock.picking")
             .create({})
         )
-        result = return_wiz.create_returns()
+        result = return_wiz.action_create_returns_all()
         return_picking = self.env["stock.picking"].browse(result["res_id"])
 
         self.assertEqual(return_picking.picking_type_code, "incoming")

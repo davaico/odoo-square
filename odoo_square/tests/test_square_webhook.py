@@ -47,7 +47,8 @@ class TestSquareWebhook(SquareHttpCase):
         )
 
     def _confirm_pick_deliver_invoice(self, sale_order, stock_qty=100.0):
-        """Stock, deliver outgoing picking (Odoo 17), post invoice — required for refund flows."""
+        """Deliver the order and post and pay its invoice for refund tests."""
+        sale_order.order_line.tax_id = False
         wh = self.env["stock.warehouse"].search([], limit=1)
         self.assertTrue(wh, "Need a warehouse")
         for line in sale_order.order_line:
@@ -71,6 +72,7 @@ class TestSquareWebhook(SquareHttpCase):
         picking.button_validate()
         invoices = sale_order._create_invoices()
         invoices.action_post()
+        self.pay_invoice(invoices)
         return invoices
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
@@ -1414,7 +1416,7 @@ class TestSquareWebhook(SquareHttpCase):
         credit_note = refund.credit_note_id
         self.assertTrue(credit_note)
         sale_order.invalidate_recordset()
-        self.assertAlmostEqual(credit_note.amount_total, refund.refund_amount, delta=0.6)
+        self.assertAlmostEqual(credit_note.amount_total, refund.refund_amount, places=2)
 
         # Verify order refund status
         self.assertEqual(sale_order.refund_status, "fully_refunded")
