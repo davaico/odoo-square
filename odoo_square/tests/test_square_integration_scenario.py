@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 import json
 import logging
-from unittest.mock import patch
+from datetime import datetime
+from unittest.mock import call, patch
+
+from odoo.tests import Form
 from odoo.tests.common import tagged
 from odoo.tools import mute_logger
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
@@ -377,6 +380,179 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
 
         self.created_invoice = invoice
+
+    def _call_admin_button(self, record, method):
+        response = self.url_open(
+            f"/web/dataset/call_button/{record._name}/{method}",
+            json={
+                "jsonrpc": "2.0",
+                "method": "call",
+                "params": {
+                    "model": record._name,
+                    "method": method,
+                    "args": [record.ids],
+                    "kwargs": {},
+                },
+                "id": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertNotIn("error", payload, payload)
+        return payload["result"]
+
+    def _scan_manual_resync(self, admin, start_at, end_at):
+        action = self._call_admin_button(
+            self.square_config, "action_open_manual_resync_wizard"
+        )
+        registered_action = self.env.ref("odoo_square.action_square_manual_resync_wizard")
+        self.assertEqual(action["res_model"], registered_action.res_model)
+        self.assertEqual(action["views"][0][1], "form")
+        self.assertEqual(action["target"], "new")
+        wizard = self.env[action["res_model"]].with_user(admin).browse(action["res_id"])
+        self.assertEqual(wizard.config_id, self.square_config)
+        self.assertEqual(wizard.state, "preview")
+        with Form(wizard) as form:
+            form.start_at = start_at
+            form.end_at = end_at
+
+        scanned = self._call_admin_button(wizard, "action_scan_missing_orders")
+        self.assertEqual(scanned["res_id"], wizard.id)
+        self.assertEqual(wizard.state, "results")
+        return wizard
+
+    def _deselect_resync_order(self, wizard, order_id):
+        line_index = wizard.line_ids.mapped("square_order_id").index(order_id)
+        with Form(wizard) as form:
+            with form.line_ids.edit(line_index) as line:
+                line.selected = False
+        self.assertEqual(wizard.selected_total, 1)
+
+    def test_manual_resync_recovers_only_selected_paid_orders(self):
+        sale_orders = self.env["sale.order"]
+        existing_id = "ORDER_ALREADY_IMPORTED"
+        existing = sale_orders.create(
+            {"square_order_id": existing_id, "partner_id": self.customer.id}
+        )
+        result = self._send_square_order_event(
+            "order.updated", "evt_resync_pending", "OPEN"
+        )
+        self.assertEqual(result["status"], "queued", result)
+        queue = self.env["square.webhook.queue"]
+        queued = queue.search([("webhook_event_id", "=", "evt_resync_pending")])
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued.state, "pending")
+
+        paid = self._mock_get_order("ORDER_L1_001")
+        paid["created_at"] = "2026-09-08T11:00:00+01:00"
+        deferred_id = "ORDER_L1_DEFERRED"
+        deferred = dict(
+            paid,
+            id=deferred_id,
+            tenders=[dict(paid["tenders"][0], id="payment_deferred")],
+        )
+        orders = {paid["id"]: paid, deferred_id: deferred}
+        orders_by_location = {"L1": [paid, deferred, {"id": existing_id}], "L2": []}
+
+        admin = self.env.ref("base.user_admin")
+        self.authenticate(admin.login, admin.login)
+        start_at = datetime(2026, 9, 8, 9, 0)
+        end_at = datetime(2026, 9, 8, 12, 0)
+
+        with (
+            patch.object(
+                SquareApiClient,
+                "get_location_orders",
+                side_effect=lambda *, location_id, **kwargs: orders_by_location[location_id],
+            ) as search_orders,
+            patch.object(
+                SquareApiClient,
+                "get_order",
+                side_effect=lambda order_id, **kwargs: dict(orders[order_id]),
+            ),
+        ):
+            wizard = self._scan_manual_resync(admin, start_at, end_at)
+            self.assertCountEqual(
+                search_orders.call_args_list,
+                [
+                    call(
+                        location_id=location,
+                        limit=500,
+                        start_at=start_at,
+                        end_at=end_at,
+                        states=["OPEN", "COMPLETED"],
+                        square_config=self.square_config,
+                    )
+                    for location in ("L1", "L2")
+                ],
+            )
+            self.assertEqual((wizard.square_total, wizard.odoo_total), (3, 1))
+            self.assertEqual((wizard.missing_total, wizard.selected_total), (2, 2))
+            self.assertCountEqual(wizard.line_ids.mapped("square_order_id"), orders)
+            paid_line = wizard.line_ids.filtered(
+                lambda line: line.square_order_id == paid["id"]
+            )
+            self.assertEqual(paid_line.created_at, datetime(2026, 9, 8, 10, 0))
+            self.assertAlmostEqual(paid_line.total_amount, 3.60, places=2)
+            self._deselect_resync_order(wizard, deferred_id)
+
+            overlapping_scan = self._scan_manual_resync(admin, start_at, end_at)
+            self._deselect_resync_order(overlapping_scan, deferred_id)
+
+            validated = self._call_admin_button(wizard, "action_validate_resync")
+            self.assertEqual(validated["res_id"], wizard.id)
+            self.assertEqual(wizard.state, "done")
+            self.assertEqual((wizard.processed_count, wizard.error_count), (1, 0))
+            self._assert_paid_square_sale()
+            recovered_order = self.created_sale_order
+            invoice = self.created_invoice
+            payment = invoice.reconciled_payment_ids
+            delivery = recovered_order.picking_ids
+
+            # The other dialog still lists the order it found before the recovery.
+            self._call_admin_button(overlapping_scan, "action_validate_resync")
+            self.assertEqual(overlapping_scan.state, "done")
+            self.assertEqual(
+                (overlapping_scan.processed_count, overlapping_scan.error_count), (1, 0)
+            )
+            self._assert_paid_square_sale()
+            self.assertEqual(self.created_sale_order, recovered_order)
+            self.assertEqual(self.created_invoice, invoice)
+            self.assertEqual(invoice.reconciled_payment_ids, payment)
+            self.assertEqual(recovered_order.picking_ids, delivery)
+
+            # A fresh scan recognizes the recovered sale and still offers the deferred one.
+            fresh_scan = self._scan_manual_resync(admin, start_at, end_at)
+            self.assertEqual((fresh_scan.square_total, fresh_scan.odoo_total), (3, 2))
+            self.assertEqual((fresh_scan.missing_total, fresh_scan.selected_total), (1, 1))
+            self.assertEqual(fresh_scan.line_ids.square_order_id, deferred_id)
+
+        self.assertFalse(sale_orders.search([("square_order_id", "=", deferred_id)]))
+        self.assertEqual(sale_orders.search([("square_order_id", "=", existing_id)]), existing)
+        self.assertEqual(existing.state, "draft")
+        self.assertFalse(existing.invoice_ids)
+        self.assertFalse(existing.picking_ids)
+        self.assertEqual(queue.search([("square_order_id", "=", paid["id"])]), queued)
+        self.assertEqual(queued.state, "completed")
+        self.assertEqual(queued.retry_count, 1)
+        self.assertTrue(queued.processed_at)
+
+        logs = self.env["square.integration.log"].with_user(admin)
+        batches = logs.search([("event_type", "=", "manual_resync")])
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(set(batches.mapped("status")), {"success"})
+        for batch in batches:
+            self.assertIn("Successfully Processed: 1", batch.description)
+            self.assertIn("Errors: 0", batch.description)
+        recovered_logs = logs.search(
+            [
+                ("sale_order_id", "=", recovered_order.id),
+                ("square_order_id", "=", paid["id"]),
+                ("status", "=", "success"),
+            ]
+        )
+        self.assertIn("order_updated", recovered_logs.mapped("event_type"))
+        self.assertIn("stock_sync", recovered_logs.mapped("event_type"))
 
     def test_paid_sale_import_and_replay(self):
         self._import_paid_square_sale()
