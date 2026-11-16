@@ -246,6 +246,19 @@ class SquareOrderProcessor(models.Model):
                 self._process_order_completion(sale_order, square_order_data)
 
             elif square_order_state in ["OPEN", "DRAFT"]:
+                # Square's order.updated notification contains order metadata.
+                if not any(
+                    key in square_order_data
+                    for key in ("line_items", "returns", "return_line_items")
+                ):
+                    # A delayed OPEN notice can arrive after the quote is closed.
+                    if sale_order.state not in ("draft", "sent"):
+                        return result
+                    fetched_order = self.env["square.api.client"].get_order(square_order_id)
+                    if not fetched_order:
+                        raise ValueError(f"Could not retrieve Square order {square_order_id}")
+                    square_order_data = {**fetched_order, **square_order_data}
+
                 # Skip line sync when the payload carries return/exchange data;
                 # these must go through the dedicated refund/exchange flows only.
                 returns = square_order_data.get("returns") or square_order_data.get("return_line_items")
@@ -257,8 +270,7 @@ class SquareOrderProcessor(models.Model):
                 else:
                     self._sync_order_line_changes(sale_order, square_order_data)
 
-            elif square_order_state in ("CANCELED", "CANCELLED"):
-                # Handle order cancellation (Square uses both spellings)
+            elif str(square_order_state).upper() in ("CANCELED", "CANCELLED"):
                 self._process_order_cancellation(sale_order, square_order_data)
 
             else:
@@ -397,10 +409,10 @@ class SquareOrderProcessor(models.Model):
                 # Update existing line
                 odoo_line = odoo_lines[square_line_id]
                 if odoo_line.product_uom_qty != quantity:
-                    odoo_line.write({"product_uom_qty": quantity})
                     updated_lines.append(
-                        f"{odoo_line.product_id.name}: {odoo_line.product_uom_qty} -> {quantity}"
+                        f"{odoo_line.product_id.name}: {odoo_line.product_uom_qty:g} -> {quantity}"
                     )
+                    odoo_line.write({"product_uom_qty": quantity})
                 odoo_lines.pop(square_line_id)
             else:
                 # This is a new line - for now, just log it
