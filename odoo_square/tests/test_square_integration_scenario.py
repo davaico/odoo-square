@@ -1153,7 +1153,15 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self._assert_paid_square_sale()
 
     def _send_square_refund_event(
-        self, event_type, event_id, refund_id, status, amount_cents, refunded_line_ids=()
+        self,
+        event_type,
+        event_id,
+        refund_id,
+        status,
+        amount_cents,
+        refunded_line_ids=(),
+        *,
+        expected_status_code=200,
     ):
         refund = {
             "id": refund_id,
@@ -1174,7 +1182,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             }),
             headers={"Content-Type": "application/json"},
         )
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, expected_status_code, response.text)
         return response.json()
 
     def _assert_refund_links(self, refund_id, amount):
@@ -1441,6 +1449,83 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         )
         self.assertAlmostEqual(order.total_refunded_amount, 1.20, places=2)
         self.assertEqual(order.refund_status, "partially_refunded")
+
+    def test_explicit_partial_refund_keeps_its_return_when_square_order_lookup_fails(self):
+        self._import_paid_square_sale()
+        delivery = self.created_sale_order.picking_ids
+        refund_id = "REFUND_EXPLICIT_LOOKUP_UNAVAILABLE"
+        result = self._send_square_refund_event(
+            "refund.created", "evt_explicit_lookup_pending", refund_id, "PENDING", 120,
+            ("line_1",),
+        )
+        self.assertEqual(result["status"], "success", result)
+        refund = self._assert_refund_links(refund_id, 1.20)
+        prepared_return = refund.return_picking_ids
+        self.assertEqual(prepared_return.move_ids.product_id, self.product_p1)
+
+        with patch.object(SquareApiClient, "get_order", return_value=None):
+            result = self._send_square_refund_event(
+                "refund.updated", "evt_explicit_lookup_completed", refund_id, "COMPLETED", 120,
+                ("line_1",),
+            )
+        self.assertEqual(result["status"], "success", result)
+        self._assert_refund_payment(refund)
+        self.assertEqual(refund.return_picking_ids, prepared_return)
+        self.assertEqual(delivery.return_ids, prepared_return)
+        self._assert_completed_return(refund, delivery, {self.product_p1: 1})
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 50)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
+
+    def test_overlapping_partial_refund_replays_after_earlier_reservation_is_released(self):
+        self._import_paid_square_sale()
+        delivery = self.created_sale_order.picking_ids
+        sale_payment = self.created_invoice.reconciled_payment_ids
+        earlier_id = "REFUND_PENDING_RESERVATION"
+        later_id = "REFUND_COMPLETED_BEFORE_RELEASE"
+        for refund_id in (earlier_id, later_id):
+            result = self._send_square_refund_event(
+                "refund.created", f"{refund_id}_pending", refund_id, "PENDING", 120,
+                ("line_1",),
+            )
+            self.assertEqual(result["status"], "success", result)
+
+        earlier = self._assert_refund_links(earlier_id, 1.20)
+        later = self._assert_refund_links(later_id, 1.20)
+        earlier_return = earlier.return_picking_ids
+        self.assertEqual(len(earlier_return), 1)
+        later_credit_note = later.credit_note_id
+        completion_event = (
+            "refund.updated", f"{later_id}_completed", later_id, "COMPLETED", 120, ("line_1",),
+        )
+        result = self._send_square_refund_event(*completion_event, expected_status_code=503)
+        self.assertEqual(result["status"], "retry", result)
+        self.assertFalse(later.processed_at)
+        self.assertFalse(later.return_picking_ids)
+        self.assertEqual(later_credit_note.state, "draft")
+        self.assertFalse(later_credit_note.reconciled_payment_ids)
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+
+        result = self._send_square_refund_event(
+            "refund.updated", f"{earlier_id}_failed", earlier_id, "FAILED", 120,
+            ("line_1",),
+        )
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(earlier_return.state, "cancel")
+
+        for expected_status in ("success", "already_processed"):
+            result = self._send_square_refund_event(*completion_event)
+            self.assertEqual(result["status"], expected_status, result)
+            self.assertTrue(later.processed_at)
+            self.assertEqual(later.credit_note_id, later_credit_note)
+            payment = self._assert_refund_payment(later)
+            self._assert_completed_return(later, delivery, {self.product_p1: 1})
+            self.assertEqual(delivery.return_ids, earlier_return | later.return_picking_ids)
+            self.assertEqual(
+                self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+                sale_payment | payment,
+            )
+            self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 50)
+            self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
 
     def test_pending_partial_refund_prepares_stock_after_earlier_refund_fails(self):
         self._import_paid_square_sale()

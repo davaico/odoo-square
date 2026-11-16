@@ -104,7 +104,9 @@ class SquareWebhookController(http.Controller):
                 )
 
             return http.Response(
-                json.dumps(result), content_type="application/json", status=200
+                json.dumps(result),
+                content_type="application/json",
+                status=503 if result.get("status") == "retry" else 200,
             )
 
         except ValidationError as e:

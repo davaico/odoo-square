@@ -9,6 +9,10 @@ import logging
 _logger = logging.getLogger(__name__)
 
 
+class RefundProcessingDeferred(UserError):
+    """The refund can be completed once its return can be resolved."""
+
+
 class SquareRefund(models.Model):
     _name = "square.refund"
     _description = "Square Refund Tracking"
@@ -334,6 +338,11 @@ class SquareRefund(models.Model):
                 "refund_id": refund_id,
                 "refund_record_id": refund_record.id,
             }
+
+        except RefundProcessingDeferred as e:
+            refund_record.processing_errors = str(e)
+            _logger.warning("Deferring Square refund %s: %s", refund_id, e)
+            return {"status": "retry", "message": str(e), "refund_id": refund_id}
 
         except Exception as e:
             _logger.error(
@@ -715,6 +724,8 @@ class SquareRefund(models.Model):
                     square_refund_id=self.square_refund_id,
                     sale_order_id=sale_order.id,
                 )
+        except RefundProcessingDeferred:
+            raise
         except Exception as e:
             _logger.error("Error creating pending refund actions: %s", e)
             self.processing_errors = str(e)
@@ -815,6 +826,8 @@ class SquareRefund(models.Model):
                     square_refund_id=self.square_refund_id,
                     sale_order_id=self.sale_order_id.id,
                 )
+        except RefundProcessingDeferred:
+            raise
         except Exception as e:
             _logger.error("Error completing refund: %s", e)
             self.processing_errors = str(e)
@@ -882,6 +895,21 @@ class SquareRefund(models.Model):
                 action = wizard.action_create_returns()
                 self.return_picking_ids = [(4, action["res_id"])]
 
+        if self.status == "completed":
+            other_returns = (
+                deliveries.move_ids.returned_move_ids - self.return_picking_ids.move_ids
+            ).filtered(
+                lambda move: move.state not in ("done", "cancel") and move.product_uom_qty > 0
+            )
+            reserved_lines = other_returns.origin_returned_move_id.sale_line_id
+            if any(
+                line.product_uom_id.compare(remaining.get(line, 0), 0) > 0
+                for line in reserved_lines
+            ):
+                raise RefundProcessingDeferred(
+                    "Un autre retour réserve les articles de ce remboursement."
+                )
+
     def _get_partial_return_quantities(self):
         """Get the requested quantities per sale line in its own unit."""
         remaining = {
@@ -900,10 +928,15 @@ class SquareRefund(models.Model):
                         quantities[line] = self._calculate_return_quantity_for_line(line, item)
                 return quantities
 
-            _logger.warning(
-                f"No order details available from Square for refund {self.square_refund_id}, "
-                "falling back to proportional distribution"
+            requested_ids = set(self.refunded_line_ids)
+            matching_lines = self.sale_order_id.order_line.filtered(
+                lambda line: line.square_line_id in requested_ids
             )
+            if not requested_ids.issubset(matching_lines.mapped("square_line_id")):
+                raise RefundProcessingDeferred(
+                    "Les articles du remboursement Square ne sont pas encore identifiables."
+                )
+            return {line: remaining[line] for line in matching_lines if line in remaining}
 
         total_order_amount = sum(
             quantity * line.price_total / line.product_uom_qty
@@ -1278,7 +1311,7 @@ class SquareRefund(models.Model):
         returned_moves = self.return_picking_ids.move_ids.filtered(
             lambda move: move.state == "done" and move.origin_returned_move_id.sale_line_id
         )
-        if returned_moves:
+        if returned_moves or self.refunded_line_ids:
             bot_user = self._get_bot_user()
             quantities = defaultdict(float)
             for move in returned_moves:
@@ -1286,6 +1319,8 @@ class SquareRefund(models.Model):
                 quantities[line] += move.product_uom._compute_quantity(
                     move.quantity, line.product_uom_id, round=False
                 )
+            if not returned_moves:
+                quantities = self._get_partial_return_quantities()
             for line, quantity in quantities.items():
                 returned_qty = line.update_returned_quantity(quantity)
                 self._add_adjustment_line(line, returned_qty, bot_user)
