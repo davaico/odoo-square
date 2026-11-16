@@ -284,6 +284,38 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.assertIn(result["status"], ("success", "updated"), result)
         self._assert_paid_square_sale()
 
+    def _confirm_sale_and_deliver_first_shipment(self):
+        square_order = self._mock_get_order("ORDER_L1_001")
+        square_order["state"] = "OPEN"
+        with patch.object(SquareApiClient, "get_order", return_value=square_order):
+            result = self._send_square_order_event(
+                "order.created", "evt_open_split_sale", "OPEN"
+            )
+        self.assertEqual(result["status"], "success", result)
+        order = self._assert_square_sale_order("draft")
+        order.action_confirm()
+        first = order.picking_ids
+        first.action_assign()
+        first.move_ids.filtered(lambda move: move.product_id == self.product_p2).quantity = 1
+        first.with_context(skip_backorder=True).button_validate()
+        self.assertEqual(first.state, "done")
+        backorder = order.picking_ids - first
+        self.assertEqual(len(backorder), 1)
+        self.assertEqual(backorder.backorder_id, first)
+        self.assertEqual(backorder.move_ids.product_id, self.product_p2)
+        self.assertEqual(backorder.move_ids.product_uom_qty, 1)
+        return order, first, backorder
+
+    def _import_paid_square_sale_with_split_delivery(self):
+        order, first, backorder = self._confirm_sale_and_deliver_first_shipment()
+        result = self._send_square_order_event(
+            "order.updated", "evt_paid_split_sale", "COMPLETED"
+        )
+        self.assertEqual(result["status"], "updated", result)
+        self.assertEqual(backorder.state, "done")
+        self._assert_paid_square_sale(delivery_count=2)
+        return first, backorder
+
     def test_open_and_draft_square_order_updates_and_replay(self):
         initial_order = self._mock_get_order("ORDER_L1_001")
         initial_order.update(state="OPEN", tenders=[])
@@ -507,7 +539,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.created_customer = order.partner_id
         return order
 
-    def _assert_paid_square_sale(self):
+    def _assert_paid_square_sale(self, delivery_count=1):
         order = self._assert_square_sale_order("sale")
         invoice = order.invoice_ids
         self.assertEqual(len(invoice), 1)
@@ -542,17 +574,16 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             invoice_receivable.full_reconcile_id, payment_receivable.full_reconcile_id
         )
 
-        delivery = order.picking_ids
-        self.assertEqual(len(delivery), 1)
-        self.assertEqual(delivery.picking_type_code, "outgoing")
-        self.assertEqual(delivery.state, "done")
-        self.assertEqual(delivery.location_id, self.warehouse_w1.lot_stock_id)
-        self.assertEqual(len(delivery.move_ids), 2)
-        self.assertEqual(set(delivery.move_ids.mapped("state")), {"done"})
-        self.assertEqual(
-            {move.product_id: move.quantity for move in delivery.move_ids},
-            {self.product_p1: 1, self.product_p2: 2},
-        )
+        deliveries = order.picking_ids
+        self.assertEqual(len(deliveries), delivery_count)
+        self.assertEqual(set(deliveries.mapped("picking_type_code")), {"outgoing"})
+        self.assertEqual(set(deliveries.mapped("state")), {"done"})
+        self.assertEqual(deliveries.location_id, self.warehouse_w1.lot_stock_id)
+        self.assertEqual(len(deliveries.move_ids), delivery_count + 1)
+        self.assertEqual(set(deliveries.move_ids.mapped("state")), {"done"})
+        for product, quantity in ((self.product_p1, 1), (self.product_p2, 2)):
+            moves = deliveries.move_ids.filtered(lambda move: move.product_id == product)
+            self.assertEqual(sum(moves.mapped("quantity")), quantity)
         for product, quantity in ((self.product_p1, 49), (self.product_p2, 48)):
             self.assertEqual(
                 self._get_stock_quantity(product, self.warehouse_w1), quantity
@@ -1175,6 +1206,33 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                 self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), 50)
                 self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
 
+    def test_full_refund_returns_only_the_outstanding_shipment(self):
+        first, backorder = self._import_paid_square_sale_with_split_delivery()
+        wizard = self.env["stock.return.picking"].with_user(
+            self.env.ref("base.user_admin")
+        ).create({"picking_id": first.id})
+        action = wizard.action_create_returns_all()
+        manual_return = self.env["stock.picking"].browse(action["res_id"])
+        manual_return.button_validate()
+        self.assertEqual(manual_return.state, "done")
+
+        refund_id = "REFUND_SPLIT_FULL"
+        result = self._send_square_refund_event(
+            "refund.updated", "evt_split_full_done", refund_id, "COMPLETED", 360
+        )
+        self.assertEqual(result["status"], "success", result)
+        refund = self._assert_refund_links(refund_id, 3.60)
+        self._assert_refund_payment(refund)
+        self.assertEqual(first.return_ids, manual_return)
+        self.assertEqual(len(backorder.return_ids), 1)
+        self.assertEqual(refund.return_picking_ids, manual_return | backorder.return_ids)
+        self.assertEqual(backorder.return_ids.state, "done")
+        self.assertEqual(backorder.return_ids.move_ids.origin_returned_move_id, backorder.move_ids)
+        self.assertEqual(backorder.return_ids.move_ids.quantity, 1)
+        for product in (self.product_p1, self.product_p2):
+            self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), 50)
+            self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
+
     def test_partial_refund_of_paid_sale(self):
         self._import_paid_square_sale()
         order = self.created_sale_order
@@ -1271,6 +1329,41 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             self.assertEqual(order.order_line.filtered(lambda line: line.square_line_id == "line_1").returned_qty, 1)
             self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 50)
             self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
+
+    def test_partial_refund_returns_one_sale_line_across_two_deliveries(self):
+        first, backorder = self._import_paid_square_sale_with_split_delivery()
+        refund_id = "REFUND_SPLIT_PARTIAL"
+        result = self._send_square_refund_event(
+            "refund.created", "evt_split_partial_pending", refund_id, "PENDING", 240,
+            ("line_2",),
+        )
+        self.assertEqual(result["status"], "success", result)
+        refund = self._assert_refund_links(refund_id, 2.40)
+        credit_note = refund.credit_note_id
+        picks = refund.return_picking_ids
+        self.assertEqual(len(picks), 2)
+        self.assertEqual(picks.return_id, first | backorder)
+        self.assertEqual(credit_note.state, "draft")
+
+        result = self._send_square_refund_event(
+            "refund.updated", "evt_split_partial_done", refund_id, "COMPLETED", 240,
+            ("line_2",),
+        )
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(refund.credit_note_id, credit_note)
+        self._assert_refund_payment(refund)
+        self.assertEqual(refund.return_picking_ids, picks)
+        for delivery in first | backorder:
+            picking = delivery.return_ids
+            self.assertEqual(len(picking), 1)
+            self.assertIn(picking, picks)
+            self.assertEqual(picking.state, "done")
+            self.assertEqual(picking.location_dest_id, self.warehouse_w1.lot_stock_id)
+            self.assertEqual(picking.move_ids.product_id, self.product_p2)
+            self.assertEqual(picking.move_ids.quantity, 1)
+            self.assertEqual(picking.move_ids.origin_returned_move_id.picking_id, delivery)
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 50)
 
     def test_unsuccessful_full_refunds_cancel_prepared_actions(self):
         self._import_paid_square_sale()
