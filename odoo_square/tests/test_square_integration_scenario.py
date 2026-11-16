@@ -1356,6 +1356,102 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                 self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), 50)
                 self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
 
+    def test_full_refund_completes_a_prepared_odoo_return(self):
+        self._import_paid_square_sale()
+        delivery = self.created_sale_order.picking_ids
+        wizard = self.env["stock.return.picking"].with_user(
+            self.env.ref("base.user_admin")
+        ).create({"picking_id": delivery.id})
+        action = wizard.action_create_returns_all()
+        manual_return = self.env["stock.picking"].browse(action["res_id"])
+        prepared_state = manual_return.state
+        self.assertNotIn(prepared_state, ("done", "cancel"))
+
+        failed_id = "REFUND_FAILED_WITH_OPEN_RETURN"
+        refund_id = "REFUND_PREPARED_ODOO_RETURN"
+        for event_type, event_id, square_refund_id, status in (
+            ("refund.created", "evt_prepared_previous_pending", failed_id, "PENDING"),
+            ("refund.updated", "evt_prepared_previous_failed", failed_id, "FAILED"),
+            ("refund.created", "evt_prepared_pending", refund_id, "PENDING"),
+        ):
+            result = self._send_square_refund_event(
+                event_type, event_id, square_refund_id, status, 360
+            )
+            self.assertEqual(result["status"], "success", result)
+            self.assertEqual(delivery.return_ids, manual_return)
+            self.assertEqual(manual_return.state, prepared_state)
+            self.assertFalse(self._assert_refund_links(square_refund_id, 3.60).return_picking_ids)
+            self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+            self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
+
+        for event_id, status in (
+            ("evt_prepared_odoo_return", "success"),
+            ("evt_prepared_odoo_return_retry", "already_processed"),
+        ):
+            result = self._send_square_refund_event(
+                "refund.updated", event_id, refund_id, "COMPLETED", 360
+            )
+            self.assertEqual(result["status"], status, result)
+            refund = self._assert_refund_links(refund_id, 3.60)
+            self._assert_refund_payment(refund)
+            self.assertEqual(refund.return_picking_ids, manual_return)
+            self.assertEqual(delivery.return_ids, manual_return)
+            self._assert_completed_return(
+                refund, delivery, {self.product_p1: 1, self.product_p2: 2}
+            )
+            for product in (self.product_p1, self.product_p2):
+                self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), 50)
+
+    def test_replacement_full_refund_links_returns_after_failure(self):
+        first, backorder = self._import_paid_square_sale_with_split_delivery()
+        admin = self.env.ref("base.user_admin")
+        wizard = self.env["stock.return.picking"].with_user(admin).create(
+            {"picking_id": first.id}
+        )
+        action = wizard.action_create_returns_all()
+        manual_return = self.env["stock.picking"].browse(action["res_id"])
+        manual_return.with_user(admin).button_validate()
+        self.assertEqual(manual_return.state, "done")
+
+        failed_id = "REFUND_FAILED_AFTER_RETURN"
+        result = self._send_square_refund_event(
+            "refund.created", "evt_prior_return_pending", failed_id, "PENDING", 360
+        )
+        self.assertEqual(result["status"], "success", result)
+        failed = self._assert_refund_links(failed_id, 3.60)
+        prepared_return = backorder.return_ids
+        self.assertEqual(len(prepared_return), 1)
+        completed_returns = manual_return | prepared_return
+        self.assertEqual(failed.return_picking_ids, completed_returns)
+        prepared_return.with_user(admin).button_validate()
+        self.assertEqual(prepared_return.state, "done")
+
+        result = self._send_square_refund_event(
+            "refund.updated", "evt_prior_return_failed", failed_id, "FAILED", 360
+        )
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(failed.credit_note_id.state, "cancel")
+
+        replacement_id = "REFUND_REPLACEMENT_AFTER_RETURN"
+        for event_id, status in (
+            ("evt_replacement_after_return", "success"),
+            ("evt_replacement_after_return_retry", "already_processed"),
+        ):
+            result = self._send_square_refund_event(
+                "refund.updated", event_id, replacement_id, "COMPLETED", 360
+            )
+            self.assertEqual(result["status"], status, result)
+            replacement = self._assert_refund_links(replacement_id, 3.60)
+            self._assert_refund_payment(replacement)
+            self.assertEqual(replacement.return_picking_ids, completed_returns)
+            self.assertEqual(failed.return_picking_ids, completed_returns)
+            self.assertEqual(first.return_ids, manual_return)
+            self.assertEqual(backorder.return_ids, prepared_return)
+            self.assertEqual(set(completed_returns.mapped("state")), {"done"})
+            self.assertFalse(failed.credit_note_id.reconciled_payment_ids)
+            for product in (self.product_p1, self.product_p2):
+                self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), 50)
+
     def test_full_refund_leaves_an_exchange_return_on_its_own_transaction(self):
         self._run_square_exchange(replacement_cents=120, payment_cents=0)
         delivery = self.created_sale_order.picking_ids.filtered(

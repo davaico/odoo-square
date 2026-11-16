@@ -1014,26 +1014,42 @@ class SquareRefund(models.Model):
         return 0
 
     def _create_full_return_picking(self):
-        """Link completed Odoo returns and prepare any remaining goods."""
+        """Reuse matching Odoo returns and prepare any remaining goods."""
         delivery_pickings = self.sale_order_id.picking_ids.filtered(
             lambda picking: picking.picking_type_code == "outgoing" and picking.state == "done"
         )
-        completed_returns = delivery_pickings.move_ids.returned_move_ids.filtered(
-            lambda move: move.state == "done"
+        return_moves = delivery_pickings.move_ids.returned_move_ids.filtered(
+            lambda move: move.state != "cancel"
             and move.picking_id.return_id == move.origin_returned_move_id.picking_id
             and move.picking_id.picking_type_code == "incoming"
-        ).picking_id.filtered(lambda picking: picking.state == "done")
-        # Older Square exchange returns were created by the integration user.
-        square_bot = self.env.ref("odoo_square.user_square_bot", raise_if_not_found=False)
-        completed_returns = completed_returns.filtered(
-            lambda picking: not picking.square_exchange_order_id
-            and picking.create_uid != square_bot
         )
-        claimed_returns = self.search([
+        candidate_returns = return_moves.picking_id.filtered(
+            lambda picking: not picking.square_exchange_order_id
+        )
+        other_refunds = self.search([
             ("id", "!=", self.id),
-            ("return_picking_ids", "in", completed_returns.ids),
-        ]).return_picking_ids
-        self.return_picking_ids |= completed_returns - claimed_returns
+            ("return_picking_ids", "in", candidate_returns.ids),
+        ])
+        claimed_returns = other_refunds.filtered(
+            lambda refund: refund.status in ("pending", "completed")
+        ).return_picking_ids
+        linked_returns = other_refunds.return_picking_ids
+        square_bot = self.env.ref("odoo_square.user_square_bot", raise_if_not_found=False)
+        # A refund link distinguishes a bot-created return from an older Square exchange.
+        self.return_picking_ids |= (candidate_returns - claimed_returns).filtered(
+            lambda picking: picking.state == "done"
+            and (picking.create_uid != square_bot or picking in linked_returns)
+        )
+        if self.status == "completed":
+            # Link open operator returns at completion so failure cannot cancel them.
+            self.return_picking_ids |= (candidate_returns - linked_returns).filtered(
+                lambda picking: picking.state not in ("done", "cancel")
+                and picking.create_uid != square_bot
+                and not (
+                    picking.move_ids.filtered(lambda move: move.state != "cancel")
+                    - return_moves
+                )
+            )
 
         wizard_model = self.env["stock.return.picking"].with_user(self._get_bot_user())
         for delivery in delivery_pickings:
