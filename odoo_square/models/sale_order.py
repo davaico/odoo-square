@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from ast import literal_eval
 from datetime import datetime, timezone
 from decimal import Decimal
 import logging
@@ -37,6 +38,12 @@ class SaleOrder(models.Model):
         copy=False,
     )
 
+    square_order_version = fields.Integer(
+        string="Square Order Version",
+        help="Version of the last Square line snapshot applied to this quotation",
+        copy=False,
+    )
+
     is_square_order = fields.Boolean(
         string="Is Square Order",
         compute="_compute_is_square_order",
@@ -70,6 +77,25 @@ class SaleOrder(models.Model):
         store=True,
         help="Current refund status of the order",
     )
+
+    @staticmethod
+    def _square_snapshot_version(order_data):
+        version = order_data.get("version")
+        return version if type(version) is int and 0 < version <= 2**31 - 1 else 0
+
+    def _square_applied_order_version(self):
+        self.ensure_one()
+        if self.square_order_version or not self.square_order_data:
+            return self.square_order_version
+
+        # Imported quotes already retain the original Square snapshot as str(dict).
+        try:
+            order_data = literal_eval(self.square_order_data)
+        except (SyntaxError, ValueError):
+            return 0
+        if isinstance(order_data, dict) and "line_items" in order_data:
+            return self._square_snapshot_version(order_data)
+        return 0
 
     @api.depends("square_order_id")
     def _compute_is_square_order(self):

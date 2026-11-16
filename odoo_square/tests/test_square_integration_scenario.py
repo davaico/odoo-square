@@ -2039,3 +2039,79 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.assertEqual(line.returned_qty, 1)
         self.assertEqual(line.effective_qty, 1)
         self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+
+    def _create_versioned_square_quote(self, version=1):
+        snapshot = self._mock_get_order("ORDER_L1_001")
+        snapshot.update(state="OPEN", version=version, tenders=[])
+        with patch.object(SquareApiClient, "get_order", return_value=snapshot):
+            result = self._send_square_order_event(
+                "order.created", "evt_versioned_quote", "OPEN",
+            )
+        self.assertEqual(result["status"], "success", result)
+        order = self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")])
+        self.assertEqual(len(order), 1)
+        self.assertEqual(order.state, "draft")
+        return order, snapshot
+
+    def _versioned_quote_lines(self, snapshot, quantity):
+        return [dict(
+            snapshot["line_items"][0],
+            quantity=str(quantity),
+            total_money={"amount": 120 * quantity, "currency": "EUR"},
+            total_tax_money={"amount": 20 * quantity, "currency": "EUR"},
+        ), snapshot["line_items"][1]]
+
+    def test_editable_quote_ignores_older_and_repeated_square_versions(self):
+        order, snapshot = self._create_versioned_square_quote(version=3)
+        line = order.order_line.filtered(lambda item: item.square_line_id == "line_1")
+        # The imported snapshot already represents version 3.
+        result = self._send_square_order_event(
+            "order.updated", "evt_older_than_import", "OPEN", version=2,
+            line_items=self._versioned_quote_lines(snapshot, 3),
+        )
+        self.assertEqual(line.product_uom_qty, 1, result)
+        for version, quantity in ((4, 4), (3, 3), (4, 5)):
+            result = self._send_square_order_event(
+                "order.updated", f"evt_quote_{version}_{quantity}", "OPEN",
+                version=version, line_items=self._versioned_quote_lines(snapshot, quantity),
+            )
+            self.assertEqual(line.product_uom_qty, 4, result)
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(order.picking_ids)
+
+    def test_editable_quote_versions_the_fetched_line_snapshot(self):
+        order, snapshot = self._create_versioned_square_quote()
+        line = order.order_line.filtered(lambda item: item.square_line_id == "line_1")
+        fetched = dict(snapshot, version=3, line_items=self._versioned_quote_lines(snapshot, 4))
+        with patch.object(SquareApiClient, "get_order", return_value=fetched):
+            result = self._send_square_order_event(
+                "order.updated", "evt_metadata_newer_than_snapshot", "OPEN", version=4,
+            )
+        self.assertEqual(line.product_uom_qty, 4, result)
+        result = self._send_square_order_event(
+            "order.updated", "evt_actual_version_four", "OPEN", version=4,
+            line_items=self._versioned_quote_lines(snapshot, 5),
+        )
+        self.assertEqual(line.product_uom_qty, 5, result)
+        with patch.object(SquareApiClient, "get_order", return_value=fetched):
+            result = self._send_square_order_event(
+                "order.updated", "evt_metadata_old_snapshot", "OPEN", version=5,
+            )
+        self.assertEqual(line.product_uom_qty, 5, result)
+
+    def test_editable_quote_does_not_consume_version_without_lines(self):
+        order, snapshot = self._create_versioned_square_quote()
+        line = order.order_line.filtered(lambda item: item.square_line_id == "line_1")
+        metadata = {key: value for key, value in snapshot.items() if key != "line_items"}
+        metadata["version"] = 3
+        with patch.object(SquareApiClient, "get_order", return_value=metadata):
+            result = self._send_square_order_event(
+                "order.updated", "evt_metadata_without_lines", "OPEN", version=3,
+            )
+        self.assertEqual(line.product_uom_qty, 1, result)
+        result = self._send_square_order_event(
+            "order.updated", "evt_later_complete_snapshot", "OPEN", version=2,
+            line_items=self._versioned_quote_lines(snapshot, 4),
+        )
+        self.assertEqual(line.product_uom_qty, 4, result)
+        self.assertEqual(order.square_order_version, 2)
