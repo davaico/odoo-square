@@ -2115,3 +2115,61 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         )
         self.assertEqual(line.product_uom_qty, 4, result)
         self.assertEqual(order.square_order_version, 2)
+
+    def test_completed_refund_retries_after_native_payment_serialization_failure(self):
+        self._import_paid_square_sale()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        delivery = order.picking_ids
+        sale_payment = invoice.reconciled_payment_ids
+        refund_id = "REFUND_PAYMENT_SERIALIZATION_RETRY"
+        result = self._send_square_refund_event(
+            "refund.created", "evt_payment_retry_pending", refund_id, "PENDING", 120,
+            ("line_1",),
+        )
+        self.assertEqual(result["status"], "success", result)
+        refund = self._assert_refund_links(refund_id, 1.20)
+        credit = refund.credit_note_id
+        prepared = refund.return_picking_ids
+        register_model = type(self.env["account.payment.register"])
+        create_payments = register_model.action_create_payments
+        attempts = []
+
+        def create_payment_with_serialization_failure(register):
+            result = create_payments(register)
+            attempts.append(register.id)
+            if len(attempts) == 1:
+                register.env.cr.execute("""
+                    DO $$ BEGIN
+                        RAISE EXCEPTION 'Square refund payment retry test' USING ERRCODE = '40001';
+                    END $$;
+                """)
+            return result
+
+        with patch.object(register_model, "action_create_payments", create_payment_with_serialization_failure):
+            result = self._send_square_refund_event(
+                "refund.updated", "evt_payment_retry_completed", refund_id, "COMPLETED", 120,
+                ("line_1",),
+            )
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(len(attempts), 2)
+        payment = self._assert_refund_payment(refund)
+        self.assertTrue(refund.processed_at)
+        self.assertEqual(refund.credit_note_id, credit)
+        self.assertEqual(invoice.reversal_move_ids, credit)
+        self.assertEqual(refund.return_picking_ids, prepared)
+        self._assert_completed_return(refund, delivery, {self.product_p1: 1})
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 50)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
+        for event_id in ("evt_payment_retry_completed", "evt_payment_retry_replayed"):
+            result = self._send_square_refund_event(
+                "refund.updated", event_id, refund_id, "COMPLETED", 120, ("line_1",),
+            )
+            self.assertEqual(result["status"], "already_processed", result)
+        self.assertEqual(order.square_refund_ids, refund)
+        self.assertEqual(invoice.reversal_move_ids, credit)
+        self.assertEqual(delivery.return_ids, prepared)
+        self.assertEqual(
+            self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+            sale_payment | payment,
+        )

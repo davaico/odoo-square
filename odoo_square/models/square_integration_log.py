@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Copyright 2024 Davai
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo import models, fields, api
 import logging
 
@@ -116,6 +117,8 @@ class SquareIntegrationLog(models.Model):
 
             return self.create(vals)
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error creating Square integration log: {str(e)}")
             return False

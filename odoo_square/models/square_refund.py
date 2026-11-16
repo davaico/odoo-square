@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo import Command, models, fields, api
 from odoo.exceptions import ValidationError, UserError, AccessError
 from collections import defaultdict
@@ -225,6 +226,8 @@ class SquareRefund(models.Model):
                                     _logger.info(
                                         f"Found order {sale_order.name} by Square API order_id {api_order_id} for refund {refund_id}"
                                     )
+                except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                    raise
                 except Exception as e:
                     _logger.warning(
                         f"Failed to fetch refund details from Square API: {str(e)}"
@@ -344,6 +347,8 @@ class SquareRefund(models.Model):
             _logger.warning("Deferring Square refund %s: %s", refund_id, e)
             return {"status": "retry", "message": str(e), "refund_id": refund_id}
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error processing {event_type} refund: {str(e)}", exc_info=True
@@ -359,6 +364,8 @@ class SquareRefund(models.Model):
                     ),
                     technical_details=f"Refund data: {refund_data}\nError: {str(e)}",
                 )
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
             except Exception:
                 pass  # Keep the original processing error if logging fails.
 
@@ -399,6 +406,8 @@ class SquareRefund(models.Model):
             # In the future, we could add a direct refund endpoint if needed
             return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error fetching payment/refund details from Square API: {str(e)}"
@@ -443,6 +452,8 @@ class SquareRefund(models.Model):
                 )
                 return existing_refund
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             # If we can't acquire the lock immediately, another process is creating this refund
             # Fall back to regular search which might find the refund if it was just created
@@ -721,6 +732,8 @@ class SquareRefund(models.Model):
                 )
         except RefundProcessingDeferred:
             raise
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error("Error creating pending refund actions: %s", e)
             self.processing_errors = str(e)
@@ -824,6 +837,8 @@ class SquareRefund(models.Model):
                     sale_order_id=self.sale_order_id.id,
                 )
         except RefundProcessingDeferred:
+            raise
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
             raise
         except Exception as e:
             _logger.error("Error completing refund: %s", e)
@@ -1393,6 +1408,8 @@ class SquareRefund(models.Model):
                 "refunds": order_data.get("refunds", []),
             }
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error fetching order details from Square: {str(e)}")
             return None
@@ -1748,6 +1765,8 @@ class SquareRefund(models.Model):
                 sale_order_id=self.sale_order_id.id,
             )
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error handling failed refund: {str(e)}")
 
@@ -1784,5 +1803,7 @@ class SquareRefund(models.Model):
                 sale_order_id=self.sale_order_id.id,
             )
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error handling cancelled refund: {str(e)}")

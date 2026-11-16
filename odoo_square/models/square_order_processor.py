@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from decimal import Decimal
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo import models, fields
 from odoo.exceptions import UserError
 import logging
@@ -1873,6 +1874,8 @@ class SquareOrderProcessor(models.Model):
             _logger.info(f"Successfully created refund payment for credit note {credit_note.name}")
             return True
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Failed to create refund payment for credit note {credit_note.name}: {str(e)}")
             return False
@@ -1963,6 +1966,8 @@ class SquareOrderProcessor(models.Model):
             )
             return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error finding outbound payment method line: {str(e)}")
             return None
@@ -2003,6 +2008,8 @@ class SquareOrderProcessor(models.Model):
 
             return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error finding payment journal: {str(e)}")
             return None

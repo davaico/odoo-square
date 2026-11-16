@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import logging
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo import models, api
 
 _logger = logging.getLogger(__name__)
@@ -77,6 +78,8 @@ class StockMove(models.Model):
             # Trigger the sync
             stock_sync.sync_stock_changes(move)
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error triggering Square sync for move {move.display_name}: {str(e)}"
