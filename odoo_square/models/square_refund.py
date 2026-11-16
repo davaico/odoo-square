@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
-from odoo import Command, models, fields, api
-from odoo.exceptions import ValidationError, UserError, AccessError
-from odoo.tools.float_utils import float_round
+from collections import defaultdict
 from datetime import timedelta
 import logging
+
+from odoo import Command, models, fields, api
+from odoo.exceptions import ValidationError, UserError, AccessError
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
+from odoo.tools.float_utils import float_compare, float_round
 from psycopg2 import errorcodes, errors
 
 _logger = logging.getLogger(__name__)
@@ -384,6 +387,8 @@ class SquareRefund(models.Model):
 
                 return True
 
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
             except Exception as e:
                 _logger.error(f"Error creating pending refund actions: {str(e)}")
                 self.processing_errors = str(e)
@@ -426,7 +431,10 @@ class SquareRefund(models.Model):
                     ):
                         raise UserError("Le paiement du remboursement Square n'a pas été créé")
 
-                for picking in self.return_picking_ids.with_user(bot_user):
+                return_pickings = self.return_picking_ids.filtered(
+                    lambda picking: picking.state != "cancel"
+                )
+                for picking in return_pickings.with_user(bot_user):
                     if picking.state == "draft":
                         picking.action_confirm()
                     if picking.state in ("confirmed", "waiting"):
@@ -440,8 +448,8 @@ class SquareRefund(models.Model):
                     if picking.state != "done":
                         raise UserError(f"Le retour {picking.name} n'a pas été validé")
 
-                if self.return_picking_ids:
-                    for move in self.return_picking_ids.move_ids:
+                if return_pickings:
+                    for move in return_pickings.move_ids:
                         line = move.origin_returned_move_id.sale_line_id
                         if line and move.state == "done":
                             qty = move.product_uom._compute_quantity(
@@ -503,6 +511,8 @@ class SquareRefund(models.Model):
 
                 return True
 
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
             except Exception as e:
                 _logger.error(f"Error completing refund: {str(e)}")
                 self.processing_errors = str(e)
@@ -522,24 +532,33 @@ class SquareRefund(models.Model):
         )
 
     def _prepare_return_pickings(self, is_partial):
-        """Create missing return pickings from the stock currently available to return."""
-        self.return_picking_ids = self.return_picking_ids.filtered(
-            lambda picking: picking.state != "cancel"
-        )
-        if self.return_picking_ids:
+        """Keep matching staged returns and replace obsolete stock reservations."""
+        active_returns = self.return_picking_ids.filtered(lambda picking: picking.state != "cancel")
+        prepared = active_returns.filtered(lambda picking: picking.state != "done")
+        if active_returns and not prepared:
             return
-
         deliveries = self._get_completed_deliveries()
         if not deliveries:
             return
 
-        wizard_model = self.env["stock.return.picking"].with_user(self._get_bot_user())
+        bot_user = self._get_bot_user()
+        prepared = prepared.with_user(bot_user)
+        prepared_by_delivery = prepared.grouped("return_id")
+        own_moves = active_returns.move_ids.filtered(lambda move: move.state != "cancel")
+        completed_by_origin = own_moves.filtered(
+            lambda move: move.state == "done"
+        ).grouped("origin_returned_move_id")
+
+        wizard_model = self.env["stock.return.picking"].with_user(bot_user)
         wizards = wizard_model.create([{"picking_id": delivery.id} for delivery in deliveries])
         return_lines = wizards.product_return_moves
         if is_partial:
             return_lines = return_lines.filtered(lambda line: line.move_id.sale_line_id)
+
+        # Plan as if this refund's own returns had not reserved stock. Keep
+        # quantities reserved or returned by other refunds out of the plan.
         available = {
-            line: line.move_id._get_square_returnable_quantity(line.uom_id)
+            line: line.move_id._get_square_returnable_quantity(line.uom_id, exclude_returns=own_moves)
             for line in return_lines
         }
         if not is_partial:
@@ -550,10 +569,53 @@ class SquareRefund(models.Model):
         else:
             self._configure_proportional_return_lines(return_lines, available)
 
+        for line in return_lines:
+            completed_qty = sum(
+                move.product_uom._compute_quantity(move.quantity, line.uom_id, round=False)
+                for move in completed_by_origin.get(line.move_id, ())
+            )
+            if completed_qty:
+                line.quantity = float_round(
+                    max(0, line.quantity - completed_qty), precision_rounding=line.uom_id.rounding
+                )
+
         for wizard in wizards:
-            if any(wizard.product_return_moves.mapped("quantity")):
+            existing = prepared_by_delivery.pop(wizard.picking_id, None)
+            planned_lines = wizard.product_return_moves.filtered("quantity")
+            if existing:
+                if planned_lines and self._prepared_returns_match(existing, planned_lines):
+                    continue
+                self._cancel_open_returns(existing)
+            if planned_lines:
                 result = wizard.action_create_returns()
                 self.return_picking_ids = [Command.link(result["res_id"])]
+
+        for obsolete in prepared_by_delivery.values():
+            self._cancel_open_returns(obsolete)
+
+    def _prepared_returns_match(self, pickings, planned_lines):
+        planned = {(line.move_id, line.to_refund): line.quantity for line in planned_lines}
+        prepared = defaultdict(float)
+        for move in pickings.move_ids.filtered(lambda move: move.state not in ("done", "cancel")):
+            source_move = move.origin_returned_move_id
+            prepared[source_move, move.to_refund] += move.product_uom._compute_quantity(
+                move.product_uom_qty, move.product_id.uom_id, round=False
+            )
+        return prepared.keys() == planned.keys() and all(
+            not float_compare(
+                quantity, prepared[move, to_refund], precision_rounding=move.product_id.uom_id.rounding
+            )
+            for (move, to_refund), quantity in planned.items()
+        )
+
+    def _cancel_open_returns(self, pickings):
+        for picking in pickings.filtered(lambda picking: picking.state not in ("done", "cancel")):
+            completed = picking.move_ids.filtered(lambda move: move.state == "done")
+            if completed:
+                (picking.move_ids - completed)._action_cancel()
+                picking.is_locked = True
+            else:
+                picking.action_cancel()
 
     def _configure_partial_return_lines(self, return_lines, available):
         legacy_lines = return_lines.filtered(lambda line: not line.move_id.sale_line_id.square_line_id)
@@ -969,6 +1031,8 @@ class SquareRefund(models.Model):
                 "refunds": order_data.get("refunds", []),
             }
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error fetching order details from Square: {str(e)}")
             return None
@@ -1296,9 +1360,7 @@ class SquareRefund(models.Model):
         """
         try:
             # Cancel return pickings
-            for picking in self.return_picking_ids:
-                if picking.state not in ["done", "cancel"]:
-                    picking.action_cancel()
+            self._cancel_open_returns(self.return_picking_ids)
 
             # Cancel credit note if not posted
             if self.credit_note_id and self.credit_note_id.state == "draft":
@@ -1323,6 +1385,8 @@ class SquareRefund(models.Model):
                 sale_order_id=self.sale_order_id.id,
             )
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error handling failed refund: {str(e)}")
 
@@ -1332,9 +1396,7 @@ class SquareRefund(models.Model):
         """
         try:
             # Cancel return pickings
-            for picking in self.return_picking_ids:
-                if picking.state not in ["done", "cancel"]:
-                    picking.action_cancel()
+            self._cancel_open_returns(self.return_picking_ids)
 
             # Cancel credit note if not posted
             if self.credit_note_id and self.credit_note_id.state == "draft":
@@ -1359,5 +1421,7 @@ class SquareRefund(models.Model):
                 sale_order_id=self.sale_order_id.id,
             )
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error handling cancelled refund: {str(e)}")

@@ -495,6 +495,169 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 49)
         self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w2), 50)
 
+    def test_completed_refund_replaces_provisional_stock_return(self):
+        self._test_sale_processing()
+        self._test_stock_updates()
+        order = self.created_sale_order
+        delivery = order.picking_ids
+        pending_data = {
+            "id": "provisional-return",
+            "order_id": order.square_order_id,
+            "amount_money": {"amount": 180, "currency": "EUR"},
+        }
+        self._send_refund_webhook(pending_data, "created", "PENDING", "evt-provisional")
+        refund = order.square_refund_ids
+        credit = refund.credit_note_id
+        provisional = refund.return_picking_ids
+        self.assertEqual(credit.state, "draft")
+        self.assertEqual(len(provisional), 1)
+        self.assertEqual(provisional.move_ids.product_id, self.product_p1 | self.product_p2)
+        self._assert_warehouse_stock(49)
+
+        completed_data = {**pending_data, "refunded_line_ids": ["line_2"]}
+        self._send_refund_webhook(completed_data, "updated", "COMPLETED", "evt-final-return")
+        self.assertTrue(refund.processed_at)
+        self.assertEqual(refund.credit_note_id, credit)
+        payment = self.assert_reconciled_payment(credit, "outbound", 1.80)
+        returned = refund.return_picking_ids.filtered(lambda picking: picking.state == "done")
+        self.assertEqual(len(returned), 1)
+        self.assertEqual(returned.return_id, delivery)
+        self.assertEqual(returned.location_dest_id, self.warehouse_w1.lot_stock_id)
+        self.assertEqual(returned.move_ids.product_id, self.product_p2)
+        self.assertEqual(returned.move_ids.quantity, 1)
+        self.assertEqual(provisional.state, "cancel")
+        self.assertEqual(refund.return_picking_ids, provisional | returned)
+
+        self._send_refund_webhook(completed_data, "updated", "COMPLETED", "evt-final-replay", "already_processed")
+        self.assertEqual(refund.return_picking_ids, provisional | returned)
+        self.assertEqual(credit.reconciled_payment_ids, payment)
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 50)
+        for product in (self.product_p1, self.product_p2):
+            self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
+
+    def test_completed_refund_recalculates_stock_when_amount_changes(self):
+        self._test_sale_processing()
+        self._test_stock_updates()
+        order = self.created_sale_order
+        pending_data = {
+            "id": "changed-refund-amount",
+            "order_id": order.square_order_id,
+            "amount_money": {"amount": 60, "currency": "EUR"},
+        }
+        self._send_refund_webhook(pending_data, "created", "PENDING", "evt-initial-amount")
+        refund = order.square_refund_ids
+        credit = refund.credit_note_id
+        provisional = refund.return_picking_ids
+        self.assertEqual(provisional.move_ids.mapped("product_uom_qty"), [0.2, 0.2])
+        self._assert_warehouse_stock(49)
+
+        completed_data = {**pending_data, "amount_money": {"amount": 150, "currency": "EUR"}}
+        self._send_refund_webhook(completed_data, "updated", "COMPLETED", "evt-final-amount")
+        self.assertEqual(provisional.state, "cancel")
+        self.assertEqual(refund.credit_note_id, credit)
+        self.assert_reconciled_payment(credit, "outbound", 1.50)
+        returned = refund.return_picking_ids.filtered(lambda picking: picking.state == "done")
+        self.assertEqual(len(returned), 1)
+        self.assertEqual(
+            {move.product_id: move.quantity for move in returned.move_ids},
+            {self.product_p1: 0.5, self.product_p2: 0.5},
+        )
+        self._assert_warehouse_stock(49.5)
+
+    def test_completed_refund_repairs_legacy_return_without_cancelling_done_moves(self):
+        self._test_sale_processing()
+        self._test_stock_updates()
+        order = self.created_sale_order
+        refund_data = {
+            "id": "legacy-draft-return",
+            "order_id": order.square_order_id,
+            "amount_money": {"amount": 180, "currency": "EUR"},
+        }
+        self._send_refund_webhook(refund_data, "created", "PENDING", "evt-legacy-pending")
+        refund = order.square_refund_ids
+        original = refund.return_picking_ids
+        p1_move = original.move_ids.filtered(lambda move: move.product_id == self.product_p1)
+        p2_move = original.move_ids.filtered(lambda move: move.product_id == self.product_p2)
+        p1_move.picked = True
+        p1_move._action_done(cancel_backorder=True)
+        self.assertEqual(p1_move.state, "done")
+        self.assertNotIn(p2_move.state, ("done", "cancel"))
+
+        # Earlier versions could update the refund's item data while leaving staged moves unchanged.
+        refund.refunded_line_ids = ["line_2"]
+        self._send_refund_webhook(refund_data, "updated", "COMPLETED", "evt-legacy-completed")
+        self.assertTrue(refund.processed_at)
+        self.assert_reconciled_payment(refund.credit_note_id, "outbound", 1.80)
+        self.assertEqual(original.state, "done")
+        self.assertEqual(p1_move.state, "done")
+        self.assertEqual(p1_move.quantity, 0.6)
+        self.assertEqual(p2_move.state, "cancel")
+        replacement = refund.return_picking_ids - original
+        self.assertEqual(len(replacement), 1)
+        self.assertEqual(replacement.state, "done")
+        self.assertEqual(replacement.move_ids.product_id, self.product_p2)
+        self.assertEqual(replacement.move_ids.quantity, 1)
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49.6)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 50)
+
+    def test_completed_refund_retries_after_postgres_serialization_failure(self):
+        self._test_sale_processing()
+        self._test_stock_updates()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        refund_data = {
+            "id": "retry-completed-refund",
+            "order_id": order.square_order_id,
+            "amount_money": {"amount": 180, "currency": "EUR"},
+            "refunded_line_ids": ["line_2"],
+        }
+        self._send_refund_webhook(refund_data, "created", "PENDING", "evt-retry-pending")
+        refund = order.square_refund_ids
+        credit = refund.credit_note_id
+        returned = refund.return_picking_ids
+        self.assertEqual(credit.state, "draft")
+        self.assertFalse(credit.reconciled_payment_ids)
+
+        register_model = type(self.env["account.payment.register"])
+        create_payments = register_model.action_create_payments
+        attempted_payments = []
+
+        def create_payment_with_serialization_failure(register):
+            result = create_payments(register)
+            attempted_payments.append(register.id)
+            if len(attempted_payments) == 1:
+                # Raise a PostgreSQL error after the wizard has already created and reconciled a payment.
+                register.env.cr.execute("""
+                    DO $$ BEGIN
+                        RAISE EXCEPTION 'Refund payment retry test' USING ERRCODE = '40001';
+                    END $$
+                """)
+            return result
+
+        with patch.object(register_model, "action_create_payments", create_payment_with_serialization_failure):
+            self._send_refund_webhook(refund_data, "updated", "COMPLETED", "evt-retry-completed")
+        self.assertEqual(len(attempted_payments), 2)
+        self.assertTrue(refund.processed_at)
+        self.assertEqual(refund.status, "completed")
+        self.assertFalse(refund.processing_errors)
+        self.assertEqual(order.square_refund_ids, refund)
+        self.assertEqual(refund.credit_note_id, credit)
+        self.assertEqual(self.env["account.move"].search([("reversed_entry_id", "=", invoice.id)]), credit)
+        payment = self.assert_reconciled_payment(credit, "outbound", 1.80)
+        self.assertEqual(self.env["account.payment"].search([
+            ("partner_id", "=", invoice.partner_id.id),
+            ("journal_id", "=", self.payment_journal.id),
+            ("payment_type", "=", "outbound"),
+        ]), payment)
+        self.assertEqual(refund.return_picking_ids, returned)
+        self.assertEqual(len(returned), 1)
+        self.assertEqual(returned.state, "done")
+        self.assertEqual(returned.move_ids.product_id, self.product_p2)
+        self.assertEqual(returned.move_ids.quantity, 1)
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 50)
+
     def test_successive_partial_refunds_of_paid_square_sale(self):
         self.p2_order_quantity = 2
         self._test_sale_processing(expected_amount=4.80)

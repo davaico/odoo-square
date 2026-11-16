@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import logging
 from odoo import models, api
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo.tools.float_utils import float_round
 
 _logger = logging.getLogger(__name__)
@@ -9,17 +10,20 @@ _logger = logging.getLogger(__name__)
 class StockMove(models.Model):
     _inherit = "stock.move"
 
-    def _get_square_returnable_quantity(self, uom):
+    def _get_square_returnable_quantity(self, uom, exclude_returns=None):
         """Get delivered quantity not already returned or reserved for returns."""
         self.ensure_one()
         delivered = self.product_uom._compute_quantity(self.quantity, uom, round=False)
+        returns = self.returned_move_ids
+        if exclude_returns:
+            returns -= exclude_returns
         reserved = sum(
             returned.product_uom._compute_quantity(
                 returned.quantity if returned.state == "done" else returned.product_uom_qty,
                 uom,
                 round=False,
             )
-            for returned in self.returned_move_ids
+            for returned in returns
             if returned.state != "cancel"
         )
         return float_round(
@@ -73,6 +77,8 @@ class StockMove(models.Model):
             # Trigger the sync
             stock_sync.sync_stock_changes(move)
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error triggering Square sync for move {move.name}: {str(e)}"

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from uuid import uuid4
 from odoo import models, api
 from odoo.exceptions import UserError
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 
 _logger = logging.getLogger(__name__)
 
@@ -103,6 +104,8 @@ class SquareApiClient(models.Model):
                 )
                 return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error fetching order {order_id} from Square API: {str(e)}")
             return None
