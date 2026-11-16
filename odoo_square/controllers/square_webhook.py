@@ -693,31 +693,12 @@ class SquareWebhookController(http.Controller):
                 .search([("square_refund_id", "=", refund_id)], limit=1)
             )
 
-            if existing_refund:
-                if existing_refund.status == "completed":
-                    # Check if refund has been fully processed (has return pickings and posted credit note)
-                    if (
-                        existing_refund.return_picking_ids
-                        and existing_refund.credit_note_id
-                        and existing_refund.credit_note_id.state == "posted"
-                    ):
-                        _logger.info(
-                            f"Refund {refund_id} already fully processed, skipping duplicate processing"
-                        )
-                        return {
-                            "status": "already_processed",
-                            "message": f"Refund {refund_id} already fully processed",
-                            "refund_id": refund_id,
-                        }
-                    else:
-                        _logger.info(
-                            f"Refund {refund_id} marked as completed but not fully processed, continuing processing"
-                        )
-                elif existing_refund.status == "pending":
-                    _logger.info(
-                        f"Refund {refund_id} is already being processed (status: {existing_refund.status})"
-                    )
-                    # Continue processing - this might be a status update webhook
+            if existing_refund.status == "completed" and existing_refund.processed_at:
+                return {
+                    "status": "already_processed",
+                    "message": f"Refund {refund_id} already fully processed",
+                    "refund_id": refund_id,
+                }
 
             # Find the original sale order - try multiple strategies
             sale_order = None
@@ -858,57 +839,26 @@ class SquareWebhookController(http.Controller):
             if webhook_event_id:
                 refund_record.webhook_event_id = webhook_event_id
 
-            rs = (refund_status or "PENDING").strip()
-            rs_upper = rs.upper()
-            refund_record.status = rs.lower()
+            rs = refund_record._get_square_refund_status(refund_data)
+            pending_prepared = (
+                refund_record.credit_note_id
+                and refund_record.credit_note_id.state != "cancel"
+            )
+            refund_record.status = rs
+            refund_record.action_process_refund()
 
-            # Process the refund based on status
-            if rs_upper == "PENDING":
-                # Create pending refund actions but don't complete them yet
-                if (
-                    not refund_record.return_picking_ids
-                    and not refund_record.credit_note_id
-                ):
-                    # Only create actions if they haven't been created yet
-                    refund_record._create_pending_refund_actions()
-                    result_message = "Actions de remboursement préparées (en attente de confirmation Square)"
-                else:
-                    result_message = "Actions de remboursement déjà préparées (en attente de confirmation Square)"
-
-            elif rs_upper == "COMPLETED":
-                # Check if refund has already been fully processed
-                if (
-                    refund_record.return_picking_ids
-                    and refund_record.credit_note_id
-                    and refund_record.credit_note_id.state == "posted"
-                ):
-                    _logger.info(
-                        f"Refund {refund_id} has already been fully processed, skipping completion"
-                    )
-                    result_message = "Refund already processed successfully"
-                else:
-                    # COMPLETED webhooks may arrive before pending actions exist; prepare
-                    # credit note and return picking first, then finalize.
-                    if not refund_record.credit_note_id or not refund_record.return_picking_ids:
-                        refund_record.write({"status": "pending"})
-                        refund_record._create_pending_refund_actions()
-                        refund_record.write({"status": "completed"})
-                    refund_record.action_process_refund()
-                    result_message = "Refund processed successfully"
-
-            elif rs_upper == "FAILED":
-                # Handle failed refund
-                refund_record._handle_failed_refund()
-                result_message = "Failed refund processed"
-
-            elif rs_upper in ("CANCELLED", "CANCELED"):
-                # Handle cancelled refund
-                refund_record._handle_cancelled_refund()
-                result_message = "Cancelled refund processed"
-
+            if rs == "pending":
+                result_message = (
+                    "Actions de remboursement déjà préparées (en attente de confirmation Square)"
+                    if pending_prepared
+                    else "Actions de remboursement préparées (en attente de confirmation Square)"
+                )
             else:
-                _logger.warning(f"Statut de remboursement inconnu: {refund_status}")
-                result_message = f"Statut de remboursement inconnu: {refund_status}"
+                result_message = {
+                    "completed": "Refund processed successfully",
+                    "failed": "Failed refund processed",
+                    "cancelled": "Cancelled refund processed",
+                }[rs]
 
             # Log webhook processing
             req_env["square.integration.log"].sudo().log_square_event(
@@ -929,6 +879,7 @@ class SquareWebhookController(http.Controller):
                 square_order_id=order_id,
                 square_refund_id=refund_id,
                 sale_order_id=sale_order.id,
+                webhook_event_id=webhook_event_id,
             )
 
             return {

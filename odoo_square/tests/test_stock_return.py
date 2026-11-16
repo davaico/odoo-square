@@ -97,7 +97,7 @@ class TestStockReturn(SquareHttpCase):
         )
         return quant.quantity if quant else 0.0
 
-    def _create_confirmed_so_with_delivery(self):
+    def _create_confirmed_so_with_delivery(self, quantity=1):
         """Create a SO, confirm it, deliver from warehouse, and invoice."""
         so = self.env["sale.order"].create(
             {
@@ -110,7 +110,7 @@ class TestStockReturn(SquareHttpCase):
             {
                 "order_id": so.id,
                 "product_id": self.product.id,
-                "product_uom_qty": 1,
+                "product_uom_qty": quantity,
                 "price_unit": 91.67,
                 "name": self.product.name,
             }
@@ -241,10 +241,10 @@ class TestStockReturn(SquareHttpCase):
 
         # Stock must be restored
         stock_after_refund = self._get_stock(self.product, self.warehouse)
-        self.assertGreater(
+        self.assertEqual(
             stock_after_refund,
-            stock_after_sale,
-            f"Stock should increase after refund return. "
+            stock_after_sale + 1,
+            f"Stock should increase by one after the refund return. "
             f"Before refund: {stock_after_sale}, after: {stock_after_refund}",
         )
 
@@ -254,11 +254,10 @@ class TestStockReturn(SquareHttpCase):
     )
     def test_force_quantity_works_for_incoming_picking(self):
         """
-        Directly verify that _force_quantity_for_square + button_validate
-        works for incoming pickings, not just outgoing.
+        Validate an incoming return whose quantity is split across move lines.
         """
-        so = self._create_confirmed_so_with_delivery()
-
+        so = self._create_confirmed_so_with_delivery(quantity=2)
+        stock_after_sale = self._get_stock(self.product, self.warehouse)
         outgoing = so.picking_ids.filtered(
             lambda p: p.picking_type_code == "outgoing" and p.state == "done"
         )[:1]
@@ -270,7 +269,7 @@ class TestStockReturn(SquareHttpCase):
             .with_context(active_id=outgoing.id, active_model="stock.picking")
             .create({})
         )
-        result = return_wiz.create_returns()
+        result = return_wiz.action_create_returns_all()
         return_picking = self.env["stock.picking"].browse(result["res_id"])
 
         self.assertEqual(return_picking.picking_type_code, "incoming")
@@ -280,7 +279,13 @@ class TestStockReturn(SquareHttpCase):
         if return_picking.state in ("confirmed", "waiting"):
             return_picking.action_assign()
 
-        # This is exactly what _complete_refund does — only with_context(force_validate=True)
+        move = return_picking.move_ids
+        self.assertEqual(len(move.move_line_ids), 1)
+        move_line = move.move_line_ids
+        move_line.quantity = 1
+        move_line.copy({"quantity": 1})
+        self.assertEqual(len(move.move_line_ids), 2)
+
         return_picking.with_context(force_validate=True).button_validate()
 
         self.assertEqual(
@@ -289,12 +294,8 @@ class TestStockReturn(SquareHttpCase):
             "Incoming picking with force_validate should be fully validated",
         )
 
-        for move in return_picking.move_ids:
-            self.assertGreater(
-                move.quantity,
-                0,
-                f"Move for {move.product_id.name} should have done qty > 0",
-            )
+        self.assertEqual(move.quantity, 2)
+        self.assertEqual(self._get_stock(self.product, self.warehouse), stock_after_sale + 2)
 
     @mute_logger(
         "odoo.addons.odoo_square.controllers.square_webhook",

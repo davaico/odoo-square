@@ -48,7 +48,7 @@ class TestSquareWebhook(SquareHttpCase):
         )
 
     def _confirm_pick_deliver_invoice(self, sale_order, stock_qty=100.0):
-        """Stock, deliver outgoing picking (Odoo 17), post invoice — required for refund flows."""
+        """Stock the warehouse, deliver the picking, and post the invoice."""
         wh = self.env["stock.warehouse"].search([], limit=1)
         self.assertTrue(wh, "Need a warehouse")
         for line in sale_order.order_line:
@@ -1340,7 +1340,7 @@ class TestSquareWebhook(SquareHttpCase):
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_full_refund_processing(self):
-        """Test webhook processing for full refund"""
+        """Process a full refund delivered as COMPLETED on the first event."""
 
         # First, create a test order
         sale_order = self.env["sale.order"].create(
@@ -1355,13 +1355,15 @@ class TestSquareWebhook(SquareHttpCase):
                             "product_id": self.product.id,
                             "product_uom_qty": 6,
                             "price_unit": 0.50,  # Total: 3.00 EUR
+                            "tax_ids": [(5, 0, 0)],
                         },
                     )
                 ],
             }
         )
 
-        self._confirm_pick_deliver_invoice(sale_order)
+        invoice = self._confirm_pick_deliver_invoice(sale_order)
+        self.assertAlmostEqual(invoice.amount_total, 3.00, places=2)
 
         # Sample Square webhook data for refund.created (full refund)
         webhook_data = {
@@ -1418,8 +1420,9 @@ class TestSquareWebhook(SquareHttpCase):
         # Verify credit note was created with full amount
         credit_note = refund.credit_note_id
         self.assertTrue(credit_note)
+        self.assertEqual(credit_note.reversed_entry_id, invoice)
         sale_order.invalidate_recordset()
-        self.assertAlmostEqual(credit_note.amount_total, refund.refund_amount, delta=0.6)
+        self.assertAlmostEqual(credit_note.amount_total, 3.00, places=2)
 
         # Verify order refund status
         self.assertEqual(sale_order.refund_status, "fully_refunded")
