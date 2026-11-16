@@ -26,13 +26,10 @@ class SaleOrder(models.Model):
         copy=False,
     )
 
-    _sql_constraints = [
-        (
-            "square_order_id_unique",
-            "UNIQUE(square_order_id)",
-            "Square Order ID must be unique. This order may already exist in the system.",
-        )
-    ]
+    _square_order_id_unique = models.Constraint(
+        "UNIQUE(square_order_id)",
+        "Square Order ID must be unique. This order may already exist in the system.",
+    )
 
     square_order_data = fields.Text(
         string="Square Order Data",
@@ -93,7 +90,11 @@ class SaleOrder(models.Model):
             order.total_refunded_amount = total_refunded
 
     @api.depends(
-        "square_refund_ids.refund_amount", "square_refund_ids.status", "amount_total"
+        "square_refund_ids.refund_amount",
+        "square_refund_ids.status",
+        "amount_total",
+        "invoice_ids.state",
+        "invoice_ids.amount_total",
     )
     def _compute_refund_status(self):
         """Compute refund status"""
@@ -109,10 +110,20 @@ class SaleOrder(models.Model):
             # Determine refund status
             if total_refunded == 0:
                 order.refund_status = "not_refunded"
-            elif total_refunded >= order.amount_total:
+            elif order.currency_id.compare_amounts(
+                total_refunded, order._get_original_sale_total()
+            ) >= 0:
                 order.refund_status = "fully_refunded"
             else:
                 order.refund_status = "partially_refunded"
+
+    def _get_original_sale_total(self):
+        self.ensure_one()
+        invoices = self.invoice_ids.filtered(
+            lambda move: move.move_type == "out_invoice" and move.state == "posted"
+        )
+        # Return adjustments change the order total; the original invoices retain the sale amount.
+        return sum(invoices.mapped("amount_total")) if invoices else self.amount_total
 
     def _get_square_bot_user(self):
         """Get the Square integration bot user"""
@@ -890,7 +901,7 @@ class SaleOrder(models.Model):
             "name": product.name,
             "product_uom_qty": quantity,
             "price_unit": unit_price,
-            "tax_id": tax_cmds,
+            "tax_ids": tax_cmds,
         }
 
         square_line_id = line_item.get("uid")
@@ -928,14 +939,17 @@ class SaleOrder(models.Model):
                 "name": "Vente Square",
                 "default_code": "VENTE_SQUARE",
                 "type": "service",  # Service product
-                "categ_id": self.env.ref("product.product_category_all").id,
+                "categ_id": self.env.ref("product.product_category_services").id,
                 "list_price": 0.0,
                 "sale_ok": True,
                 "purchase_ok": False,
                 "description": "Service product for Square sales integration",
             }
 
-            product = self.env["product.product"].create(product_vals)
+            # The bot can provision this fixed fallback without product manager access.
+            product = (
+                self.env["product.product"].sudo().create(product_vals).with_env(self.env)
+            )
             _logger.info(f"Created 'Vente Square' service product: {product.id}")
             return product
 

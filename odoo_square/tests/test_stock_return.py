@@ -48,7 +48,7 @@ class TestStockReturn(SquareHttpCase):
                 "name": "Cardigan Selmana Jaune S",
                 "default_code": "25FWFESUCARSLMJAC-S",
                 "list_price": 110.00,
-                "type": "product",
+                "is_storable": True,
             }
         )
 
@@ -97,21 +97,32 @@ class TestStockReturn(SquareHttpCase):
         )
         return quant.quantity if quant else 0.0
 
-    def _create_confirmed_so_with_delivery(self):
+    def _create_confirmed_so_with_delivery(self, quantity=1):
         """Create a SO, confirm it, deliver from warehouse, and invoice."""
+        self.enterContext(patch.object(
+            SquareApiClient, "search_catalog_by_sku",
+            return_value={"success": True, "not_found": True},
+        ))
+        eur = self.env.ref("base.EUR")
+        eur.active = True
+        pricelist = self.env["product.pricelist"].create(
+            {"name": "Square EUR", "currency_id": eur.id}
+        )
         so = self.env["sale.order"].create(
             {
                 "partner_id": self.partner.id,
                 "warehouse_id": self.warehouse.id,
                 "square_order_id": "ORDER_TEST",
+                "pricelist_id": pricelist.id,
             }
         )
         self.env["sale.order.line"].create(
             {
                 "order_id": so.id,
                 "product_id": self.product.id,
-                "product_uom_qty": 1,
-                "price_unit": 91.67,
+                "product_uom_qty": quantity,
+                "price_unit": 110.00,
+                "tax_ids": [(5, 0, 0)],
                 "name": self.product.name,
             }
         )
@@ -199,6 +210,7 @@ class TestStockReturn(SquareHttpCase):
         so the incoming picking was validated with qty=0 and stock stayed depleted.
         """
         so = self._create_confirmed_so_with_delivery()
+        self.assertAlmostEqual(so.invoice_ids.amount_total, 110.00, places=2)
         stock_after_sale = self._get_stock(self.product, self.warehouse)
 
         refund = self.env["square.refund"].create(
@@ -223,6 +235,7 @@ class TestStockReturn(SquareHttpCase):
         # Now complete the refund
         refund.write({"status": "completed"})
         refund.action_process_refund()
+        self.assertAlmostEqual(refund.credit_note_id.amount_total, 110.00, places=2)
 
         # Verify return picking is done
         for picking in refund.return_picking_ids:
@@ -241,10 +254,10 @@ class TestStockReturn(SquareHttpCase):
 
         # Stock must be restored
         stock_after_refund = self._get_stock(self.product, self.warehouse)
-        self.assertGreater(
+        self.assertEqual(
             stock_after_refund,
-            stock_after_sale,
-            f"Stock should increase after refund return. "
+            stock_after_sale + 1,
+            f"Stock should increase by one after the refund return. "
             f"Before refund: {stock_after_sale}, after: {stock_after_refund}",
         )
 
@@ -254,11 +267,10 @@ class TestStockReturn(SquareHttpCase):
     )
     def test_force_quantity_works_for_incoming_picking(self):
         """
-        Directly verify that _force_quantity_for_square + button_validate
-        works for incoming pickings, not just outgoing.
+        Validate an incoming return whose quantity is split across move lines.
         """
-        so = self._create_confirmed_so_with_delivery()
-
+        so = self._create_confirmed_so_with_delivery(quantity=2)
+        stock_after_sale = self._get_stock(self.product, self.warehouse)
         outgoing = so.picking_ids.filtered(
             lambda p: p.picking_type_code == "outgoing" and p.state == "done"
         )[:1]
@@ -270,7 +282,7 @@ class TestStockReturn(SquareHttpCase):
             .with_context(active_id=outgoing.id, active_model="stock.picking")
             .create({})
         )
-        result = return_wiz.create_returns()
+        result = return_wiz.action_create_returns_all()
         return_picking = self.env["stock.picking"].browse(result["res_id"])
 
         self.assertEqual(return_picking.picking_type_code, "incoming")
@@ -280,7 +292,13 @@ class TestStockReturn(SquareHttpCase):
         if return_picking.state in ("confirmed", "waiting"):
             return_picking.action_assign()
 
-        # This is exactly what _complete_refund does — only with_context(force_validate=True)
+        move = return_picking.move_ids
+        self.assertEqual(len(move.move_line_ids), 1)
+        move_line = move.move_line_ids
+        move_line.quantity = 1
+        move_line.copy({"quantity": 1})
+        self.assertEqual(len(move.move_line_ids), 2)
+
         return_picking.with_context(force_validate=True).button_validate()
 
         self.assertEqual(
@@ -289,12 +307,8 @@ class TestStockReturn(SquareHttpCase):
             "Incoming picking with force_validate should be fully validated",
         )
 
-        for move in return_picking.move_ids:
-            self.assertGreater(
-                move.quantity,
-                0,
-                f"Move for {move.product_id.name} should have done qty > 0",
-            )
+        self.assertEqual(move.quantity, 2)
+        self.assertEqual(self._get_stock(self.product, self.warehouse), stock_after_sale + 2)
 
     @mute_logger(
         "odoo.addons.odoo_square.controllers.square_webhook",
@@ -406,9 +420,8 @@ class TestStockReturn(SquareHttpCase):
     )
     def test_sync_skips_when_payload_has_returns(self):
         """
-        When an order.updated (OPEN) payload contains a 'returns' key,
-        _sync_order_line_changes should not be called at all — the return
-        must go through the dedicated refund/exchange flow.
+        An OPEN update with returns and a positive line quantity must leave
+        the sale quantity unchanged for the dedicated refund/exchange flow.
         """
         processor = self.env["square.order.processor"]
 
@@ -451,8 +464,8 @@ class TestStockReturn(SquareHttpCase):
                 {
                     "uid": "line_ret_1",
                     "name": "Cardigan Selmana Jaune S",
-                    "quantity": "0",
-                    "total_money": {"amount": 0, "currency": "EUR"},
+                    "quantity": "3",
+                    "total_money": {"amount": 33000, "currency": "EUR"},
                 }
             ],
         }

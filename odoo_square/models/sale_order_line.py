@@ -25,7 +25,7 @@ class SaleOrderLine(models.Model):
     # Return tracking fields
     returned_qty = fields.Float(
         string="Returned Quantity",
-        digits="Product Unit of Measure",
+        digits="Product Unit",
         default=0.0,
         help="Quantity of this product that has been returned via Square refunds",
         copy=False,
@@ -34,12 +34,12 @@ class SaleOrderLine(models.Model):
     effective_qty = fields.Float(
         string="Effective Quantity",
         compute="_compute_effective_qty",
-        digits="Product Unit of Measure",
+        digits="Product Unit",
         help="Net quantity after returns: Original Qty - Returned Qty",
         store=True,
     )
 
-    @api.depends("product_uom_qty", "discount", "price_unit", "tax_id")
+    @api.depends("product_uom_qty", "discount", "price_unit", "tax_ids")
     def _compute_amount(self):
         """
         Override to prevent tax recalculation for Square orders

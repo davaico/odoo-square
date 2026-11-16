@@ -16,52 +16,11 @@ This project is an Odoo addon, so changes should follow Odoo module conventions,
 
 ## Local Setup
 
-```bash
-git clone https://github.com/davaico/odoo-square.git
-cd odoo-square
-cp .env.example .env
-```
-
-Set `DB_PASSWORD` in `.env`, then start the local stack:
-
-```bash
-docker compose up -d
-```
-
-Install or upgrade the addon from Odoo Apps, or run:
-
-```bash
-docker compose exec odoo bash -lc 'odoo \
-  --config=/etc/odoo/odoo.conf \
-  -d odoo \
-  --db_host="${HOST:-db}" \
-  --db_port=5432 \
-  --db_user="${USER:-odoo}" \
-  --db_password="$PASSWORD" \
-  -u odoo_square \
-  --stop-after-init'
-```
+Use `feat/v19` for Odoo 19 work. See the [local setup](README.md#quick-start) and [addon update command](README.md#development).
 
 ## Tests
 
-Run the full addon test suite before opening a pull request:
-
-```bash
-DB_PASSWORD=ci_odoo_test docker compose -f docker-compose.test.yml run --rm odoo \
-  odoo \
-    --config=/etc/odoo/odoo.conf \
-    -d odoo \
-    --db_host=db \
-    --db_port=5432 \
-    --db_user=odoo \
-    --db_password=ci_odoo_test \
-    -i odoo_square \
-    --test-enable \
-    --workers=0 \
-    --stop-after-init \
-    --test-tags=odoo_square \
-    --log-level=test
-```
+Run the [full addon test suite](README.md#testing) on a fresh Odoo 19 Community database before opening a pull request.
 
 Tests should be added or updated when a change affects:
 
@@ -75,7 +34,7 @@ Tests should be added or updated when a change affects:
 ## Pull Request Checklist
 
 - The change is scoped to one problem.
-- The addon installs or upgrades cleanly on Odoo 17.0.
+- The addon installs cleanly on Odoo 19 Community.
 - Tests pass locally or the pull request explains why they could not be run.
 - New or changed behavior is covered by tests.
 - README, configuration notes, or migration notes are updated when relevant.
@@ -86,7 +45,7 @@ Tests should be added or updated when a change affects:
 
 For bug reports, include:
 
-- Odoo edition and exact 17.0 build if known
+- Odoo edition and exact 19.0 build if known
 - addon version from the manifest or Square configuration screen
 - Square event type involved
 - expected behavior

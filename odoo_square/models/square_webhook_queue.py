@@ -196,27 +196,12 @@ class SquareWebhookQueue(models.Model):
 
                     return False
 
-            # Process the event using the webhook controller
-            from odoo.addons.odoo_square.controllers.square_webhook import (
-                SquareWebhookController,
-            )
-
-            controller = SquareWebhookController()
-
-            # Extract order data based on event type
-            if self.event_type == "order.updated":
+            if self.event_type in ("order.created", "order.updated"):
                 _logger.info(
                     f"Processing queued event {self.webhook_event_id} - Order state: {order_data.get('state')}"
                 )
-                result = controller._process_order(
-                    order_data, "updated", self.webhook_event_id
-                )
-            elif self.event_type == "order.created":
-                _logger.info(
-                    f"Processing queued event {self.webhook_event_id} - Order state: {order_data.get('state')}"
-                )
-                result = controller._process_order(
-                    order_data, "created", self.webhook_event_id
+                result = self.env["square.order.processor"]._process_order_event(
+                    order_data, self.event_type.split(".")[1], self.webhook_event_id
                 )
             else:
                 _logger.error(

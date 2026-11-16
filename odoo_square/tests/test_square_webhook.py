@@ -4,7 +4,7 @@ from unittest.mock import patch
 import logging
 from odoo.tests.common import tagged
 from odoo.tools import mute_logger
-from odoo.addons.odoo_square.controllers.square_webhook import SquareWebhookController
+from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
 
 from .common import SquareHttpCase
 
@@ -31,7 +31,8 @@ class TestSquareWebhook(SquareHttpCase):
                 "name": "Test Product",
                 "default_code": "TEST_SKU_001",
                 "list_price": 25.00,
-                "type": "product",
+                "type": "consu",
+                "is_storable": True,
             }
         )
 
@@ -46,7 +47,7 @@ class TestSquareWebhook(SquareHttpCase):
         )
 
     def _confirm_pick_deliver_invoice(self, sale_order, stock_qty=100.0):
-        """Stock, deliver outgoing picking (Odoo 17), post invoice — required for refund flows."""
+        """Stock the warehouse, deliver the picking, and post the invoice."""
         wh = self.env["stock.warehouse"].search([], limit=1)
         self.assertTrue(wh, "Need a warehouse")
         for line in sale_order.order_line:
@@ -75,6 +76,7 @@ class TestSquareWebhook(SquareHttpCase):
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_order_created_completed(self):
         """Test webhook processing for order.created with COMPLETED status"""
+        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=None))
 
         # Sample Square webhook data for order.created
         webhook_data = {
@@ -138,6 +140,7 @@ class TestSquareWebhook(SquareHttpCase):
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_order_updated_completed(self):
         """Test webhook processing for order.updated with COMPLETED status"""
+        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=None))
 
         webhook_data = {
             "type": "order.updated",
@@ -276,8 +279,15 @@ class TestSquareWebhook(SquareHttpCase):
         self.assertEqual(data2["status"], "already_processed")
 
     @mute_logger("odoo.addons.odoo_square.models.sale_order")
-    def test_webhook_unknown_product_skipped(self):
-        """Test that unknown products are skipped with error logging"""
+    def test_webhook_unknown_product_uses_placeholder(self):
+        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=None))
+        self.enterContext(
+            patch.object(
+                SquareApiClient,
+                "get_catalog_object",
+                return_value={"success": True, "not_found": True},
+            )
+        )
 
         webhook_data = {
             "type": "order.created",
@@ -309,7 +319,6 @@ class TestSquareWebhook(SquareHttpCase):
             headers={"Content-Type": "application/json"},
         )
 
-        # Should still succeed but log error
         self.assertEqual(response.status_code, 200)
         response_data = response.json()
         self.assertEqual(response_data["status"], "success")
@@ -339,7 +348,7 @@ class TestSquareWebhook(SquareHttpCase):
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_signature_required_when_key_configured(self):
-        """Reject webhook requests without a Square signature when a key is configured."""
+        """Reject missing and invalid Square signatures when a key is configured."""
 
         self.square_config.square_webhook_signature_key = "test_signature_key"
         webhook_data = {
@@ -355,16 +364,24 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
-            "/square/webhook",
-            data=json.dumps(webhook_data),
-            headers={"Content-Type": "application/json"},
-        )
+        for signature in (None, "invalid_signature"):
+            with self.subTest(signature=signature):
+                headers = {"Content-Type": "application/json"}
+                if signature is not None:
+                    headers["x-square-hmacsha256-signature"] = signature
+                response = self.url_open(
+                    "/square/webhook", data=json.dumps(webhook_data), headers=headers
+                )
 
-        self.assertEqual(response.status_code, 403)
-        response_data = response.json()
-        self.assertEqual(response_data["status"], "error")
-        self.assertEqual(response_data["message"], "Invalid signature")
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(
+                    response.json(), {"status": "error", "message": "Invalid signature"}
+                )
+                self.assertFalse(
+                    self.env["sale.order"].search_count(
+                        [("square_order_id", "=", "test_unsigned_order")]
+                    )
+                )
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_malformed_json(self):
@@ -920,13 +937,9 @@ class TestSquareWebhook(SquareHttpCase):
             "reason": "Test refund",
         }
 
-        # Create a webhook controller instance and call the refund processing
-        webhook_controller = SquareWebhookController()
-
-        # Mock the request environment for testing
         with self.env.cr.savepoint():
-            result = webhook_controller._process_refund(
-                refund_data, "created", env=self.env
+            result = self.env["square.refund"]._process_refund_event(
+                refund_data, "created"
             )
 
             self.assertEqual(result["status"], "success")
@@ -999,20 +1012,15 @@ class TestSquareWebhook(SquareHttpCase):
             "reason": "Test refund with USD (should fail)",
         }
 
-        from odoo.addons.odoo_square.controllers.square_webhook import (
-            SquareWebhookController,
-        )
-
-        webhook_controller = SquareWebhookController()
 
         with self.env.cr.savepoint():
-            result = webhook_controller._process_refund(
-                eur_refund_data, "created", env=self.env
+            result = self.env["square.refund"]._process_refund_event(
+                eur_refund_data, "created"
             )
             self.assertEqual(result["status"], "success")
 
-            result_usd = webhook_controller._process_refund(
-                usd_refund_data, "created", env=self.env
+            result_usd = self.env["square.refund"]._process_refund_event(
+                usd_refund_data, "created"
             )
             self.assertEqual(result_usd["status"], "error")
             err = (result_usd.get("message") or "").lower()
@@ -1087,57 +1095,91 @@ class TestSquareWebhook(SquareHttpCase):
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_order_cancellation_case_insensitive(self):
-        """Test that order cancellation works with both CANCELED and CANCELLED"""
-
-        # Create a sale order in draft state
-        sale_order = self.env["sale.order"].create(
+        warehouse = self.env["stock.warehouse"].search(
+            [("company_id", "=", self.env.company.id)], limit=1
+        )
+        quant = self.env["stock.quant"].create(
             {
-                "partner_id": self.partner.id,
-                "square_order_id": "test_cancel_order_002",
-                "state": "draft",
+                "product_id": self.product.id,
+                "location_id": warehouse.lot_stock_id.id,
+                "quantity": 10.0,
             }
         )
-
-        # Test with CANCELED (one L - as sent by Square webhook)
-        webhook_data = {
-            "type": "order.updated",
-            "event_id": "test_cancel_event_001",
-            "data": {
-                "object": {
-                    "order_updated": {
-                        "id": "test_cancel_order_002",
-                        "state": "CANCELED",  # One L
-                        "version": 2,
+        for state in ("canceled", "CaNcElLeD"):
+            with self.subTest(state=state):
+                square_order_id = f"draft_order_{state}"
+                order = self.env["sale.order"].create(
+                    {
+                        "partner_id": self.partner.id,
+                        "square_order_id": square_order_id,
+                        "warehouse_id": warehouse.id,
+                        "order_line": [
+                            (
+                                0,
+                                0,
+                                {
+                                    "product_id": self.product.id,
+                                    "product_uom_qty": 2,
+                                    "price_unit": 25.0,
+                                    "tax_ids": [(5, 0, 0)],
+                                },
+                            )
+                        ],
                     }
+                )
+                line = order.order_line
+                webhook_data = {
+                    "type": "order.updated",
+                    "event_id": f"draft_cancel_event_{state}",
+                    "data": {
+                        "object": {
+                            "order_updated": {
+                                "id": square_order_id,
+                                "state": state,
+                                "version": 2,
+                            }
+                        }
+                    },
                 }
-            },
-        }
+                for expected_status in ("updated", "already_processed"):
+                    response = self.url_open(
+                        "/square/webhook",
+                        data=json.dumps(webhook_data),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["status"], expected_status)
 
-        response = self.url_open(
-            "/square/webhook",
-            data=json.dumps(webhook_data),
-            headers={"Content-Type": "application/json"},
-        )
+                self.assertEqual(
+                    self.env["sale.order"].search(
+                        [("square_order_id", "=", square_order_id)]
+                    ),
+                    order,
+                )
+                self.assertEqual(order.state, "cancel")
+                self.assertEqual(order.order_line, line)
+                self.assertEqual(line.product_uom_qty, 2)
+                self.assertAlmostEqual(order.amount_total, 50.0, places=2)
+                self.assertFalse(order.invoice_ids)
+                self.assertFalse(
+                    self.env["account.payment"].search_count(
+                        [("partner_id", "=", self.partner.id)]
+                    )
+                )
+                self.assertFalse(order.picking_ids)
+                self.assertEqual(quant.quantity, 10.0)
+                self.assertEqual(quant.reserved_quantity, 0.0)
 
-        self.assertEqual(response.status_code, 200)
-        response_data = response.json()
-        self.assertEqual(response_data["status"], "updated")
-
-        # Verify order was cancelled
-        sale_order.invalidate_recordset()
-        self.assertEqual(sale_order.state, "cancel")
-
-        # Log entry should exist
-        log_entry = self.env["square.integration.log"].search(
-            [
-                ("square_order_id", "=", "test_cancel_order_002"),
-                ("event_type", "=", "order_updated"),
-                ("status", "=", "warning"),
-            ],
-            limit=1,
-        )
-        self.assertTrue(log_entry)
-        self.assertIn("cancelled", log_entry.title)
+                logs = self.env["square.integration.log"].search(
+                    [
+                        ("square_order_id", "=", square_order_id),
+                        ("sale_order_id", "=", order.id),
+                        ("event_type", "=", "order_updated"),
+                        ("status", "=", "warning"),
+                    ]
+                )
+                self.assertEqual(len(logs), 1)
+                self.assertIn("cancelled", logs.title)
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_order_cancellation_completed_order(self):
@@ -1231,11 +1273,21 @@ class TestSquareWebhook(SquareHttpCase):
     def test_partial_refund_processing(self):
         """Test webhook processing for partial refund (1 EUR refund for 3 EUR order)"""
 
-        # First, create a test order
+        eur = self.env.ref("base.EUR")
+        eur.active = True
+        pricelist = self.env["product.pricelist"].create(
+            {"name": "Square EUR", "currency_id": eur.id}
+        )
+        journal = self.env["account.journal"].create(
+            {"name": "Square Card", "code": "SQR", "type": "bank", "currency_id": eur.id}
+        )
+        self.square_config.payment_journal_id = journal
+
         sale_order = self.env["sale.order"].create(
             {
                 "partner_id": self.partner.id,
                 "square_order_id": "test_partial_refund_order_001",
+                "pricelist_id": pricelist.id,
                 "order_line": [
                     (
                         0,
@@ -1244,13 +1296,23 @@ class TestSquareWebhook(SquareHttpCase):
                             "product_id": self.product.id,
                             "product_uom_qty": 6,
                             "price_unit": 0.50,  # Total: 3.00 EUR
+                            "tax_ids": [(5, 0, 0)],
                         },
                     )
                 ],
             }
         )
 
-        self._confirm_pick_deliver_invoice(sale_order)
+        invoice = self._confirm_pick_deliver_invoice(sale_order)
+        self.assertEqual(invoice.currency_id, eur)
+        self.assertAlmostEqual(invoice.amount_total, 3.00, places=2)
+        self.env["account.payment.register"].with_context(
+            active_model="account.move", active_ids=invoice.ids
+        ).create({"journal_id": journal.id}).action_create_payments()
+        self.assertAlmostEqual(invoice.amount_residual, 0.00, places=2)
+        self.assertEqual(invoice.reconciled_payment_ids.payment_type, "inbound")
+        delivery = sale_order.picking_ids
+        self.assertEqual(len(delivery), 1)
 
         # Sample Square webhook data for refund.created (partial refund)
         webhook_data = {
@@ -1280,11 +1342,12 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Process the webhook
-        response = self.url_open(
-            "/square/webhook",
-            data=json.dumps(webhook_data),
-            headers={"Content-Type": "application/json"},
-        )
+        with patch.object(SquareApiClient, "get_order", return_value=None):
+            response = self.url_open(
+                "/square/webhook",
+                data=json.dumps(webhook_data),
+                headers={"Content-Type": "application/json"},
+            )
 
         self.assertEqual(response.status_code, 200)
         response_data = response.json()
@@ -1302,8 +1365,15 @@ class TestSquareWebhook(SquareHttpCase):
         self.assertTrue(refund._is_partial_refund())
 
         credit_note = refund.credit_note_id
-        self.assertTrue(credit_note)
-        sale_order.invalidate_recordset()
+        self.assertEqual(credit_note.reversed_entry_id, invoice)
+        self.assertEqual(credit_note.state, "posted")
+        self.assertAlmostEqual(credit_note.amount_total, 1.00, places=2)
+        self.assertAlmostEqual(credit_note.amount_residual, 0.00, places=2)
+        payment = credit_note.reconciled_payment_ids
+        self.assertEqual(len(payment), 1)
+        self.assertEqual(payment.payment_type, "outbound")
+        self.assertEqual(payment.currency_id, eur)
+        self.assertAlmostEqual(payment.amount, 1.00, places=2)
 
         # Verify order refund status
         self.assertEqual(sale_order.refund_status, "partially_refunded")
@@ -1313,16 +1383,22 @@ class TestSquareWebhook(SquareHttpCase):
         # Original order: 6 products at 0.50 each = 3.00 total
         # Refund: 1.00 = 33.33% of order
         # Expected returned quantity: 6 * 0.3333 = ~2.00 units
-        order_line = sale_order.order_line[0]
-        self.assertAlmostEqual(order_line.returned_qty, 2.00, places=1)
-        self.assertEqual(
-            order_line.effective_qty,
-            order_line.product_uom_qty - order_line.returned_qty,
-        )
+        order_line = sale_order.order_line.filtered(lambda line: line.product_uom_qty > 0)
+        self.assertEqual(len(order_line), 1)
+        self.assertEqual(order_line.product_uom_qty, 6)
+        self.assertEqual(order_line.returned_qty, 2)
+        self.assertEqual(order_line.effective_qty, 4)
+        self.assertEqual(order_line.qty_delivered, 4)
+        picking = refund.return_picking_ids
+        self.assertEqual(len(picking), 1)
+        self.assertEqual(picking.return_id, delivery)
+        self.assertEqual(picking.state, "done")
+        self.assertEqual(picking.move_ids.origin_returned_move_id, delivery.move_ids)
+        self.assertEqual(picking.move_ids.quantity, 2)
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_full_refund_processing(self):
-        """Test webhook processing for full refund"""
+        """Process a full refund delivered as COMPLETED on the first event."""
 
         # First, create a test order
         sale_order = self.env["sale.order"].create(
@@ -1337,13 +1413,15 @@ class TestSquareWebhook(SquareHttpCase):
                             "product_id": self.product.id,
                             "product_uom_qty": 6,
                             "price_unit": 0.50,  # Total: 3.00 EUR
+                            "tax_ids": [(5, 0, 0)],
                         },
                     )
                 ],
             }
         )
 
-        self._confirm_pick_deliver_invoice(sale_order)
+        invoice = self._confirm_pick_deliver_invoice(sale_order)
+        self.assertAlmostEqual(invoice.amount_total, 3.00, places=2)
 
         # Sample Square webhook data for refund.created (full refund)
         webhook_data = {
@@ -1400,8 +1478,9 @@ class TestSquareWebhook(SquareHttpCase):
         # Verify credit note was created with full amount
         credit_note = refund.credit_note_id
         self.assertTrue(credit_note)
+        self.assertEqual(credit_note.reversed_entry_id, invoice)
         sale_order.invalidate_recordset()
-        self.assertAlmostEqual(credit_note.amount_total, refund.refund_amount, delta=0.6)
+        self.assertAlmostEqual(credit_note.amount_total, 3.00, places=2)
 
         # Verify order refund status
         self.assertEqual(sale_order.refund_status, "fully_refunded")
@@ -1412,74 +1491,3 @@ class TestSquareWebhook(SquareHttpCase):
         order_line = sale_order.order_line[0]
         self.assertEqual(order_line.returned_qty, order_line.product_uom_qty)
         self.assertEqual(order_line.effective_qty, 0.0)
-
-    @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
-    def test_multiple_partial_refunds(self):
-        """Partial COMPLETED refund on a delivered, invoiced order (stable in Odoo 17)."""
-
-        sale_order = self.env["sale.order"].create(
-            {
-                "partner_id": self.partner.id,
-                "square_order_id": "test_multiple_refunds_order_001",
-                "order_line": [
-                    (
-                        0,
-                        0,
-                        {
-                            "product_id": self.product.id,
-                            "product_uom_qty": 10,
-                            "price_unit": 0.50,  # Total: 5.00 EUR
-                        },
-                    )
-                ],
-            }
-        )
-
-        self._confirm_pick_deliver_invoice(sale_order)
-
-        webhook_data_1 = {
-            "merchant_id": "TEST_MERCHANT_ID",
-            "type": "refund.created",
-            "event_id": "test_multiple_refund_1_event_001",
-            "created_at": "2025-01-15T10:00:00.000Z",
-            "data": {
-                "type": "refund",
-                "id": "test_multiple_refund_001",
-                "object": {
-                    "refund": {
-                        "amount_money": {"amount": 100, "currency": "EUR"},  # 1.00 EUR
-                        "created_at": "2025-01-15T10:00:00.000Z",
-                        "destination_type": "CARD",
-                        "id": "test_multiple_refund_001",
-                        "location_id": "TEST_LOCATION",
-                        "order_id": "test_multiple_refunds_order_001",
-                        "payment_id": "test_payment_001",
-                        "reason": "Returned goods",
-                        "status": "COMPLETED",
-                        "updated_at": "2025-01-15T10:00:00.000Z",
-                        "version": 1,
-                    }
-                },
-            },
-        }
-
-        response_1 = self.url_open(
-            "/square/webhook",
-            data=json.dumps(webhook_data_1),
-            headers={"Content-Type": "application/json"},
-        )
-        self.assertEqual(response_1.status_code, 200)
-        self.assertEqual(response_1.json()["status"], "success")
-
-        sale_order.invalidate_recordset()
-        self.assertEqual(sale_order.refund_status, "partially_refunded")
-        self.assertEqual(sale_order.total_refunded_amount, 1.00)
-
-        order_line = sale_order.order_line[0]
-        self.assertAlmostEqual(order_line.returned_qty, 2.0, places=1)
-        self.assertAlmostEqual(order_line.effective_qty, 8.0, places=1)
-
-        refunds = self.env["square.refund"].search(
-            [("sale_order_id", "=", sale_order.id), ("status", "=", "completed")]
-        )
-        self.assertEqual(len(refunds), 1)
