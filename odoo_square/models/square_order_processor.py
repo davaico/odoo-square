@@ -293,6 +293,7 @@ class SquareOrderProcessor(models.Model):
                 if sale_order.state not in ("draft", "sent"):
                     return result
 
+                snapshot_version = sale_order._square_snapshot_version(square_order_data)
                 # Square's order.updated notification contains order metadata.
                 if not any(
                     key in square_order_data
@@ -301,6 +302,7 @@ class SquareOrderProcessor(models.Model):
                     fetched_order = self.env["square.api.client"].get_order(square_order_id)
                     if not fetched_order:
                         raise ValueError(f"Could not retrieve Square order {square_order_id}")
+                    snapshot_version = sale_order._square_snapshot_version(fetched_order)
                     square_order_data = {**fetched_order, **square_order_data}
 
                 # Skip line sync when the payload carries return/exchange data;
@@ -312,7 +314,23 @@ class SquareOrderProcessor(models.Model):
                         f"skipping line sync (will be handled by refund/exchange flow)"
                     )
                 else:
+                    # Serialize version checks and line writes on the same order.
+                    self.env.cr.execute(
+                        "SELECT id FROM sale_order WHERE id = %s FOR UPDATE", (sale_order.id,)
+                    )
+                    if (
+                        snapshot_version
+                        and snapshot_version <= sale_order._square_applied_order_version()
+                    ):
+                        _logger.info(
+                            "Skipping Square order %s snapshot at version %s as already processed",
+                            square_order_id,
+                            snapshot_version,
+                        )
+                        return {**result, "status": "already_processed"}
                     self._sync_order_line_changes(sale_order, square_order_data)
+                    if snapshot_version:
+                        sale_order.square_order_version = snapshot_version
 
             elif str(square_order_state).upper() in ("CANCELED", "CANCELLED"):
                 self._process_order_cancellation(sale_order, square_order_data)

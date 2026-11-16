@@ -863,22 +863,30 @@ class TestSquareWebhook(SquareHttpCase):
             }
 
         first_update = update(2, "3", 9000)
-        second_update = update(3, "4", 12000)
+        second_update = update(4, "4", 12000)
         order_with_returns = {
-            **update(4, "5", 15000),
+            **update(5, "5", 15000),
             "returns": [{"source_order_id": "original-order"}],
         }
-        for version, event_id, square_order, status, quantity, amount in (
-            (2, "evt_line_sync_first", first_update, "updated", 3, 90),
-            (3, "evt_line_sync_second", None, "error", 3, 90),
-            (3, "evt_line_sync_second", second_update, "updated", 4, 120),
-            (2, "evt_line_sync_first", second_update, "already_processed", 4, 120),
-            (4, "evt_line_sync_returns", order_with_returns, "updated", 4, 120),
+        for event_id, payload, fetched_order, status, quantity, amount in (
+            ("evt_line_sync_first", first_update, None, "updated", 3, 90),
+            ("evt_line_sync_second", {**order_notice, "version": 3}, None, "error", 3, 90),
+            (
+                "evt_line_sync_second", {**order_notice, "version": 3},
+                second_update, "updated", 4, 120,
+            ),
+            ("evt_line_sync_first", first_update, None, "already_processed", 4, 120),
+            (
+                "evt_line_sync_returns", {**order_notice, "version": 5},
+                order_with_returns, "updated", 4, 120,
+            ),
+            (
+                "evt_line_sync_delayed", update(3, "3", 9000),
+                None, "already_processed", 4, 120,
+            ),
         ):
-            with patch.object(SquareApiClient, "get_order", return_value=square_order):
-                self._send_order_event(
-                    "order.updated", event_id, {**order_notice, "version": version}, status
-                )
+            with patch.object(SquareApiClient, "get_order", return_value=fetched_order):
+                self._send_order_event("order.updated", event_id, payload, status)
             self.assertEqual(self.env["sale.order"].search(order_domain), sale_order)
             self.assertEqual(sale_order.state, "draft")
             self.assertEqual(sale_order.square_order_data, original_order_data)
@@ -903,6 +911,61 @@ class TestSquareWebhook(SquareHttpCase):
         changes = unescape(" ".join(update_logs.mapped("description")))
         self.assertIn("2 -> 3", changes)
         self.assertIn("3 -> 4", changes)
+
+    def test_queued_open_update_older_than_imported_order(self):
+        self.env.company.currency_id = self.env.ref("base.EUR")
+        order_notice = {
+            "order_id": "test_queued_open_order",
+            "location_id": "test_line_sync_location",
+            "state": "OPEN",
+        }
+
+        def snapshot(quantity):
+            return {
+                **order_notice,
+                "line_items": [
+                    {
+                        "uid": "line_queued_001",
+                        "catalog_object_id": self.product.default_code,
+                        "name": self.product.name,
+                        "quantity": str(quantity),
+                        "total_money": {"amount": quantity * 2500, "currency": "EUR"},
+                    }
+                ],
+                "fulfillments": [
+                    {"pickup_details": {"recipient": {"email_address": self.partner.email}}}
+                ],
+            }
+
+        self._send_order_event(
+            "order.updated", "evt_open_before_creation", {**snapshot(2), "version": 2}, "queued"
+        )
+        with patch.object(SquareApiClient, "get_order", return_value={**snapshot(3), "version": 3}):
+            self._send_order_event(
+                "order.created", "evt_open_order_created", {**order_notice, "version": 1}, "success"
+            )
+        sale_order = self.env["sale.order"].search(
+            [("square_order_id", "=", order_notice["order_id"])]
+        )
+        self.assertEqual(sale_order.order_line.product_uom_qty, 3)
+        queued_event = self.env["square.webhook.queue"].search(
+            [("webhook_event_id", "=", "evt_open_before_creation")]
+        )
+        self.assertEqual(queued_event.state, "completed")
+
+        # A version from a notice cannot identify an unversioned retrieved snapshot.
+        with patch.object(SquareApiClient, "get_order", return_value=snapshot(4)):
+            self._send_order_event(
+                "order.updated", "evt_unversioned_snapshot", {**order_notice, "version": 5}, "updated"
+            )
+        self.assertEqual(sale_order.order_line.product_uom_qty, 4)
+
+        self._send_order_event(
+            "order.updated", "evt_current_draft_order",
+            {**snapshot(5), "state": "DRAFT", "version": 4}, "updated",
+        )
+        self.assertEqual(sale_order.state, "draft")
+        self.assertEqual(sale_order.order_line.product_uom_qty, 5)
 
     def test_order_cancellation_processing(self):
         """Test order cancellation processing"""
