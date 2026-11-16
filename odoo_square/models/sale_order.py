@@ -932,7 +932,10 @@ class SaleOrder(models.Model):
                 "description": "Service product for Square sales integration",
             }
 
-            product = self.env["product.product"].create(product_vals)
+            # The bot can provision this fixed fallback without product manager access.
+            product = (
+                self.env["product.product"].sudo().create(product_vals).with_env(self.env)
+            )
             _logger.info(f"Created 'Vente Square' service product: {product.id}")
             return product
 

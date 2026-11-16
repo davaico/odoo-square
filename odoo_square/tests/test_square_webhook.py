@@ -5,6 +5,7 @@ import logging
 from odoo.tests.common import tagged
 from odoo.tools import mute_logger
 from odoo.addons.odoo_square.controllers.square_webhook import SquareWebhookController
+from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
 
 from .common import SquareHttpCase
 
@@ -76,6 +77,7 @@ class TestSquareWebhook(SquareHttpCase):
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_order_created_completed(self):
         """Test webhook processing for order.created with COMPLETED status"""
+        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=None))
 
         # Sample Square webhook data for order.created
         webhook_data = {
@@ -139,6 +141,7 @@ class TestSquareWebhook(SquareHttpCase):
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_order_updated_completed(self):
         """Test webhook processing for order.updated with COMPLETED status"""
+        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=None))
 
         webhook_data = {
             "type": "order.updated",
@@ -277,8 +280,15 @@ class TestSquareWebhook(SquareHttpCase):
         self.assertEqual(data2["status"], "already_processed")
 
     @mute_logger("odoo.addons.odoo_square.models.sale_order")
-    def test_webhook_unknown_product_skipped(self):
-        """Test that unknown products are skipped with error logging"""
+    def test_webhook_unknown_product_uses_placeholder(self):
+        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=None))
+        self.enterContext(
+            patch.object(
+                SquareApiClient,
+                "get_catalog_object",
+                return_value={"success": True, "not_found": True},
+            )
+        )
 
         webhook_data = {
             "type": "order.created",
@@ -310,7 +320,6 @@ class TestSquareWebhook(SquareHttpCase):
             headers={"Content-Type": "application/json"},
         )
 
-        # Should still succeed but log error
         self.assertEqual(response.status_code, 200)
         response_data = response.json()
         self.assertEqual(response_data["status"], "success")
