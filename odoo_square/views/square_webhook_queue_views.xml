@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
-    <!-- Square Webhook Queue Tree View -->
+    <!-- Square Webhook Queue List View -->
     <record id="view_square_webhook_queue_tree" model="ir.ui.view">
         <field name="name">square.webhook.queue.tree</field>
         <field name="model">square.webhook.queue</field>
         <field name="arch" type="xml">
-            <tree string="Webhook Queue"
+            <list string="Webhook Queue"
                 decoration-success="state == 'completed'"
                 decoration-warning="state == 'pending'"
                 decoration-danger="state in ['failed', 'expired']"
@@ -18,7 +18,7 @@
                 <field name="next_retry_time" string="Next Retry" />
                 <field name="state" widget="badge" />
                 <field name="processed_at" string="Processed At" optional="hide" />
-            </tree>
+            </list>
         </field>
     </record>
 
@@ -110,7 +110,7 @@
     <record id="action_square_webhook_queue" model="ir.actions.act_window">
         <field name="name">Webhook Queue</field>
         <field name="res_model">square.webhook.queue</field>
-        <field name="view_mode">tree,form</field>
+        <field name="view_mode">list,form</field>
         <field name="context">{
             'search_default_filter_pending': 1,
             }</field>

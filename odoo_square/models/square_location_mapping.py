@@ -115,13 +115,10 @@ class SquareLocationMapping(models.Model):
 
         return result
 
-    def name_get(self):
-        """Custom name_get to show meaningful names"""
-        result = []
+    @api.depends("square_location_name", "warehouse_id.name")
+    def _compute_display_name(self):
         for record in self:
-            name = f"{record.square_location_name} → {record.warehouse_id.name}"
-            result.append((record.id, name))
-        return result
+            record.display_name = f"{record.square_location_name} → {record.warehouse_id.name}"
 
     @api.depends("config_id")
     def _compute_available_square_locations(self):

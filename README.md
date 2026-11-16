@@ -2,11 +2,11 @@
 
 [![CI](https://github.com/davaico/odoo-square/actions/workflows/ci.yml/badge.svg)](https://github.com/davaico/odoo-square/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
-[![Odoo](https://img.shields.io/badge/Odoo-17.0-875A7B.svg)](https://www.odoo.com)
+[![Odoo](https://img.shields.io/badge/Odoo-18.0-875A7B.svg)](https://www.odoo.com)
 
-Production-oriented Odoo 17 addon for integrating Square POS with Odoo Sales, Accounting, and Inventory.
+Odoo 18 Community addon for integrating Square POS with Odoo Sales, Accounting, and Inventory.
 
-The module processes Square webhooks, creates and updates Odoo sales orders, handles refunds and exchanges, maps Square locations to Odoo warehouses, and synchronizes inventory with an auditable activity log.
+The module processes Square webhooks, creates and updates Odoo sales orders, records payments and refunds initiated in Square, maps Square locations to Odoo warehouses, and synchronizes inventory with an auditable activity log.
 
 ## Features
 
@@ -21,15 +21,14 @@ The module processes Square webhooks, creates and updates Odoo sales orders, han
 
 ## Requirements
 
-- Odoo 17.0 Community or Enterprise
-- PostgreSQL supported by Odoo 17.0
-- Python package: `requests`
+- Odoo 18.0 Community and PostgreSQL. The included Compose setup uses Odoo 18.0-20261015 and PostgreSQL 17.4.
+- Python package: `requests`, included in the official Odoo container
 - Square Developer account with an application, access token, location IDs, and webhook signature key
 - Docker and Docker Compose for the included local development environment
 
 ## Compatibility
 
-This repository follows Odoo addon versioning. The current manifest version is `17.0.1.4.0`, where `17.0` is the Odoo series and `1.4.0` is the addon release version.
+This repository follows Odoo addon versioning. The current manifest version is `18.0.1.4.0`, where `18.0` is the Odoo series and `1.4.0` is the addon release version.
 
 The addon manifest declares the following Odoo dependencies:
 
@@ -39,14 +38,15 @@ The addon manifest declares the following Odoo dependencies:
 - `sales_team`
 - `account`
 - `stock`
+- `sale_stock`
 - `payment`
 
 ## Quick Start
 
-Clone the repository:
+Clone the Odoo 18 release branch:
 
 ```bash
-git clone https://github.com/davaico/odoo-square.git
+git clone --branch 18.0 https://github.com/davaico/odoo-square.git
 cd odoo-square
 ```
 
@@ -58,25 +58,17 @@ cp .env.example .env
 
 Edit `.env` and set a non-default `DB_PASSWORD`.
 
-Start Odoo and PostgreSQL:
+Install **Square POS Integration** into the fresh local database, then start Odoo:
 
 ```bash
+docker compose build odoo
+docker compose run --rm odoo odoo -d odoo -i odoo_square --stop-after-init
 docker compose up -d
 ```
 
-Open [http://localhost:8069](http://localhost:8069), create or select a database, update the Apps list, then install **Square POS Integration**.
+Use the database name from `.env` in place of `odoo` if you changed `DB_NAME`. Open [http://localhost:8069](http://localhost:8069) and sign in with the fresh local administrator credentials (`admin` / `admin`).
 
 ## Square Configuration
-
-In Odoo, open **Settings > Square Configuration** and configure:
-
-- Square Application ID
-- Square Access Token
-- Environment: `Sandbox` or `Production`
-- Webhook Signature Key
-- Payment Journal
-- Square Location to Odoo Warehouse mappings
-- Optional Sales Team mappings
 
 In the Square Developer Dashboard, create a webhook subscription that points to:
 
@@ -91,6 +83,16 @@ Configure at least these event types:
 - `payment.updated`
 - `refund.created`
 - `refund.updated`
+
+Set up the company's chart of accounts and create or select a payment journal for Square payments. In Odoo, open **Square > Configuration** and create a configuration with:
+
+- The matching Square environment (`Sandbox` or `Production`), application ID, and access token
+- The webhook signature key from the Square Developer Dashboard
+- The payment journal used to record Square transactions
+- A mapping from each Square location ID to its Odoo warehouse
+- An optional default Sales Team and optional per-location Sales Teams
+
+Save the configuration and use **Test Connection** to verify the Square credentials.
 
 For production deployments, run Odoo behind HTTPS and keep `proxy_mode = True` in `config/odoo.conf` when a reverse proxy terminates TLS.
 
@@ -117,37 +119,24 @@ docker compose restart odoo
 Update the addon after manifest, XML, or model changes:
 
 ```bash
-docker compose exec odoo bash -lc 'odoo \
-  --config=/etc/odoo/odoo.conf \
-  -d odoo \
-  --db_host="${HOST:-db}" \
-  --db_port=5432 \
-  --db_user="${USER:-odoo}" \
-  --db_password="$PASSWORD" \
-  -u odoo_square \
-  --stop-after-init'
+docker compose stop odoo
+docker compose run --rm odoo odoo -d odoo -u odoo_square --stop-after-init
+docker compose up -d
 ```
 
 ## Testing
 
-Run the same test command used by CI:
+Run the CI test service with its own Compose project, database, and volumes:
 
 ```bash
-DB_PASSWORD=ci_odoo_test docker compose -f docker-compose.test.yml run --rm odoo \
-  odoo \
-    --config=/etc/odoo/odoo.conf \
-    -d odoo \
-    --db_host=db \
-    --db_port=5432 \
-    --db_user=odoo \
-    --db_password=ci_odoo_test \
-    -i odoo_square \
-    --test-enable \
-    --workers=0 \
-    --stop-after-init \
-    --test-tags=odoo_square \
-    --log-level=test
+test_project=odoo-square-v18-test-$$
+export DB_PASSWORD=ci_odoo_test DB_NAME=odoo_square_v18_test
+docker compose -p "$test_project" -f docker-compose.test.yml build odoo
+docker compose -p "$test_project" -f docker-compose.test.yml run --rm odoo
+docker compose -p "$test_project" -f docker-compose.test.yml down -v
 ```
+
+Set `ODOO_TEST_TAGS` for a focused run, for example `/odoo_square:TestSquareModuleContracts`.
 
 The suite includes HTTP webhook tests, Square order/refund integration scenarios, stock return behavior, manual resync behavior, and addon contract tests.
 

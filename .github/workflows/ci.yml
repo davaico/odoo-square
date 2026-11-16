@@ -3,7 +3,7 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: ['18.0']
   pull_request:
   workflow_dispatch:
 
@@ -15,47 +15,16 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DB_PASSWORD: ci_odoo_test
-      DB_NAME: odoo
-      DB_USER: odoo
-      DB_HOST: db
-      MODULE: odoo_square
+      COMPOSE_PROJECT_NAME: odoo-square-v18-test-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start PostgreSQL
-        run: docker compose -f docker-compose.test.yml up -d db
-
-      - name: Wait for PostgreSQL
-        run: |
-          for i in $(seq 1 60); do
-            if docker compose -f docker-compose.test.yml exec -T db pg_isready -U "$DB_USER"; then
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "PostgreSQL did not become ready in time"
-          exit 1
-
-      - name: Build Odoo
+      - name: Build Odoo 18 Community
         run: docker compose -f docker-compose.test.yml build odoo
 
-      - name: Run tests
-        run: |
-          docker compose -f docker-compose.test.yml run --rm odoo \
-            odoo \
-              --config=/etc/odoo/odoo.conf \
-              -d "$DB_NAME" \
-              --db_host="$DB_HOST" \
-              --db_port=5432 \
-              --db_user="$DB_USER" \
-              --db_password="$DB_PASSWORD" \
-              -i "$MODULE" \
-              --test-enable \
-              --workers=0 \
-              --stop-after-init \
-              --test-tags="$MODULE" \
-              --log-level=test
+      - name: Install and test Square on a fresh database
+        run: docker compose -f docker-compose.test.yml run --rm odoo
 
       - name: Logs on failure
         if: failure()

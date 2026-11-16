@@ -56,14 +56,14 @@
                             </group>
                             <separator string="Missing Orders" colspan="4" invisible="state != 'results'"/>
                             <field name="line_ids" nolabel="1" invisible="state != 'results'">
-                                <tree string="Missing Orders" editable="bottom">
+                                <list string="Missing Orders" editable="bottom">
                                     <field name="selected" widget="boolean"/>
                                     <field name="square_order_id"/>
                                     <field name="created_at" optional="show"/>
                                     <field name="state" optional="show"/>
                                     <field name="location_id" optional="show"/>
                                     <field name="total_amount" optional="show"/>
-                                </tree>
+                                </list>
                             </field>
                         </div>
 
