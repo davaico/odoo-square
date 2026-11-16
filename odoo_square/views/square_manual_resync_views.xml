@@ -55,14 +55,14 @@
                                 <field name="selected_total" widget="integer"/>
                             </group>
                             <separator string="Missing Orders" colspan="4" invisible="state != 'results'"/>
-                            <field name="line_ids" nolabel="1" invisible="state != 'results'">
-                                <list string="Missing Orders" editable="bottom">
+                            <field name="line_ids" nolabel="1" invisible="state != 'results'" readonly="state != 'results'">
+                                <list string="Missing Orders" editable="bottom" create="0" delete="0">
                                     <field name="selected" widget="boolean"/>
-                                    <field name="square_order_id"/>
-                                    <field name="created_at" optional="show"/>
-                                    <field name="state" optional="show"/>
-                                    <field name="location_id" optional="show"/>
-                                    <field name="total_amount" optional="show"/>
+                                    <field name="square_order_id" readonly="1"/>
+                                    <field name="created_at" optional="show" readonly="1"/>
+                                    <field name="state" optional="show" readonly="1"/>
+                                    <field name="location_id" optional="show" readonly="1"/>
+                                    <field name="total_amount" optional="show" readonly="1"/>
                                 </list>
                             </field>
                         </div>
