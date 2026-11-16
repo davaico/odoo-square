@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 from unittest.mock import call, patch
 
+from odoo.exceptions import UserError
 from odoo.tests import Form
 from odoo.tests.common import tagged
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
@@ -514,6 +515,74 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.assertEqual(len(cancellation_logs), 1)
         self.assertEqual(cancellation_logs.event_type, "order_updated")
         self.assertIn(reversal.name, cancellation_logs.description)
+
+    def test_cancellation_replay_posts_only_the_missing_invoice_reversal(self):
+        (self.product_p1 | self.product_p2).invoice_policy = "delivery"
+        order, first, backorder = self._confirm_sale_and_deliver_first_shipment()
+        first_invoice = order._create_invoices()
+        first_invoice.action_post()
+        backorder.action_assign()
+        backorder.button_validate()
+        self.assertEqual(backorder.state, "done")
+        second_invoice = order._create_invoices()
+        second_invoice.action_post()
+        self.assertEqual(order.invoice_ids, first_invoice | second_invoice)
+        self.assertEqual(order.invoice_status, "invoiced")
+        self.assertAlmostEqual(first_invoice.amount_total, 2.40, places=2)
+        self.assertAlmostEqual(second_invoice.amount_total, 1.20, places=2)
+
+        move_model = type(self.env["account.move"])
+        post_moves = move_model.action_post
+
+        def post_except_second_reversal(moves):
+            if second_invoice.id in moves.reversed_entry_id.ids:
+                raise UserError("Test failure posting the second cancellation reversal")
+            return post_moves(moves)
+
+        event_id = "evt_cancellation_two_invoices"
+        with patch.object(move_model, "action_post", post_except_second_reversal):
+            result = self._send_square_order_event("order.updated", event_id, "CANCELED")
+        self.assertEqual(result["status"], "error", result)
+        first_reversal = first_invoice.reversal_move_ids
+        self.assertEqual(len(first_reversal), 1)
+        self.assertEqual(first_reversal.state, "posted")
+        self.assertFalse(second_invoice.reversal_move_ids)
+
+        log_model = self.env["square.integration.log"]
+        success_domain = [("webhook_event_id", "=", event_id), ("status", "=", "success")]
+        self.assertFalse(log_model.search(success_domain))
+        failures = log_model.search([
+            ("sale_order_id", "=", order.id),
+            ("event_type", "=", "order_updated"),
+            ("status", "=", "error"),
+        ])
+        self.assertEqual(len(failures), 1)
+        self.assertIn(second_invoice.name, failures.description)
+
+        result = self._send_square_order_event("order.updated", event_id, "CANCELED")
+        self.assertEqual(result["status"], "updated", result)
+        second_reversal = second_invoice.reversal_move_ids
+        self.assertEqual(len(second_reversal), 1)
+        self.assertEqual(second_reversal.state, "posted")
+        self.assertAlmostEqual(first_reversal.amount_total, 2.40, places=2)
+        self.assertAlmostEqual(second_reversal.amount_total, 1.20, places=2)
+
+        result = self._send_square_order_event("order.updated", event_id, "CANCELED")
+        self.assertEqual(result["status"], "already_processed", result)
+        self.assertEqual(first_invoice.reversal_move_ids, first_reversal)
+        self.assertEqual(second_invoice.reversal_move_ids, second_reversal)
+        self.assertEqual(
+            order.invoice_ids, first_invoice | second_invoice | first_reversal | second_reversal
+        )
+        self.assertEqual(log_model.search_count(success_domain), 1)
+        self.assertEqual(order.state, "sale")
+        self.assertEqual(order.picking_ids, first | backorder)
+        self.assertEqual(set(order.picking_ids.mapped("state")), {"done"})
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
+        self.assertFalse(
+            self.env["account.payment"].search([("partner_id", "=", self.customer.id)])
+        )
 
     def _assert_square_sale_order(self, state):
         order = self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")])
