@@ -887,7 +887,7 @@ class SaleOrder(models.Model):
             "name": product.name,
             "product_uom_qty": quantity,
             "price_unit": unit_price,
-            "tax_id": tax_cmds,
+            "tax_ids": tax_cmds,
         }
 
         square_line_id = line_item.get("uid")

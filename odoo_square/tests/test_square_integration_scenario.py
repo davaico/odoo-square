@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
 import logging
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from odoo.tests.common import tagged
 from odoo.tools import mute_logger
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
@@ -17,6 +17,22 @@ class TestSquareIntegrationScenario(SquareHttpCase):
     Complete integration test for the Square Odoo integration scenario.
     Tests the full flow: setup, sale, stock sync, refund, and stock restoration.
     """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        company = cls.env.company
+        company.currency_id = cls.env.ref("base.EUR")
+        cls.env["account.chart.template"].try_loading("generic_coa", company)
+        cls.sale_tax = cls.env["account.tax"].create(
+            {
+                "name": "Square VAT 20%",
+                "amount": 20.0,
+                "amount_type": "percent",
+                "type_tax_use": "sale",
+                "price_include_override": "tax_excluded",
+            }
+        )
 
     def setUp(self):
         super().setUp()
@@ -68,22 +84,32 @@ class TestSquareIntegrationScenario(SquareHttpCase):
 
         # Update config with payment journal
         self.square_config.payment_journal_id = self.payment_journal.id
+        self.env["square.stock.sync"].create({"auto_sync_enabled": False})
+        self.customer = self.env["res.partner"].create(
+            {"name": "Existing John Doe", "email": "john.doe@example.com"}
+        )
 
         # Create test products with SKUs
         self.product_p1 = self.env["product.product"].create(
             {
                 "name": "Product P1",
                 "default_code": "P1-SKU",
-                "list_price": 1.00,  # TTC price
-                "type": "product",
+                "list_price": 5.0,
+                "type": "consu",
+                "is_storable": True,
+                "invoice_policy": "order",
+                "taxes_id": [(6, 0, self.sale_tax.ids)],
             }
         )
         self.product_p2 = self.env["product.product"].create(
             {
                 "name": "Product P2",
                 "default_code": "P2-SKU",
-                "list_price": 2.00,  # TTC price
-                "type": "product",
+                "list_price": 7.0,
+                "type": "consu",
+                "is_storable": True,
+                "invoice_policy": "order",
+                "taxes_id": [(6, 0, self.sale_tax.ids)],
             }
         )
 
@@ -93,27 +119,23 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self._set_initial_stock(self.product_p2, self.warehouse_w1, 50)
         self._set_initial_stock(self.product_p2, self.warehouse_w2, 50)
 
-        # Mock Square API client responses
-        self.mock_square_api = {
-            "get_order": self._mock_get_order,
-            "get_catalog_object": self._mock_get_catalog_object,
-            "test_connection": MagicMock(
-                return_value={"success": True, "message": "Connected"}
-            ),
-        }
-
-        self._patcher_get_order = patch.object(
-            SquareApiClient,
-            "get_order",
-            side_effect=self._patch_side_get_order,
+        self.enterContext(
+            patch.object(SquareApiClient, "get_order", side_effect=self._patch_side_get_order)
         )
-        self._patcher_get_catalog = patch.object(
-            SquareApiClient,
-            "get_catalog_object",
-            side_effect=self._patch_side_get_catalog,
+        self.enterContext(
+            patch.object(
+                SquareApiClient,
+                "get_catalog_object",
+                side_effect=self._patch_side_get_catalog,
+            )
         )
-        self._patcher_get_order.start()
-        self._patcher_get_catalog.start()
+        self.enterContext(
+            patch.object(
+                SquareApiClient,
+                "search_catalog_by_sku",
+                return_value={"success": True, "not_found": True},
+            )
+        )
 
         # Track created records for assertions
         self.created_sale_order = None
@@ -145,20 +167,22 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                         "name": "Product P1",
                         "catalog_object_id": "P1-SKU",
                         "quantity": "1",
-                        "total_money": {"amount": 100, "currency": "EUR"},  # 1.00€
-                        "total_tax_money": {"amount": 20, "currency": "EUR"},  # 0.20€
+                        "base_price_money": {"amount": 100, "currency": "EUR"},
+                        "total_money": {"amount": 120, "currency": "EUR"},
+                        "total_tax_money": {"amount": 20, "currency": "EUR"},
                     },
                     {
                         "uid": "line_2",
                         "name": "Product P2",
-                        "catalog_object_id": "P2-SKU",
-                        "quantity": "1",
-                        "total_money": {"amount": 200, "currency": "EUR"},  # 2.00€
-                        "total_tax_money": {"amount": 40, "currency": "EUR"},  # 0.40€
+                        "catalog_object_id": "P2-CATALOG",
+                        "quantity": "2",
+                        "base_price_money": {"amount": 100, "currency": "EUR"},
+                        "total_money": {"amount": 240, "currency": "EUR"},
+                        "total_tax_money": {"amount": 40, "currency": "EUR"},
                     },
                 ],
-                "total_money": {"amount": 300, "currency": "EUR"},  # 3.00€
-                "total_tax_money": {"amount": 60, "currency": "EUR"},  # 0.60€
+                "total_money": {"amount": 360, "currency": "EUR"},
+                "total_tax_money": {"amount": 60, "currency": "EUR"},
                 "fulfillments": [
                     {
                         "pickup_details": {
@@ -173,7 +197,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                 "tenders": [
                     {
                         "id": "payment_001",
-                        "amount_money": {"amount": 300, "currency": "EUR"},
+                        "amount_money": {"amount": 360, "currency": "EUR"},
                         "card_details": {"card": {"cardholder_name": "JOHN DOE"}},
                     }
                 ],
@@ -184,7 +208,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         """Mock Square API get_catalog_object response"""
         sku_mapping = {
             "P1-SKU": {"sku": "P1-SKU", "name": "Product P1"},
-            "P2-SKU": {"sku": "P2-SKU", "name": "Product P2"},
+            "P2-CATALOG": {"sku": "P2-SKU", "name": "Product P2"},
         }
 
         if catalog_id in sku_mapping:
@@ -239,14 +263,139 @@ class TestSquareIntegrationScenario(SquareHttpCase):
     def _get_stock_quantity(self, product, warehouse):
         """Get current stock quantity for a product in a warehouse"""
         stock_location = warehouse.lot_stock_id
-        quant = self.env["stock.quant"].search(
+        quants = self.env["stock.quant"].search(
             [
                 ("product_id", "=", product.id),
                 ("location_id", "=", stock_location.id),
             ],
-            limit=1,
         )
-        return quant.quantity if quant else 0
+        return sum(quants.mapped("quantity"))
+
+    def _send_square_order_event(self, event_type, event_id, state):
+        payload = {
+            "type": event_type,
+            "event_id": event_id,
+            "data": {
+                "object": {
+                    event_type.replace(".", "_"): {
+                        "id": "ORDER_L1_001",
+                        "location_id": "L1",
+                        "state": state,
+                    }
+                }
+            },
+        }
+        response = self.url_open(
+            "/square/webhook",
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def _import_paid_square_sale(self):
+        result = self._send_square_order_event(
+            "order.updated", "evt_paid_sale_001", "COMPLETED"
+        )
+        self.assertIn(result["status"], ("success", "updated"), result)
+        self._assert_paid_square_sale()
+
+    def _assert_square_sale_order(self, state):
+        order = self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")])
+        self.assertEqual(len(order), 1)
+        self.assertEqual(order.partner_id, self.customer)
+        self.assertEqual(order.state, state)
+        self.assertEqual(order.warehouse_id, self.warehouse_w1)
+        self.assertEqual(order.currency_id, self.env.ref("base.EUR"))
+        self.assertEqual(order.square_payment_id, "payment_001")
+        self.assertEqual(len(order.order_line), 2)
+        for product, quantity, tax, total in (
+            (self.product_p1, 1, 0.20, 1.20),
+            (self.product_p2, 2, 0.40, 2.40),
+        ):
+            line = order.order_line.filtered(lambda line: line.product_id == product)
+            self.assertEqual(len(line), 1)
+            self.assertEqual(line.product_uom_qty, quantity)
+            self.assertAlmostEqual(line.price_tax, tax, places=2)
+            self.assertAlmostEqual(line.price_total, total, places=2)
+        self.assertAlmostEqual(order.amount_total, 3.60, places=2)
+
+        self.created_sale_order = order
+        self.created_customer = order.partner_id
+        return order
+
+    def _assert_paid_square_sale(self):
+        order = self._assert_square_sale_order("sale")
+        invoice = order.invoice_ids
+        self.assertEqual(len(invoice), 1)
+        self.assertEqual(invoice.move_type, "out_invoice")
+        self.assertEqual(invoice.state, "posted")
+        self.assertEqual(invoice.currency_id, order.currency_id)
+        self.assertAlmostEqual(invoice.amount_total, 3.60, places=2)
+        self.assertAlmostEqual(invoice.amount_residual, 0.0, places=2)
+        self.assertEqual(invoice.payment_state, "paid")
+
+        payment = self.env["account.payment"].search(
+            [("partner_id", "=", self.customer.id)]
+        )
+        self.assertEqual(len(payment), 1)
+        self.assertEqual(invoice.reconciled_payment_ids, payment)
+        self.assertEqual(payment.journal_id, self.payment_journal)
+        self.assertEqual(payment.payment_type, "inbound")
+        self.assertEqual(payment.currency_id, order.currency_id)
+        self.assertAlmostEqual(payment.amount, 3.60, places=2)
+        self.assertEqual(payment.move_id.state, "posted")
+
+        invoice_receivable = invoice.line_ids.filtered(
+            lambda line: line.account_id.account_type == "asset_receivable"
+        )
+        payment_receivable = payment.move_id.line_ids.filtered(
+            lambda line: line.account_id.account_type == "asset_receivable"
+        )
+        self.assertEqual(len(invoice_receivable), 1)
+        self.assertEqual(len(payment_receivable), 1)
+        self.assertTrue(invoice_receivable.full_reconcile_id)
+        self.assertEqual(
+            invoice_receivable.full_reconcile_id, payment_receivable.full_reconcile_id
+        )
+
+        delivery = order.picking_ids
+        self.assertEqual(len(delivery), 1)
+        self.assertEqual(delivery.picking_type_code, "outgoing")
+        self.assertEqual(delivery.state, "done")
+        self.assertEqual(delivery.location_id, self.warehouse_w1.lot_stock_id)
+        self.assertEqual(len(delivery.move_ids), 2)
+        self.assertEqual(set(delivery.move_ids.mapped("state")), {"done"})
+        self.assertEqual(
+            {move.product_id: move.quantity for move in delivery.move_ids},
+            {self.product_p1: 1, self.product_p2: 2},
+        )
+        for product, quantity in ((self.product_p1, 49), (self.product_p2, 48)):
+            self.assertEqual(
+                self._get_stock_quantity(product, self.warehouse_w1), quantity
+            )
+            self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
+
+        self.created_invoice = invoice
+
+    def test_paid_sale_import_and_replay(self):
+        self._import_paid_square_sale()
+
+        order_logs = self.env["square.integration.log"].search(
+            [
+                ("sale_order_id", "=", self.created_sale_order.id),
+                ("square_order_id", "=", "ORDER_L1_001"),
+                ("status", "=", "success"),
+            ]
+        )
+        self.assertIn("order_updated", order_logs.mapped("event_type"))
+        self.assertIn("stock_sync", order_logs.mapped("event_type"))
+
+        result = self._send_square_order_event(
+            "order.updated", "evt_paid_sale_001", "COMPLETED"
+        )
+        self.assertEqual(result["status"], "already_processed", result)
+        self._assert_paid_square_sale()
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_complete_square_integration_scenario(self):
@@ -311,133 +460,20 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         _logger.info("✓ Initial setup verification passed")
 
     def _test_sale_processing(self):
-        """Test sale processing via webhook"""
-
-        # Simulate order.created webhook
-        order_created_data = {
-            "type": "order.created",
-            "data": {
-                "object": {
-                    "order_created": {
-                        "id": "ORDER_L1_001",
-                        "location_id": "L1",
-                        "state": "OPEN",
-                    }
-                }
-            },
-            "event_id": "evt_order_created_001",
-        }
-
-        response = self.url_open(
-            "/square/webhook",
-            data=json.dumps(order_created_data),
-            headers={"Content-Type": "application/json"},
+        """Import the open order as a draft quotation."""
+        result = self._send_square_order_event(
+            "order.created", "evt_order_created_001", "OPEN"
         )
-
-        self.assertEqual(response.status_code, 200)
-        response_data = response.json()
-        self.assertEqual(response_data["status"], "success")
-
-        # Verify draft sale order was created
-        self.created_sale_order = self.env["sale.order"].search(
-            [("square_order_id", "=", "ORDER_L1_001")]
-        )
-        self.assertTrue(self.created_sale_order.exists())
-        self.assertEqual(self.created_sale_order.state, "draft")
-        self.assertEqual(self.created_sale_order.warehouse_id, self.warehouse_w1)
-
-        # Verify customer was created/found
-        self.created_customer = self.created_sale_order.partner_id
-        self.assertTrue(self.created_customer.exists())
-        self.assertEqual(self.created_customer.email, "john.doe@example.com")
-
-        # Verify order lines were created
-        self.assertEqual(len(self.created_sale_order.order_line), 2)
-        p1_line = self.created_sale_order.order_line.filtered(
-            lambda l: l.product_id == self.product_p1
-        )
-        p2_line = self.created_sale_order.order_line.filtered(
-            lambda l: l.product_id == self.product_p2
-        )
-
-        self.assertTrue(p1_line.exists())
-        self.assertTrue(p2_line.exists())
-        self.assertEqual(p1_line.product_uom_qty, 1)
-        self.assertEqual(p2_line.product_uom_qty, 1)
-
-        # Verify total amount (with VAT) — Odoo sale lines add tax on top of Square TTC split
-        self.assertAlmostEqual(self.created_sale_order.amount_total, 3.45, places=2)
-
-        _logger.info("✓ Sale processing verification passed")
+        self.assertEqual(result["status"], "success", result)
+        self._assert_square_sale_order("draft")
 
     def _test_stock_updates(self):
-        """Test stock updates after order completion"""
-
-        # Simulate order.updated webhook to COMPLETED
-        order_updated_data = {
-            "type": "order.updated",
-            "data": {
-                "object": {
-                    "order_updated": {
-                        "id": "ORDER_L1_001",
-                        "location_id": "L1",
-                        "state": "COMPLETED",
-                    }
-                }
-            },
-            "event_id": "evt_order_updated_001",
-        }
-
-        response = self.url_open(
-            "/square/webhook",
-            data=json.dumps(order_updated_data),
-            headers={"Content-Type": "application/json"},
+        """Complete the imported quotation through the Square webhook."""
+        result = self._send_square_order_event(
+            "order.updated", "evt_order_updated_001", "COMPLETED"
         )
-
-        self.assertEqual(response.status_code, 200)
-        response_data = response.json()
-        self.assertIn(
-            response_data["status"],
-            ("success", "updated"),
-            "COMPLETED update should succeed",
-        )
-
-        # Refresh sale order
-        self.created_sale_order.invalidate_recordset()
-
-        # Verify order was confirmed
-        self.assertEqual(self.created_sale_order.state, "sale")
-
-        # Verify invoice was created and posted
-        invoices = self.created_sale_order.invoice_ids
-        self.assertTrue(len(invoices) > 0)
-        posted_invoice = invoices.filtered(lambda inv: inv.state == "posted")
-        self.assertTrue(posted_invoice.exists())
-        self.created_invoice = posted_invoice[0]
-
-        # Verify payment was registered (refunds may leave residual reconciliation)
-        self.assertIn(
-            self.created_invoice.payment_state,
-            ("paid", "partial", "in_payment"),
-        )
-
-        # Verify stock was decreased in W1
-        self.assertEqual(
-            self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49
-        )
-        self.assertEqual(
-            self._get_stock_quantity(self.product_p2, self.warehouse_w1), 49
-        )
-
-        # Verify stock in W2 unchanged
-        self.assertEqual(
-            self._get_stock_quantity(self.product_p1, self.warehouse_w2), 50
-        )
-        self.assertEqual(
-            self._get_stock_quantity(self.product_p2, self.warehouse_w2), 50
-        )
-
-        _logger.info("✓ Stock updates verification passed")
+        self.assertIn(result["status"], ("success", "updated"), result)
+        self._assert_paid_square_sale()
 
     def _test_refund_processing(self):
         """Test partial refund processing"""
@@ -448,7 +484,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                 "square_refund_id": "REFUND_L1_001",
                 "square_order_id": "ORDER_L1_001",
                 "status": "pending",
-                "refund_amount": 1.00,  # Partial refund for P1
+                "refund_amount": 1.20,  # Partial refund for P1
                 "currency_id": self.env.ref("base.EUR").id,
                 "sale_order_id": self.created_sale_order.id,
                 "refund_reason": "Customer return",
@@ -514,16 +550,16 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.assertEqual(self.created_sale_order.state, "sale")
         self.created_sale_order.invalidate_recordset()
         self.assertGreater(self.created_sale_order.amount_total, 0)
-        self.assertLessEqual(self.created_sale_order.amount_total, 3.46)
+        self.assertLessEqual(self.created_sale_order.amount_total, 3.60)
 
         # Verify refund tracking
         self.assertEqual(len(self.created_sale_order.square_refund_ids), 1)
         refund = self.created_sale_order.square_refund_ids[0]
         self.assertEqual(refund.status, "completed")
-        self.assertEqual(refund.refund_amount, 1.00)
+        self.assertEqual(refund.refund_amount, 1.20)
 
         # Verify total refunded amount
-        self.assertEqual(self.created_sale_order.total_refunded_amount, 1.00)
+        self.assertEqual(self.created_sale_order.total_refunded_amount, 1.20)
 
         # Verify refund status
         self.assertEqual(self.created_sale_order.refund_status, "partially_refunded")
@@ -543,7 +579,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         )  # Unchanged
 
         # Verify invoice and credit note
-        self.assertAlmostEqual(self.created_invoice.amount_total, 3.45, places=2)
+        self.assertAlmostEqual(self.created_invoice.amount_total, 3.60, places=2)
         self.assertIn(
             self.created_invoice.payment_state,
             ("paid", "partial", "in_payment"),
@@ -614,17 +650,17 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             other_lines.unlink()
 
         single_line.product_uom_qty = 2
-        single_line.price_unit = 1.0  # 1€ per unit, 2€ total
+        single_line.price_unit = 1.0  # €1.20 per unit including VAT
 
         self._confirm_deliver_invoice_mapped_wh(self.created_sale_order)
 
-        # Create refund for exactly 1€
+        # Refund one item at its VAT-inclusive price
         refund_record = self.env["square.refund"].create(
             {
                 "square_refund_id": "SINGLE_LINE_REFUND_TEST",
                 "square_order_id": "ORDER_L1_001",
                 "status": "pending",
-                "refund_amount": 1.00,  # Exactly 1€, should return exactly 1 unit
+                "refund_amount": 1.20,
                 "currency_id": self.env.ref("base.EUR").id,
                 "sale_order_id": self.created_sale_order.id,
             }
@@ -644,7 +680,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.assertEqual(
             single_line.returned_qty,
             1.0,
-            "Should return exactly 1 unit for 1€ refund on 1€/unit item",
+            "A refund of one unit’s price should return exactly one unit",
         )
 
         # Verify order quantity is updated correctly
@@ -656,30 +692,3 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.assertTrue(refund_record.credit_note_id)
 
         _logger.info("✓ Single line partial refund quantity fix test passed")
-
-    def tearDown(self):
-        """Clean up test data"""
-        for p in getattr(self, "_patcher_get_order", None), getattr(
-            self, "_patcher_get_catalog", None
-        ):
-            if p is not None:
-                try:
-                    p.stop()
-                except RuntimeError:
-                    pass
-
-        # Additional cleanup if needed
-        try:
-            # Clean up any remaining test records
-            self.env["sale.order"].search(
-                [("square_order_id", "=", "ORDER_L1_001")]
-            ).unlink()
-
-            self.env["square.refund"].search(
-                [("square_refund_id", "=", "REFUND_L1_001")]
-            ).unlink()
-
-        except Exception as e:
-            _logger.warning(f"Error during test cleanup: {str(e)}")
-
-        super().tearDown()
