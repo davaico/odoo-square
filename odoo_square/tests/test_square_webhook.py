@@ -1288,7 +1288,17 @@ class TestSquareWebhook(SquareHttpCase):
         self.assertAlmostEqual(invoice.amount_total, 50, places=2)
 
         account_moves = self.env["account.move"]
+        account_payments = self.env["account.payment"]
         account_domain = [("partner_id", "=", self.partner.id)]
+        original_payment = account_payments.search(account_domain)
+        self.assertEqual(len(original_payment), 1)
+        original_payment_move = original_payment.move_id
+        invoice_receivable = invoice.line_ids.filtered(
+            lambda line: line.account_type == "asset_receivable"
+        )
+        payment_receivable = original_payment_move.line_ids.filtered(
+            lambda line: line.account_type == "asset_receivable"
+        )
         credit_note = account_moves.browse()
         for state, event_id, status in (
             ("CANCELED", "evt_completed_cancel", "updated"),
@@ -1316,7 +1326,17 @@ class TestSquareWebhook(SquareHttpCase):
             )
             self.assertEqual(invoice.state, "posted")
             self.assertAlmostEqual(invoice.amount_total, 50, places=2)
-            self.assertFalse(self.env["account.payment"].search(account_domain))
+            self.assertAlmostEqual(invoice.amount_residual, 0, places=2)
+            self.assertEqual(account_payments.search(account_domain), original_payment)
+            self.assertEqual(original_payment.payment_type, "inbound")
+            self.assertEqual(original_payment.currency_id, invoice.currency_id)
+            self.assertAlmostEqual(original_payment.amount, 50, places=2)
+            self.assertEqual(original_payment.move_id, original_payment_move)
+            self.assertEqual(original_payment_move.state, "posted")
+            self.assertTrue(invoice_receivable.full_reconcile_id)
+            self.assertEqual(
+                payment_receivable.full_reconcile_id, invoice_receivable.full_reconcile_id
+            )
             self.assertFalse(sale_order.square_refund_ids)
             self.assertEqual(
                 self.env["sale.order"].search([("square_order_id", "=", order_id)]),
