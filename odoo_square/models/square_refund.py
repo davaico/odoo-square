@@ -383,7 +383,8 @@ class SquareRefund(models.Model):
 
     def _create_pending_refund_actions(self):
         """Prepare the return pickings and draft credit note."""
-        if self.credit_note_id and self.credit_note_id.state != "cancel":
+        has_credit_note = self.credit_note_id and self.credit_note_id.state != "cancel"
+        if has_credit_note and self.status == "pending":
             return True
 
         try:
@@ -398,6 +399,9 @@ class SquareRefund(models.Model):
                         self._create_partial_return_picking()
                     else:
                         self._create_full_return_picking()
+
+                if has_credit_note:
+                    return True
 
                 self.credit_note_id = self._create_credit_note(is_partial)
                 self.invoice_id = self.credit_note_id.reversed_entry_id
