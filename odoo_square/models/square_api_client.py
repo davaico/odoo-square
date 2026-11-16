@@ -3,7 +3,8 @@ import requests
 import json
 import logging
 from datetime import datetime, timezone
-from odoo import models, api, fields
+from uuid import uuid4
+from odoo import models, api
 from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
@@ -334,18 +335,19 @@ class SquareApiClient(models.Model):
 
             # Get current timestamp in ISO 8601 format for Square API
             occurred_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            request_id = str(uuid4())
 
             data = {
-                "idempotency_key": f"odoo-count-{product_sku}-{fields.Datetime.now().strftime('%Y%m%d%H%M%S')}",
+                "idempotency_key": request_id,
                 "changes": [
                     {
                         "type": "PHYSICAL_COUNT",
                         "physical_count": {
-                            "reference_id": f"odoo-sync-{product_sku}-{fields.Datetime.now().strftime('%Y%m%d%H%M%S')}",
+                            "reference_id": f"odoo-sync-{request_id}",
                             "catalog_object_id": catalog_object_id,
                             "state": "IN_STOCK",
                             "location_id": location_id,
-                            "quantity": str(abs(target_quantity)),
+                            "quantity": str(max(0, target_quantity)),
                             "occurred_at": occurred_at,
                         },
                     }

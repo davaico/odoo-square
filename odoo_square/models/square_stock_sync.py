@@ -89,11 +89,21 @@ class SquareStockSync(models.Model):
             return False
 
         # Only sync stockable products
-        if product.type != "product":
+        if not product.is_storable:
             _logger.info(f"Skipping product {product.name} - not stockable")
             return False
 
         return True
+
+    def _get_warehouse_stock(self, product, warehouse):
+        """Count stock in the warehouse's stock location and its bins."""
+        quants = self.env["stock.quant"].search(
+            [
+                ("product_id", "=", product.id),
+                ("location_id", "child_of", warehouse.lot_stock_id.id),
+            ]
+        )
+        return max(0, sum(quants.mapped("quantity")))
 
     def _get_product_square_inventory(self, product_sku):
         """Get current inventory from Square for a product"""
@@ -181,14 +191,7 @@ class SquareStockSync(models.Model):
         try:
             # Get current stock quantity in configured warehouse
             configured_warehouse = self._get_configured_warehouse()
-            stock_quant = self.env["stock.quant"].search(
-                [
-                    ("product_id", "=", product.id),
-                    ("location_id", "child_of", configured_warehouse.lot_stock_id.id),
-                ]
-            )
-
-            total_quantity = sum(quant.quantity for quant in stock_quant)
+            total_quantity = self._get_warehouse_stock(product, configured_warehouse)
 
             _logger.info(
                 f"Syncing {product.default_code} to Square: {total_quantity} units"
@@ -354,31 +357,37 @@ class SquareStockSync(models.Model):
             _logger.debug(f"Skipping non-done move: {stock_move.name}")
             return
 
-        # Determine which warehouse this move affects
-        affected_warehouse = self._get_affected_warehouse(stock_move)
-        if not affected_warehouse:
+        if not self._should_sync_product(stock_move.product_id):
+            return
+
+        locations = stock_move.location_id | stock_move.location_dest_id
+        warehouses = locations.warehouse_id
+        mappings = self._get_location_mappings().filtered(
+            lambda mapping: mapping.warehouse_id in warehouses
+        )
+        if not mappings:
             _logger.debug(f"No mapped warehouse affected by move: {stock_move.name}")
             return
 
-        # Find the corresponding location mapping
-        square_location_id = self._get_square_location_for_warehouse(affected_warehouse)
-        if not square_location_id:
-            _logger.debug(f"No Square location mapping found for warehouse {affected_warehouse.name}")
-            return
+        for mapping in mappings:
+            self._sync_mapped_stock_move(
+                stock_move, mapping.warehouse_id, mapping.square_location_id
+            )
 
+    def _sync_mapped_stock_move(
+        self, stock_move, affected_warehouse, square_location_id
+    ):
         _logger.info(f"Processing stock move for Square sync: {stock_move.name} (warehouse: {affected_warehouse.name}, location: {square_location_id})")
 
         # Get current stock quantity for this warehouse
-        stock_quant = self.env["stock.quant"].search(
-            [
-                ("product_id", "=", stock_move.product_id.id),
-                ("location_id", "child_of", affected_warehouse.lot_stock_id.id),
-            ]
+        total_quantity = self._get_warehouse_stock(
+            stock_move.product_id, affected_warehouse
         )
-        total_quantity = sum(quant.quantity for quant in stock_quant)
 
         # Sync affected product to the specific location
-        success = self.sync_product_stock_to_location(stock_move.product_id, affected_warehouse, square_location_id, total_quantity)
+        success = self.sync_product_stock_to_location(
+            stock_move.product_id, affected_warehouse, square_location_id, total_quantity
+        )
 
         # Log the stock move trigger event
         if success:
@@ -408,35 +417,6 @@ class SquareStockSync(models.Model):
             _logger.error(
                 f"Failed to sync {stock_move.product_id.default_code} to Square location {square_location_id}"
             )
-
-    def _get_affected_warehouse(self, stock_move):
-        """Determine which warehouse is affected by a stock move"""
-        # Check if the move involves any of our mapped warehouses
-        location_mappings = self._get_location_mappings()
-
-        for mapping in location_mappings:
-            warehouse_locations = (
-                mapping.warehouse_id.lot_stock_id | mapping.warehouse_id.view_location_id
-            )
-
-            # Check if source or destination location is in this warehouse
-            source_is_warehouse = stock_move.location_id in warehouse_locations
-            dest_is_warehouse = stock_move.location_dest_id in warehouse_locations
-
-            if source_is_warehouse or dest_is_warehouse:
-                return mapping.warehouse_id
-
-        return None
-
-    def _get_square_location_for_warehouse(self, warehouse):
-        """Get the Square location ID mapped to a specific warehouse"""
-        location_mappings = self._get_location_mappings()
-
-        for mapping in location_mappings:
-            if mapping.warehouse_id == warehouse:
-                return mapping.square_location_id
-
-        return None
 
     def _get_location_mappings(self):
         """Get all configured location mappings from Square config"""
@@ -541,13 +521,7 @@ class SquareStockSync(models.Model):
 
         for product in products:
             # Get current stock quantity for this warehouse
-            stock_quant = self.env["stock.quant"].search(
-                [
-                    ("product_id", "=", product.id),
-                    ("location_id", "child_of", warehouse.lot_stock_id.id),
-                ]
-            )
-            total_quantity = sum(quant.quantity for quant in stock_quant)
+            total_quantity = self._get_warehouse_stock(product, warehouse)
 
             if square_location_id:
                 # Sync to specific Square location
