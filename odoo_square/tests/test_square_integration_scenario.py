@@ -1139,6 +1139,42 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         ])
         self.assertEqual(len(completion_log), 1)
 
+    def test_full_refund_reuses_the_completed_odoo_return(self):
+        self._import_paid_square_sale()
+        delivery = self.created_sale_order.picking_ids
+        wizard = self.env["stock.return.picking"].with_user(
+            self.env.ref("base.user_admin")
+        ).create({"picking_id": delivery.id})
+        action = wizard.action_create_returns_all()
+        manual_return = self.env["stock.picking"].browse(action["res_id"])
+        manual_return.button_validate()
+        self.assertEqual(manual_return.state, "done")
+        self.assertEqual(delivery.return_ids, manual_return)
+
+        refund_id = "REFUND_ALREADY_RETURNED"
+        for event_id, status in (
+            ("evt_already_returned", "success"),
+            ("evt_already_returned_retry", "already_processed"),
+        ):
+            result = self._send_square_refund_event(
+                "refund.updated", event_id, refund_id, "COMPLETED", 360
+            )
+            self.assertEqual(result["status"], status, result)
+            refund = self._assert_refund_links(refund_id, 3.60)
+            self._assert_refund_payment(refund)
+            self.assertEqual(refund.return_picking_ids, manual_return)
+            self.assertEqual(delivery.return_ids, manual_return)
+            self._assert_completed_return(
+                refund, delivery, {self.product_p1: 1, self.product_p2: 2}
+            )
+            self.assertEqual(self.created_invoice.reversal_move_ids, refund.credit_note_id)
+            self.assertEqual(
+                self.created_invoice.reconciled_payment_ids.payment_type, "inbound"
+            )
+            for product in (self.product_p1, self.product_p2):
+                self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), 50)
+                self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
+
     def test_partial_refund_of_paid_sale(self):
         self._import_paid_square_sale()
         order = self.created_sale_order

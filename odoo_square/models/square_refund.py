@@ -738,20 +738,33 @@ class SquareRefund(models.Model):
         return 0
 
     def _create_full_return_picking(self):
-        """Return the delivered goods from the original delivery pickings."""
+        """Link completed Odoo returns and prepare any remaining goods."""
         delivery_pickings = self.sale_order_id.picking_ids.filtered(
             lambda picking: picking.picking_type_code == "outgoing" and picking.state == "done"
         )
-        bot_user = self._get_bot_user()
+        completed_returns = delivery_pickings.move_ids.returned_move_ids.filtered(
+            lambda move: move.state == "done"
+            and move.picking_id.return_id == move.origin_returned_move_id.picking_id
+            and move.picking_id.picking_type_code == "incoming"
+        ).picking_id.filtered(lambda picking: picking.state == "done")
+        square_bot = self.env.ref("odoo_square.user_square_bot", raise_if_not_found=False)
+        completed_returns = completed_returns.filtered(
+            lambda picking: picking.create_uid != square_bot
+        )
+        claimed_returns = self.search([
+            ("id", "!=", self.id),
+            ("return_picking_ids", "in", completed_returns.ids),
+        ]).return_picking_ids
+        self.return_picking_ids |= completed_returns - claimed_returns
+
+        wizard_model = self.env["stock.return.picking"].with_user(self._get_bot_user())
         for delivery in delivery_pickings:
-            return_wizard = (
-                self.env["stock.return.picking"]
-                .with_user(bot_user)
-                .with_context(active_id=delivery.id, active_model="stock.picking")
-                .create({})
-            )
-            action = return_wizard.action_create_returns_all()
-            self.return_picking_ids = [(4, action["res_id"])]
+            return_wizard = wizard_model.create({"picking_id": delivery.id})
+            for line in return_wizard.product_return_moves:
+                line.quantity = line.move_id._get_square_returnable_quantity()
+            if any(return_wizard.product_return_moves.mapped("quantity")):
+                action = return_wizard.action_create_returns()
+                self.return_picking_ids = [(4, action["res_id"])]
 
     def _create_credit_note(self, is_partial):
         """Prepare a draft reversal of the original posted invoice."""

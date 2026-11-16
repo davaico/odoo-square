@@ -35,6 +35,23 @@ class StockMove(models.Model):
 
         return result
 
+    def _get_square_returnable_quantity(self):
+        """Return the uncommitted quantity in this delivery move's unit."""
+        self.ensure_one()
+        if self.state != "done" or self.location_dest_usage == "inventory":
+            return 0.0
+
+        committed = sum(
+            returned.product_uom._compute_quantity(
+                returned.quantity if returned.state == "done" else returned.product_uom_qty,
+                self.product_uom,
+                round=False,
+            )
+            for returned in self.returned_move_ids
+            if returned.state != "cancel"
+        )
+        return max(self.product_uom.round(self.quantity - committed), 0.0)
+
     def _trigger_square_sync(self, move):
         """Trigger Square stock synchronization for a completed move"""
         try:
