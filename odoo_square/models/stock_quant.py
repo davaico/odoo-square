@@ -10,20 +10,17 @@ class StockQuant(models.Model):
 
     def write(self, vals):
         """Override write to trigger Square sync when quantity changes"""
-        # Store old quantities before update
-        old_quantities = {}
-        if "quantity" in vals:
-            for quant in self:
-                old_quantities[quant.id] = quant.quantity
+        if "quantity" not in vals or self.env.context.get("square_move_in_progress"):
+            return super().write(vals)
 
+        # Store old quantities before update
+        old_quantities = {quant.id: quant.quantity for quant in self}
         result = super().write(vals)
 
         # Check if quantity changed and trigger sync
-        if "quantity" in vals:
-            for quant in self:
-                old_qty = old_quantities.get(quant.id, 0)
-                if old_qty != quant.quantity:
-                    self._trigger_square_sync_for_quant(quant)
+        for quant in self:
+            if old_quantities[quant.id] != quant.quantity:
+                self._trigger_square_sync_for_quant(quant)
 
         return result
 
@@ -69,7 +66,7 @@ class StockQuant(models.Model):
                 )
 
             # Get current stock quantity for this product and warehouse
-            current_stock = quant._get_current_stock_for_warehouse(warehouse)
+            current_stock = stock_sync._get_warehouse_stock(quant.product_id, warehouse)
 
             # Sync to Square for the specific location
             stock_sync.sync_product_stock_for_location(
@@ -80,19 +77,3 @@ class StockQuant(models.Model):
             _logger.error(
                 f"Error triggering Square sync for quant {quant.id}: {str(e)}"
             )
-
-    def _get_current_stock_for_warehouse(self, warehouse):
-        """Get current stock quantity for this product in the warehouse"""
-        self.ensure_one()
-
-        # Sum all quants for this product in the warehouse's stock location
-        stock_location = warehouse.lot_stock_id
-        quants = self.env["stock.quant"].search(
-            [
-                ("product_id", "=", self.product_id.id),
-                ("location_id", "=", stock_location.id),
-            ]
-        )
-
-        total_quantity = sum(quant.quantity for quant in quants)
-        return max(0, int(total_quantity))  # Ensure non-negative integer
