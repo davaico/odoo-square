@@ -258,9 +258,19 @@ class SquareOrderProcessor(models.Model):
                 else:
                     self._sync_order_line_changes(sale_order, square_order_data)
 
-            elif square_order_state in ("CANCELED", "CANCELLED"):
+            elif (
+                isinstance(square_order_state, str)
+                and square_order_state.upper() in ("CANCELED", "CANCELLED")
+            ):
                 # Handle order cancellation (Square uses both spellings)
-                self._process_order_cancellation(sale_order, square_order_data)
+                if self._process_order_cancellation(
+                    sale_order, square_order_data
+                ) is False:
+                    result.update(
+                        status="error",
+                        message="Could not post all cancellation credit notes",
+                    )
+                    return result
 
             else:
                 _logger.info(
@@ -388,9 +398,6 @@ class SquareOrderProcessor(models.Model):
         for square_line in square_lines:
             square_line_id = square_line.get("uid")
             quantity = int(square_line.get("quantity", "1"))
-            price_data = square_line.get("total_money", {})
-            amount = round(float(price_data.get("amount", 0)) / 100.0, 2)
-
             if quantity <= 0:
                 _logger.info(
                     f"Skipping line {square_line.get('name', 'Unknown')} with non-positive "
@@ -401,10 +408,18 @@ class SquareOrderProcessor(models.Model):
             if square_line_id in odoo_lines:
                 # Update existing line
                 odoo_line = odoo_lines[square_line_id]
-                if odoo_line.product_uom_qty != quantity:
-                    odoo_line.write({"product_uom_qty": quantity})
+                previous_qty = odoo_line.product_uom_qty
+                if previous_qty != quantity:
+                    # Keep the imported price when Odoo recomputes the line totals.
+                    odoo_line.write(
+                        {
+                            "product_uom_qty": quantity,
+                            "price_unit": odoo_line.price_unit,
+                            "discount": odoo_line.discount,
+                        }
+                    )
                     updated_lines.append(
-                        f"{odoo_line.product_id.name}: {odoo_line.product_uom_qty} -> {quantity}"
+                        f"{odoo_line.product_id.name}: {previous_qty} -> {quantity}"
                     )
                 odoo_lines.pop(square_line_id)
             else:
@@ -450,10 +465,15 @@ class SquareOrderProcessor(models.Model):
         Handles different order states appropriately
         """
         square_order_id = square_order_data.get("order_id")
+        previous_state = sale_order.state
 
         _logger.info(
-            f"Processing cancellation for order {sale_order.name} (current state: {sale_order.state})"
+            f"Processing cancellation for order {sale_order.name} (current state: {previous_state})"
         )
+
+        if previous_state == "cancel":
+            _logger.info(f"Order {sale_order.name} is already cancelled")
+            return
 
         lines_to_deliver = sale_order.order_line.filtered(
             lambda l: l.product_id.type in ("product", "consu")
@@ -463,24 +483,39 @@ class SquareOrderProcessor(models.Model):
             for line in lines_to_deliver
         )
 
-        # Handle different order states
-        if sale_order.state == "cancel":
-            _logger.info(f"Order {sale_order.name} is already cancelled")
-            return
+        reason = f"Square Order Cancellation - {square_order_id}"
+        posted_invoices = sale_order.invoice_ids.filtered(
+            lambda invoice: invoice.move_type == "out_invoice"
+            and invoice.state == "posted"
+        )
+        reversed_invoices = posted_invoices.filtered(
+            lambda invoice: invoice.reversal_move_ids.filtered(
+                lambda move: move.move_type == "out_refund"
+                and move.state == "posted"
+                and reason in (move.ref or "")
+            )
+        )
 
-        elif sale_order.state == "done" or (
-            sale_order.state == "sale"
+        # Posting a credit note can change invoice_status even for a fully delivered order.
+        if reversed_invoices or previous_state == "done" or (
+            previous_state == "sale"
             and sale_order.invoice_status == "invoiced"
             and fully_delivered
         ):
+            if reversed_invoices and reversed_invoices == posted_invoices:
+                _logger.info(
+                    f"Order {sale_order.name} already has cancellation credit notes"
+                )
+                return
             _logger.warning(
-                f"Order {sale_order.name} is invoiced and fulfilled — processing refund/credit note"
+                f"Order {sale_order.name} is invoiced and fulfilled — processing cancellation credit notes"
             )
-            self._process_completed_order_cancellation(sale_order, square_order_data)
-            return
+            return self._process_completed_order_cancellation(
+                sale_order, square_order_data, posted_invoices - reversed_invoices, reason
+            )
 
         # For draft and open sale states (not fully delivered/invoiced), standard cancel
-        elif sale_order.state in ["draft", "sale"]:
+        elif previous_state in ("draft", "sale"):
             try:
                 # Get bot user for the cancellation
                 bot_user = self._get_square_bot_user()
@@ -499,7 +534,7 @@ class SquareOrderProcessor(models.Model):
                         <ul>
                             <li>ID Commande Square: <strong>{square_order_id}</strong></li>
                             <li>Commande Odoo: <strong>{sale_order.name}</strong></li>
-                            <li>État Précédent: {sale_order.state}</li>
+                            <li>État Précédent: {previous_state}</li>
                             <li>New State: Cancelled</li>
                             <li>Action: order cancelled dans Odoo via webhook Square</li>
                         </ul>
@@ -553,13 +588,17 @@ class SquareOrderProcessor(models.Model):
                 sale_order_id=sale_order.id,
             )
 
-    def _process_completed_order_cancellation(self, sale_order, square_order_data):
+    def _process_completed_order_cancellation(
+        self, sale_order, square_order_data, posted_invoices, reason
+    ):
         """
-        Process cancellation of a completed order by creating a credit note/refund
+        Post cancellation credit notes for the completed order's remaining invoices.
         """
         square_order_id = square_order_data.get("order_id")
 
-        _logger.info(f"Processing refund for completed order {sale_order.name}")
+        _logger.info(
+            f"Creating cancellation credit notes for completed order {sale_order.name}"
+        )
 
         try:
             # Get bot user
@@ -589,40 +628,30 @@ class SquareOrderProcessor(models.Model):
                 )
                 return
 
-            # Get posted invoices
-            posted_invoices = sale_order.invoice_ids.filtered(
-                lambda inv: inv.state == "posted"
-            )
-
             if not posted_invoices:
                 _logger.warning(f"No posted invoices found for order {sale_order.name}")
                 return
 
             # Create credit notes for posted invoices
+            success = True
             for invoice in posted_invoices:
                 try:
-                    # Create credit note using Odoo's standard method
-                    credit_note_wizard = (
-                        self.env["account.move.reversal"]
-                        .with_user(bot_user)
-                        .create(
-                            {
-                                "move_ids": [(6, 0, invoice.ids)],
-                                "journal_id": invoice.journal_id.id,
-                                "reason": f"Square Order Cancellation - {square_order_id}",
-                            }
+                    with self.env.cr.savepoint():
+                        credit_note_wizard = (
+                            self.env["account.move.reversal"]
+                            .with_user(bot_user)
+                            .create(
+                                {
+                                    "move_ids": [(6, 0, invoice.ids)],
+                                    "journal_id": invoice.journal_id.id,
+                                    "reason": reason,
+                                }
+                            )
                         )
-                    )
-
-                    # Generate the credit note
-                    credit_note_result = credit_note_wizard.reverse_moves()
-                    credit_note = self.env["account.move"].browse(
-                        credit_note_result["res_id"]
-                    )
-
-                    # Validate the credit note
-                    if credit_note.state == "draft":
-                        credit_note.with_user(bot_user).action_post()
+                        credit_note_wizard.reverse_moves()
+                        credit_note = credit_note_wizard.new_move_ids
+                        if credit_note.state == "draft":
+                            credit_note.action_post()
 
                     _logger.info(
                         f"Created credit note {credit_note.name} for invoice {invoice.name}"
@@ -649,6 +678,7 @@ class SquareOrderProcessor(models.Model):
                     )
 
                 except Exception as e:
+                    success = False
                     _logger.error(
                         f"Failed to create credit note for invoice {invoice.name}: {str(e)}"
                     )
@@ -670,6 +700,8 @@ class SquareOrderProcessor(models.Model):
                         square_order_id=square_order_id,
                         sale_order_id=sale_order.id,
                     )
+
+            return success
 
         except Exception as e:
             _logger.error(

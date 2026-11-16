@@ -274,7 +274,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         )
         return sum(quants.mapped("quantity"))
 
-    def _send_square_order_event(self, event_type, event_id, state):
+    def _send_square_order_event(self, event_type, event_id, state, **order_data):
         payload = {
             "type": event_type,
             "event_id": event_id,
@@ -284,6 +284,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                         "id": "ORDER_L1_001",
                         "location_id": "L1",
                         "state": state,
+                        **order_data,
                     }
                 }
             },
@@ -302,6 +303,155 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         )
         self.assertIn(result["status"], ("success", "updated"), result)
         self._assert_paid_square_sale()
+
+    def test_open_and_draft_square_order_updates_and_replay(self):
+        initial_order = self._mock_get_order("ORDER_L1_001")
+        initial_order.update(state="OPEN", tenders=[])
+        with patch.object(SquareApiClient, "get_order", return_value=initial_order):
+            result = self._send_square_order_event(
+                "order.created", "evt_open_order_created", "OPEN"
+            )
+        self.assertEqual(result["status"], "success", result)
+
+        order_domain = [("square_order_id", "=", "ORDER_L1_001")]
+        order = self.env["sale.order"].search(order_domain)
+        self.assertEqual(len(order), 1)
+        self.assertEqual(order.partner_id, self.customer)
+        self.assertEqual(order.warehouse_id, self.warehouse_w1)
+        self.assertEqual(order.amount_total, 3.60)
+        lines = order.order_line
+        self.assertEqual(lines.mapped("square_line_id"), ["line_1", "line_2"])
+        order_log_domain = [("sale_order_id", "=", order.id)]
+        creation_logs = self.env["square.integration.log"].search(
+            order_log_domain + [("event_type", "=", "order_created")]
+        )
+        self.assertTrue(creation_logs)
+
+        for state, event_id, quantity, line_total, order_total in (
+            ("OPEN", "evt_open_order_updated", 3, 3.60, 6.00),
+            ("DRAFT", "evt_draft_order_updated", 4, 4.80, 7.20),
+            ("DRAFT", "evt_draft_order_updated_again", 5, 6.00, 8.40),
+        ):
+            with self.subTest(event_id=event_id):
+                line_items = [
+                    dict(
+                        initial_order["line_items"][0],
+                        quantity=str(quantity),
+                        total_money={
+                            "amount": round(line_total * 100),
+                            "currency": "EUR",
+                        },
+                        total_tax_money={"amount": 20 * quantity, "currency": "EUR"},
+                    ),
+                    initial_order["line_items"][1],
+                ]
+                result = self._send_square_order_event(
+                    "order.updated", event_id, state, line_items=line_items
+                )
+                self.assertEqual(result["status"], "updated", result)
+                result = self._send_square_order_event(
+                    "order.updated", event_id, state, line_items=line_items
+                )
+                self.assertEqual(result["status"], "already_processed", result)
+
+                self.assertEqual(self.env["sale.order"].search(order_domain), order)
+                self.assertEqual(order.state, "draft")
+                self.assertEqual(order.order_line, lines)
+                self.assertEqual(lines.mapped("product_uom_qty"), [quantity, 2])
+                self.assertAlmostEqual(lines[0].price_total, line_total, places=2)
+                self.assertAlmostEqual(lines[1].price_total, 2.40, places=2)
+                self.assertAlmostEqual(order.amount_total, order_total, places=2)
+
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(
+            self.env["account.payment"].search_count(
+                [("partner_id", "=", self.customer.id)]
+            )
+        )
+        self.assertFalse(order.picking_ids)
+        for product in (self.product_p1, self.product_p2):
+            for warehouse in (self.warehouse_w1, self.warehouse_w2):
+                self.assertEqual(self._get_stock_quantity(product, warehouse), 50)
+        order_logs = self.env["square.integration.log"].search(order_log_domain)
+        self.assertTrue(creation_logs <= order_logs)
+        self.assertEqual(
+            len(order_logs.filtered(lambda entry: entry.event_type == "order_updated")),
+            3,
+        )
+
+    def test_paid_and_delivered_square_order_cancellation_and_replay(self):
+        self._import_paid_square_sale()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        payment = invoice.reconciled_payment_ids
+        delivery = order.picking_ids
+        order_lines = order.order_line
+        log_domain = [("sale_order_id", "=", order.id)]
+        original_logs = self.env["square.integration.log"].search(log_domain)
+        self.assertTrue(original_logs)
+
+        result = self._send_square_order_event(
+            "order.updated", "evt_paid_order_canceled", "CANCELED"
+        )
+        self.assertEqual(result["status"], "updated", result)
+        reversal = invoice.reversal_move_ids
+        self.assertEqual(len(reversal), 1)
+
+        for event_id, state in (
+            ("evt_paid_order_canceled", "CANCELED"),
+            ("evt_paid_order_cancelled", "CANCELLED"),
+        ):
+            result = self._send_square_order_event("order.updated", event_id, state)
+            self.assertIn(result["status"], ("already_processed", "updated"), result)
+
+        self.assertEqual(
+            self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")]),
+            order,
+        )
+        self.assertEqual(order.state, "sale")
+        self.assertEqual(order.order_line, order_lines)
+        self.assertEqual(order.invoice_ids, invoice | reversal)
+        self.assertEqual(invoice.reversal_move_ids, reversal)
+        self.assertEqual(invoice.state, "posted")
+        self.assertEqual(invoice.payment_state, "paid")
+        self.assertAlmostEqual(invoice.amount_total, 3.60, places=2)
+        self.assertAlmostEqual(invoice.amount_residual, 0.0, places=2)
+        self.assertEqual(invoice.reconciled_payment_ids, payment)
+
+        self.assertEqual(reversal.move_type, "out_refund")
+        self.assertEqual(reversal.state, "posted")
+        self.assertEqual(reversal.reversed_entry_id, invoice)
+        self.assertEqual(reversal.currency_id, invoice.currency_id)
+        self.assertAlmostEqual(reversal.amount_total, 3.60, places=2)
+        self.assertAlmostEqual(reversal.amount_residual, 3.60, places=2)
+        self.assertEqual(
+            self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+            payment,
+        )
+        self.assertEqual(payment.payment_type, "inbound")
+        self.assertEqual(payment.move_id.state, "posted")
+        self.assertAlmostEqual(payment.amount, 3.60, places=2)
+        self.assertFalse(order.square_refund_ids)
+
+        self.assertEqual(order.picking_ids, delivery)
+        self.assertEqual(delivery.state, "done")
+        self.assertEqual(delivery.picking_type_code, "outgoing")
+        self.assertEqual(
+            {move.product_id: move.quantity for move in delivery.move_ids},
+            {self.product_p1: 1, self.product_p2: 2},
+        )
+        for product, quantity in ((self.product_p1, 49), (self.product_p2, 48)):
+            self.assertEqual(
+                self._get_stock_quantity(product, self.warehouse_w1), quantity
+            )
+            self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
+
+        logs = self.env["square.integration.log"].search(log_domain)
+        self.assertTrue(original_logs <= logs)
+        cancellation_logs = logs - original_logs
+        self.assertEqual(len(cancellation_logs), 1)
+        self.assertEqual(cancellation_logs.event_type, "order_updated")
+        self.assertIn(reversal.name, cancellation_logs.description)
 
     def _assert_square_sale_order(self, state):
         order = self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")])

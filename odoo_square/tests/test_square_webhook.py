@@ -1105,57 +1105,91 @@ class TestSquareWebhook(SquareHttpCase):
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_order_cancellation_case_insensitive(self):
-        """Test that order cancellation works with both CANCELED and CANCELLED"""
-
-        # Create a sale order in draft state
-        sale_order = self.env["sale.order"].create(
+        warehouse = self.env["stock.warehouse"].search(
+            [("company_id", "=", self.env.company.id)], limit=1
+        )
+        quant = self.env["stock.quant"].create(
             {
-                "partner_id": self.partner.id,
-                "square_order_id": "test_cancel_order_002",
-                "state": "draft",
+                "product_id": self.product.id,
+                "location_id": warehouse.lot_stock_id.id,
+                "quantity": 10.0,
             }
         )
-
-        # Test with CANCELED (one L - as sent by Square webhook)
-        webhook_data = {
-            "type": "order.updated",
-            "event_id": "test_cancel_event_001",
-            "data": {
-                "object": {
-                    "order_updated": {
-                        "id": "test_cancel_order_002",
-                        "state": "CANCELED",  # One L
-                        "version": 2,
+        for state in ("canceled", "CaNcElLeD"):
+            with self.subTest(state=state):
+                square_order_id = f"draft_order_{state}"
+                order = self.env["sale.order"].create(
+                    {
+                        "partner_id": self.partner.id,
+                        "square_order_id": square_order_id,
+                        "warehouse_id": warehouse.id,
+                        "order_line": [
+                            (
+                                0,
+                                0,
+                                {
+                                    "product_id": self.product.id,
+                                    "product_uom_qty": 2,
+                                    "price_unit": 25.0,
+                                    "tax_ids": [(5, 0, 0)],
+                                },
+                            )
+                        ],
                     }
+                )
+                line = order.order_line
+                webhook_data = {
+                    "type": "order.updated",
+                    "event_id": f"draft_cancel_event_{state}",
+                    "data": {
+                        "object": {
+                            "order_updated": {
+                                "id": square_order_id,
+                                "state": state,
+                                "version": 2,
+                            }
+                        }
+                    },
                 }
-            },
-        }
+                for expected_status in ("updated", "already_processed"):
+                    response = self.url_open(
+                        "/square/webhook",
+                        data=json.dumps(webhook_data),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["status"], expected_status)
 
-        response = self.url_open(
-            "/square/webhook",
-            data=json.dumps(webhook_data),
-            headers={"Content-Type": "application/json"},
-        )
+                self.assertEqual(
+                    self.env["sale.order"].search(
+                        [("square_order_id", "=", square_order_id)]
+                    ),
+                    order,
+                )
+                self.assertEqual(order.state, "cancel")
+                self.assertEqual(order.order_line, line)
+                self.assertEqual(line.product_uom_qty, 2)
+                self.assertAlmostEqual(order.amount_total, 50.0, places=2)
+                self.assertFalse(order.invoice_ids)
+                self.assertFalse(
+                    self.env["account.payment"].search_count(
+                        [("partner_id", "=", self.partner.id)]
+                    )
+                )
+                self.assertFalse(order.picking_ids)
+                self.assertEqual(quant.quantity, 10.0)
+                self.assertEqual(quant.reserved_quantity, 0.0)
 
-        self.assertEqual(response.status_code, 200)
-        response_data = response.json()
-        self.assertEqual(response_data["status"], "updated")
-
-        # Verify order was cancelled
-        sale_order.invalidate_recordset()
-        self.assertEqual(sale_order.state, "cancel")
-
-        # Log entry should exist
-        log_entry = self.env["square.integration.log"].search(
-            [
-                ("square_order_id", "=", "test_cancel_order_002"),
-                ("event_type", "=", "order_updated"),
-                ("status", "=", "warning"),
-            ],
-            limit=1,
-        )
-        self.assertTrue(log_entry)
-        self.assertIn("cancelled", log_entry.title)
+                logs = self.env["square.integration.log"].search(
+                    [
+                        ("square_order_id", "=", square_order_id),
+                        ("sale_order_id", "=", order.id),
+                        ("event_type", "=", "order_updated"),
+                        ("status", "=", "warning"),
+                    ]
+                )
+                self.assertEqual(len(logs), 1)
+                self.assertIn("cancelled", logs.title)
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_order_cancellation_completed_order(self):
