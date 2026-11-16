@@ -967,6 +967,17 @@ class TestSquareWebhook(SquareHttpCase):
         self.assertEqual(sale_order.state, "draft")
         self.assertEqual(sale_order.order_line.product_uom_qty, 5)
 
+        self._send_order_event(
+            "order.updated", "evt_partial_order_notice",
+            {**order_notice, "version": 5, "returns": []}, "updated",
+        )
+        self.assertEqual(sale_order.order_line.product_uom_qty, 5)
+        self._send_order_event(
+            "order.updated", "evt_complete_order_snapshot",
+            {**snapshot(6), "version": 5}, "updated",
+        )
+        self.assertEqual(sale_order.order_line.product_uom_qty, 6)
+
     def test_order_cancellation_processing(self):
         """Test order cancellation processing"""
 

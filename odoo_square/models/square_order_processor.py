@@ -313,7 +313,7 @@ class SquareOrderProcessor(models.Model):
                         f"Order {square_order_id} contains return data in OPEN/DRAFT state, "
                         f"skipping line sync (will be handled by refund/exchange flow)"
                     )
-                else:
+                elif "line_items" in square_order_data:
                     # Serialize version checks and line writes on the same order.
                     self.env.cr.execute(
                         "SELECT id FROM sale_order WHERE id = %s FOR UPDATE", (sale_order.id,)
