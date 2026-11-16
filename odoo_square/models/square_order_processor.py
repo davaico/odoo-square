@@ -1281,14 +1281,10 @@ class SquareOrderProcessor(models.Model):
                 continue
 
             sale_uom = move.sale_line_id.product_uom_id
-            requested = sale_uom._compute_quantity(
-                pending[catalog_id], line.uom_id, round=False
+            line.quantity, remaining = move._allocate_square_return_quantity(
+                pending[catalog_id], sale_uom, line.uom_id
             )
-            line.quantity = min(
-                move._get_square_returnable_quantity(), line.uom_id.round(requested)
-            )
-            allocated = line.uom_id._compute_quantity(line.quantity, sale_uom, round=False)
-            pending[catalog_id] = max(sale_uom.round(pending[catalog_id] - allocated), 0.0)
+            pending[catalog_id] = max(sale_uom.round(remaining), 0.0)
 
         if not any(wizard.product_return_moves.mapped("quantity")):
             return
