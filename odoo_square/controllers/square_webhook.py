@@ -15,7 +15,12 @@ _logger = logging.getLogger(__name__)
 class SquareWebhookController(http.Controller):
 
     @http.route(
-        "/square/webhook", type="http", auth="none", methods=["POST"], csrf=False
+        "/square/webhook",
+        type="http",
+        auth="none",
+        methods=["POST"],
+        csrf=False,
+        readonly=False,
     )
     def square_webhook(self, **kwargs):
         """

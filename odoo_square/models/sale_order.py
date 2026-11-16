@@ -26,13 +26,10 @@ class SaleOrder(models.Model):
         copy=False,
     )
 
-    _sql_constraints = [
-        (
-            "square_order_id_unique",
-            "UNIQUE(square_order_id)",
-            "Square Order ID must be unique. This order may already exist in the system.",
-        )
-    ]
+    _square_order_id_unique = models.Constraint(
+        "UNIQUE(square_order_id)",
+        "Square Order ID must be unique. This order may already exist in the system.",
+    )
 
     square_order_data = fields.Text(
         string="Square Order Data",
@@ -928,7 +925,7 @@ class SaleOrder(models.Model):
                 "name": "Vente Square",
                 "default_code": "VENTE_SQUARE",
                 "type": "service",  # Service product
-                "categ_id": self.env.ref("product.product_category_all").id,
+                "categ_id": self.env.ref("product.product_category_services").id,
                 "list_price": 0.0,
                 "sale_ok": True,
                 "purchase_ok": False,

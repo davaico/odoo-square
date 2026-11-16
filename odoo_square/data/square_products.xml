@@ -9,6 +9,6 @@
         <field name="list_price">0.0</field>
         <field name="taxes_id" eval="[(5, 0, 0)]"/>
         <field name="supplier_taxes_id" eval="[(5, 0, 0)]"/>
-        <field name="categ_id" ref="product.product_category_all"/>
+        <field name="categ_id" ref="product.product_category_services"/>
     </record>
 </odoo>

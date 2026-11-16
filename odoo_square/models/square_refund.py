@@ -81,13 +81,10 @@ class SquareRefund(models.Model):
     square_data = fields.Json(string="Square Data", help="Raw Square webhook data")
     webhook_event_id = fields.Char(string="Webhook Event ID")
 
-    _sql_constraints = [
-        (
-            "square_refund_id_unique",
-            "UNIQUE(square_refund_id)",
-            "Square Refund ID must be unique.",
-        ),
-    ]
+    _square_refund_id_unique = models.Constraint(
+        "UNIQUE(square_refund_id)",
+        "Square Refund ID must be unique.",
+    )
 
     @api.model
     def _track_visibility(self):

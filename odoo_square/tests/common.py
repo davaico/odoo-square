@@ -10,15 +10,7 @@ class SquareHttpCase(HttpCase):
     Webhook tests must see DB state after ``url_open``.
     """
 
-    def url_open(self, url, data=None, files=None, timeout=12, headers=None, allow_redirects=True, head=False):
-        res = super().url_open(
-            url,
-            data=data,
-            files=files,
-            timeout=timeout,
-            headers=headers,
-            allow_redirects=allow_redirects,
-            head=head,
-        )
+    def url_open(self, url, *args, **kwargs):
+        res = super().url_open(url, *args, **kwargs)
         self.env.invalidate_all()
         return res

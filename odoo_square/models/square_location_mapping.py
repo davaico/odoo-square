@@ -3,6 +3,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import logging
 from odoo import models, fields, api
+from odoo.exceptions import ValidationError
 
 _logger = logging.getLogger(__name__)
 
@@ -54,22 +55,15 @@ class SquareLocationMapping(models.Model):
 
     active = fields.Boolean(default=True)
 
-    _sql_constraints = [
-        (
-            "unique_location_per_config",
-            "unique(config_id, square_location_id)",
-            "Each Square location can only be mapped once per configuration",
-        ),
-    ]
+    _unique_location_per_config = models.Constraint(
+        "UNIQUE(config_id, square_location_id)",
+        "Each Square location can only be mapped once per configuration",
+    )
 
     @api.model_create_multi
     def create(self, vals_list):
         """Override create to validate warehouse selection"""
         records = super().create(vals_list)
-
-        # Handle single record case
-        if not isinstance(records, list):
-            records = [records]
 
         # Validate each record
         for record in records:
@@ -83,7 +77,7 @@ class SquareLocationMapping(models.Model):
             )
 
             if existing_mapping:
-                raise models.ValidationError(
+                raise ValidationError(
                     f"Warehouse '{record.warehouse_id.name}' is already mapped to another Square location in this configuration."
                 )
 
@@ -92,7 +86,7 @@ class SquareLocationMapping(models.Model):
                 f"Odoo warehouse '{record.warehouse_id.name}'"
             )
 
-        return records[0] if len(records) == 1 else records
+        return records
 
     def write(self, vals):
         """Override write to validate warehouse selection"""
@@ -109,19 +103,16 @@ class SquareLocationMapping(models.Model):
             )
 
             if existing_mapping:
-                raise models.ValidationError(
+                raise ValidationError(
                     f"Warehouse '{self.warehouse_id.name}' is already mapped to another Square location in this configuration."
                 )
 
         return result
 
-    def name_get(self):
-        """Custom name_get to show meaningful names"""
-        result = []
+    @api.depends("square_location_name", "warehouse_id.name")
+    def _compute_display_name(self):
         for record in self:
-            name = f"{record.square_location_name} → {record.warehouse_id.name}"
-            result.append((record.id, name))
-        return result
+            record.display_name = f"{record.square_location_name} → {record.warehouse_id.name}"
 
     @api.depends("config_id")
     def _compute_available_square_locations(self):

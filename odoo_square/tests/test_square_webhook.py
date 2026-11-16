@@ -31,7 +31,8 @@ class TestSquareWebhook(SquareHttpCase):
                 "name": "Test Product",
                 "default_code": "TEST_SKU_001",
                 "list_price": 25.00,
-                "type": "product",
+                "type": "consu",
+                "is_storable": True,
             }
         )
 
@@ -339,7 +340,7 @@ class TestSquareWebhook(SquareHttpCase):
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_signature_required_when_key_configured(self):
-        """Reject webhook requests without a Square signature when a key is configured."""
+        """Reject missing and invalid Square signatures when a key is configured."""
 
         self.square_config.square_webhook_signature_key = "test_signature_key"
         webhook_data = {
@@ -355,16 +356,24 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
-            "/square/webhook",
-            data=json.dumps(webhook_data),
-            headers={"Content-Type": "application/json"},
-        )
+        for signature in (None, "invalid_signature"):
+            with self.subTest(signature=signature):
+                headers = {"Content-Type": "application/json"}
+                if signature is not None:
+                    headers["x-square-hmacsha256-signature"] = signature
+                response = self.url_open(
+                    "/square/webhook", data=json.dumps(webhook_data), headers=headers
+                )
 
-        self.assertEqual(response.status_code, 403)
-        response_data = response.json()
-        self.assertEqual(response_data["status"], "error")
-        self.assertEqual(response_data["message"], "Invalid signature")
+                self.assertEqual(response.status_code, 403)
+                self.assertEqual(
+                    response.json(), {"status": "error", "message": "Invalid signature"}
+                )
+                self.assertFalse(
+                    self.env["sale.order"].search_count(
+                        [("square_order_id", "=", "test_unsigned_order")]
+                    )
+                )
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_malformed_json(self):
