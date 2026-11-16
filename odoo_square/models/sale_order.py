@@ -92,8 +92,17 @@ class SaleOrder(models.Model):
             total_refunded = sum(completed_refunds.mapped("refund_amount"))
             order.total_refunded_amount = total_refunded
 
+    def _square_refund_base_amount(self):
+        self.ensure_one()
+        invoices = self.invoice_ids.filtered(
+            lambda invoice: invoice.move_type == "out_invoice" and invoice.state == "posted"
+        )
+        # Return adjustment lines reduce the order total after each refund.
+        return sum(invoices.mapped("amount_total")) if invoices else self.amount_total
+
     @api.depends(
-        "square_refund_ids.refund_amount", "square_refund_ids.status", "amount_total"
+        "square_refund_ids.refund_amount", "square_refund_ids.status", "amount_total",
+        "invoice_ids.amount_total", "invoice_ids.state", "invoice_ids.move_type",
     )
     def _compute_refund_status(self):
         """Compute refund status"""
@@ -109,7 +118,9 @@ class SaleOrder(models.Model):
             # Determine refund status
             if total_refunded == 0:
                 order.refund_status = "not_refunded"
-            elif total_refunded >= order.amount_total:
+            elif order.currency_id.compare_amounts(
+                total_refunded, order._square_refund_base_amount()
+            ) >= 0:
                 order.refund_status = "fully_refunded"
             else:
                 order.refund_status = "partially_refunded"
