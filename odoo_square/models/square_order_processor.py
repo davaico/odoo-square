@@ -73,6 +73,218 @@ class SquareOrderProcessor(models.Model):
 
         return None
 
+    def _process_order_event(self, order_data, event_type, event_id=None):
+        """Process Square order with event-level deduplication"""
+
+        if order_data:
+            order_data = dict(order_data)
+            if order_data.get("id") and not order_data.get("order_id"):
+                order_data["order_id"] = order_data["id"]
+
+        # 1. Extract event and order IDs
+        # Event ID comes from the webhook root level, passed as parameter
+        order_id = order_data.get("order_id") if order_data else None
+
+        # 2. Deduplication check based on order_id + state combination
+        order_state = order_data.get("state")
+
+        # An editable order can have several distinct updates in the same state.
+        if event_type != "updated" or order_state not in ("OPEN", "DRAFT"):
+            existing_log = (
+                self.env["square.integration.log"]
+                .sudo()
+                .search(
+                    [
+                        ("square_order_id", "=", order_id),
+                        ("status", "=", "success"),
+                        ("description", "ilike", f"state: {order_state}"),
+                    ],
+                    limit=1,
+                )
+            )
+
+            if existing_log:
+                _logger.info(
+                    f"Order {order_id} with state {order_state} already processed successfully, skipping event {event_id}"
+                )
+                return {
+                    "status": "already_processed",
+                    "order_id": order_id,
+                    "state": order_state,
+                }
+
+        # Check event identity for all states when an event ID is available.
+        if event_id:
+            existing_event_log = (
+                self.env["square.integration.log"]
+                .sudo()
+                .search(
+                    [("webhook_event_id", "=", event_id), ("status", "=", "success")],
+                    limit=1,
+                )
+            )
+
+            if existing_event_log:
+                _logger.info(
+                    f"Event {event_id} already processed successfully, skipping"
+                )
+                return {"status": "already_processed", "event_id": event_id}
+
+        # 3. Process the order based on event type with transaction isolation
+        bot_user = None
+        try:
+            # Get bot user in separate transaction
+            with self.env.cr.savepoint():
+                try:
+                    bot_user = self.env.ref("odoo_square.user_square_bot")
+                except ValueError:
+                    bot_user = self.env.ref("base.user_admin")
+
+            # Main processing in separate transaction
+            try:
+                with self.env.cr.savepoint():
+                    square_processor = (
+                        self.sudo().with_user(bot_user)
+                    )
+
+                    # Handle the order based on event type
+                    if event_type == "created":
+                        result = square_processor.process_square_order(order_data)
+
+                        # After successfully creating order, process any pending queued events
+                        if result.get("status") == "success":
+                            try:
+                                self.env[
+                                    "square.webhook.queue"
+                                ].sudo().process_pending_for_order(order_id)
+                            except Exception as queue_error:
+                                _logger.warning(
+                                    f"Error processing queued events after order creation: {str(queue_error)}"
+                                )
+
+                    elif event_type == "updated":
+                        # For updates, we need to find the existing order first
+                        existing_order = (
+                            self.env["sale.order"]
+                            .sudo()
+                            .search([("square_order_id", "=", order_id)], limit=1)
+                        )
+                        if existing_order:
+                            result = square_processor.process_square_order_update(
+                                order_data, existing_order
+                            )
+                        elif order_state == "COMPLETED":
+                            # Square may send order.updated(COMPLETED) before order.created in tests
+                            # or without a prior Odoo record — create + complete from payload.
+                            result = square_processor.process_square_order(order_data)
+                        else:
+                            # Order doesn't exist yet - queue this update event for retry
+                            _logger.info(
+                                f"Order {order_id} not found for update, queueing event {event_id} for retry"
+                            )
+
+                            # Queue the event for later processing
+                            try:
+                                # Build the full event data structure for queuing
+                                self.env["square.webhook.queue"].sudo().queue_event(
+                                    webhook_event_id=event_id,
+                                    event_type="order.updated",
+                                    order_data=order_data,
+                                    square_order_id=order_id,
+                                )
+
+                                _logger.info(
+                                    f"Event {event_id} queued for retry - will process after order {order_id} is created"
+                                )
+
+                                result = {
+                                    "status": "queued",
+                                    "order_id": order_id,
+                                    "state": order_state,
+                                    "message": "Order not found - event queued for retry",
+                                }
+                            except Exception as queue_error:
+                                _logger.error(
+                                    f"Failed to queue event {event_id}: {str(queue_error)}"
+                                )
+                                result = {
+                                    "status": "error",
+                                    "order_id": order_id,
+                                    "message": f"Order not found and failed to queue: {str(queue_error)}",
+                                }
+                    else:
+                        result = {
+                            "status": "error",
+                            "message": f"Unknown event type: {event_type}",
+                        }
+            except Exception as e:
+                # Handle transaction aborted errors gracefully
+                error_str = str(e)
+                if (
+                    "current transaction is aborted" in error_str
+                    or "InFailedSqlTransaction" in error_str
+                ):
+                    _logger.warning(
+                        f"Transaction aborted during order processing: {error_str}"
+                    )
+                    result = {
+                        "status": "error",
+                        "order_id": order_id,
+                        "message": "Database transaction error - order may be partially processed",
+                    }
+                else:
+                    raise
+
+            # Success logging in separate transaction
+            if event_id and result.get("status") in ["success", "updated"]:
+                try:
+                    with self.env.cr.savepoint():
+                        self.env["square.integration.log"].sudo().with_user(
+                            bot_user
+                        ).create(
+                            {
+                                "webhook_event_id": event_id,
+                                "square_order_id": order_id,
+                                "status": "success",
+                                "event_type": (
+                                    "order_created"
+                                    if event_type == "created"
+                                    else "order_updated"
+                                ),
+                                "title": f"Order {order_id} processed successfully (state: {order_state})",
+                                "description": f"Webhook event {event_id} processed successfully for order {order_id} with state: {order_state}",
+                            }
+                        )
+                except Exception as log_error:
+                    _logger.warning(
+                        f"Could not log successful order processing: {str(log_error)}"
+                    )
+
+            return result
+        except Exception as e:
+            # Simple error logging - just log to Python logger, don't try DB logging in failed transaction
+            _logger.error(
+                f"Square webhook processing failed for event {event_id}: {str(e)}",
+                exc_info=True,
+            )
+
+            # Check if this is a transaction aborted error
+            error_str = str(e)
+            if (
+                "current transaction is aborted" in error_str
+                or "InFailedSqlTransaction" in error_str
+            ):
+                _logger.warning(
+                    f"Transaction was aborted, this may be due to a previous database error"
+                )
+                # Don't raise the exception for transaction aborted errors
+                return {
+                    "status": "error",
+                    "message": "Database transaction error occurred",
+                }
+            else:
+                raise
+
     def process_square_order(self, square_order_data):
         """
         Main entry point for processing Square order data from webhooks
@@ -246,7 +458,14 @@ class SquareOrderProcessor(models.Model):
                 # Process completion
                 self._process_order_completion(sale_order, square_order_data)
 
-            elif square_order_state in ["OPEN", "DRAFT"]:
+            elif square_order_state in ("OPEN", "DRAFT"):
+                if sale_order.state not in ("draft", "sent"):
+                    _logger.info(
+                        "Ignoring Square %s update for order %s in Odoo state %s",
+                        square_order_state, square_order_id, sale_order.state,
+                    )
+                    return result
+
                 # Skip line sync when the payload carries return/exchange data;
                 # these must go through the dedicated refund/exchange flows only.
                 returns = square_order_data.get("returns") or square_order_data.get("return_line_items")

@@ -359,6 +359,56 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             3,
         )
 
+    def test_delayed_order_updates_leave_the_paid_sale_unchanged(self):
+        initial_order = self._mock_get_order("ORDER_L1_001")
+        initial_order["state"] = "OPEN"
+        with patch.object(SquareApiClient, "get_order", return_value=initial_order):
+            result = self._send_square_order_event(
+                "order.created", "evt_open_before_payment", "OPEN"
+            )
+        self.assertEqual(result["status"], "success", result)
+        self._import_paid_square_sale()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        payment = invoice.reconciled_payment_ids
+        pickings = order.picking_ids
+        moves = pickings.move_ids
+
+        for state in ("OPEN", "DRAFT"):
+            line_items = [
+                dict(
+                    initial_order["line_items"][0],
+                    quantity="3",
+                    total_money={"amount": 360, "currency": "EUR"},
+                    total_tax_money={"amount": 60, "currency": "EUR"},
+                ),
+                initial_order["line_items"][1],
+            ]
+            event_id = f"evt_delayed_{state.lower()}"
+            result = self._send_square_order_event(
+                "order.updated", event_id, state, line_items=line_items
+            )
+            self.assertEqual(result["status"], "updated", result)
+            replay = self._send_square_order_event(
+                "order.updated", event_id, state, line_items=line_items
+            )
+            self.assertEqual(replay["status"], "already_processed", replay)
+            self.assertEqual(order.state, "sale")
+            self.assertEqual(order.order_line.mapped("product_uom_qty"), [1, 2])
+            self.assertAlmostEqual(order.amount_total, 3.60, places=2)
+            self.assertEqual(order.invoice_ids, invoice)
+            self.assertEqual(invoice.state, "posted")
+            self.assertEqual(invoice.payment_state, "paid")
+            self.assertEqual(invoice.amount_residual, 0)
+            self.assertEqual(
+                self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+                payment,
+            )
+            self.assertEqual(order.picking_ids, pickings)
+            self.assertEqual(pickings.move_ids, moves)
+            self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+            self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
+
     def test_paid_and_delivered_square_order_cancellation_and_replay(self):
         self._import_paid_square_sale()
         order = self.created_sale_order
