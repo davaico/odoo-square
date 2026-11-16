@@ -11,10 +11,10 @@ Checkout, payment collection, and refund initiation happen in Square. The addon 
 ## Features
 
 - Secure Square webhook endpoint at `/square/webhook` with HMAC-SHA256 validation when a webhook signature key is configured.
-- Order ingestion for `order.created` and `order.updated` events, including customer matching and sale order creation.
-- Refund and exchange handling with invoices, credit notes, stock returns, and preserved order history.
+- Square order import and supported updates and cancellations. Completed sales post invoices, record payments collected by Square, and deduct tracked stock from the mapped warehouse.
+- Full and partial EUR refunds with credit notes, outbound payment records, and stock returns where applicable. Supported exchanges process returned and replacement items and record any price difference.
 - Square location to Odoo warehouse mapping for multi-location inventory workflows.
-- Inventory synchronization hooks for Odoo stock movements and manual quantity changes.
+- Outbound updates of on-hand stock counts for matching SKUs after supported Odoo stock movements and applied inventory adjustments in mapped warehouses.
 - Manual resync wizard for finding and replaying missing Square orders.
 - Integration log models and views for monitoring webhook, order, refund, exchange, and stock sync activity.
 - Docker Compose development and CI test setup.
@@ -64,13 +64,15 @@ For a standalone Odoo 19 Community setup, put the `odoo_square` folder on the Od
 
 ## Square Configuration
 
-Set up the company's chart of accounts and enable EUR for the integration. In Odoo, open **Square > Configuration** and create the Square configuration.
+Set up the company's chart of accounts and configure EUR for Square transactions. In Odoo, open **Square > Configuration** and create the Square configuration.
 
 - Enter the **Square Application ID** and **Square Access Token**, and select **Sandbox** or **Production** to match the credentials.
-- Select the **Payment Journal** that records Square payments and refunds in Odoo.
+- Select the company's **Payment Journal** for incoming and outgoing Square payment records. A bank journal can record both sales and refunds.
 - Add a **Square Location Mapping** with the Square location ID, location name, and corresponding Odoo warehouse for each location.
 - Optionally select a sales team for each mapping and a **Default Sales Team**.
 - Save the configuration and use **Test Connection** to verify the Square credentials.
+
+For products that should affect stock, enable **Track Inventory** in Odoo and match the Odoo **Internal Reference** to the Square SKU.
 
 In the Square Developer Dashboard, create a webhook subscription that points to:
 
@@ -80,13 +82,11 @@ https://your-odoo-domain.example/square/webhook
 
 Copy the subscription's signature key into **Webhook Signature Key** in the Odoo configuration. Subscribe to these event types.
 
-- `order.created`
-- `order.updated`
-- `payment.updated`
-- `refund.created`
-- `refund.updated`
+- `order.created` and `order.updated` for order import and supported status and line changes.
+- `payment.updated` for completed payments tied to supported exchanges.
+- `refund.created` and `refund.updated` for refund creation and status changes.
 
-For production deployments, run Odoo behind HTTPS and keep `proxy_mode = True` in `config/odoo.conf` when a reverse proxy terminates TLS.
+Use a publicly reachable HTTPS URL for the webhook. When a reverse proxy terminates TLS, keep `proxy_mode = True` in `config/odoo.conf` and forward the public hostname so Odoo can verify the signature against the subscription URL.
 
 ## Development
 
@@ -126,7 +126,7 @@ docker compose -f docker-compose.test.yml run --rm -T odoo
 docker compose -f docker-compose.test.yml down -v
 ```
 
-These commands reset only the `odoo-square-v19-test` project. The test run should report zero failures and errors and a nonzero test count. The suite uses real Odoo records and mocked Square API responses. It includes HTTP webhook tests, Square order and refund scenarios, stock returns, manual resync, and addon contracts.
+These commands reset only the `odoo-square-v19-test` project. The test run should report zero failures and errors and a nonzero test count. The suite uses real Odoo records and mocked Square API responses. It covers order import and updates, payments, refunds, exchanges, stock movements and counts, manual order resync, webhook validation, and addon contracts.
 
 ## Project Structure
 
@@ -156,7 +156,7 @@ flowchart TB
     Queue["square.webhook.queue"]
     Processor["square.order.processor"]
     Sale["sale.order"]
-    Accounting["Invoices and credit notes"]
+    Accounting["Invoices, credit notes, and payment records"]
     Stock["Stock pickings, moves, and quants"]
     Sync["square.stock.sync"]
     Log["square.integration.log"]
@@ -181,7 +181,7 @@ flowchart TB
 - Keep Square access tokens out of Git. Use Odoo configuration records, environment-specific secrets management, or encrypted backups.
 - Map every active Square location to the intended Odoo warehouse before enabling production inventory sync.
 - Review **Square Integration Logs** after installation and after every Square credential or webhook change.
-- Use the manual resync wizard for missed or delayed Square events instead of replaying raw webhook requests manually.
+- To recover missing Square orders, open **Manual Resync Orders** from **Square > Configuration**, scan the relevant dates, and select the orders to import.
 
 ## Contributing
 
