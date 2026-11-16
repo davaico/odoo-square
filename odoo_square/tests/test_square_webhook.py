@@ -1283,11 +1283,21 @@ class TestSquareWebhook(SquareHttpCase):
     def test_partial_refund_processing(self):
         """Test webhook processing for partial refund (1 EUR refund for 3 EUR order)"""
 
-        # First, create a test order
+        eur = self.env.ref("base.EUR")
+        eur.active = True
+        pricelist = self.env["product.pricelist"].create(
+            {"name": "Square EUR", "currency_id": eur.id}
+        )
+        journal = self.env["account.journal"].create(
+            {"name": "Square Card", "code": "SQR", "type": "bank", "currency_id": eur.id}
+        )
+        self.square_config.payment_journal_id = journal
+
         sale_order = self.env["sale.order"].create(
             {
                 "partner_id": self.partner.id,
                 "square_order_id": "test_partial_refund_order_001",
+                "pricelist_id": pricelist.id,
                 "order_line": [
                     (
                         0,
@@ -1304,6 +1314,13 @@ class TestSquareWebhook(SquareHttpCase):
         )
 
         invoice = self._confirm_pick_deliver_invoice(sale_order)
+        self.assertEqual(invoice.currency_id, eur)
+        self.assertAlmostEqual(invoice.amount_total, 3.00, places=2)
+        self.env["account.payment.register"].with_context(
+            active_model="account.move", active_ids=invoice.ids
+        ).create({"journal_id": journal.id}).action_create_payments()
+        self.assertAlmostEqual(invoice.amount_residual, 0.00, places=2)
+        self.assertEqual(invoice.reconciled_payment_ids.payment_type, "inbound")
         delivery = sale_order.picking_ids
         self.assertEqual(len(delivery), 1)
 
@@ -1365,6 +1382,7 @@ class TestSquareWebhook(SquareHttpCase):
         payment = credit_note.reconciled_payment_ids
         self.assertEqual(len(payment), 1)
         self.assertEqual(payment.payment_type, "outbound")
+        self.assertEqual(payment.currency_id, eur)
         self.assertAlmostEqual(payment.amount, 1.00, places=2)
 
         # Verify order refund status

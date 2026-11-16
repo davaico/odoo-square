@@ -99,11 +99,21 @@ class TestStockReturn(SquareHttpCase):
 
     def _create_confirmed_so_with_delivery(self, quantity=1):
         """Create a SO, confirm it, deliver from warehouse, and invoice."""
+        self.enterContext(patch.object(
+            SquareApiClient, "search_catalog_by_sku",
+            return_value={"success": True, "not_found": True},
+        ))
+        eur = self.env.ref("base.EUR")
+        eur.active = True
+        pricelist = self.env["product.pricelist"].create(
+            {"name": "Square EUR", "currency_id": eur.id}
+        )
         so = self.env["sale.order"].create(
             {
                 "partner_id": self.partner.id,
                 "warehouse_id": self.warehouse.id,
                 "square_order_id": "ORDER_TEST",
+                "pricelist_id": pricelist.id,
             }
         )
         self.env["sale.order.line"].create(
@@ -111,7 +121,8 @@ class TestStockReturn(SquareHttpCase):
                 "order_id": so.id,
                 "product_id": self.product.id,
                 "product_uom_qty": quantity,
-                "price_unit": 91.67,
+                "price_unit": 110.00,
+                "tax_ids": [(5, 0, 0)],
                 "name": self.product.name,
             }
         )
@@ -199,6 +210,7 @@ class TestStockReturn(SquareHttpCase):
         so the incoming picking was validated with qty=0 and stock stayed depleted.
         """
         so = self._create_confirmed_so_with_delivery()
+        self.assertAlmostEqual(so.invoice_ids.amount_total, 110.00, places=2)
         stock_after_sale = self._get_stock(self.product, self.warehouse)
 
         refund = self.env["square.refund"].create(
@@ -223,6 +235,7 @@ class TestStockReturn(SquareHttpCase):
         # Now complete the refund
         refund.write({"status": "completed"})
         refund.action_process_refund()
+        self.assertAlmostEqual(refund.credit_note_id.amount_total, 110.00, places=2)
 
         # Verify return picking is done
         for picking in refund.return_picking_ids:
