@@ -4,7 +4,6 @@ from unittest.mock import patch
 import logging
 from odoo.tests.common import tagged
 from odoo.tools import mute_logger
-from odoo.addons.odoo_square.controllers.square_webhook import SquareWebhookController
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
 
 from .common import SquareHttpCase
@@ -938,13 +937,9 @@ class TestSquareWebhook(SquareHttpCase):
             "reason": "Test refund",
         }
 
-        # Create a webhook controller instance and call the refund processing
-        webhook_controller = SquareWebhookController()
-
-        # Mock the request environment for testing
         with self.env.cr.savepoint():
-            result = webhook_controller._process_refund(
-                refund_data, "created", env=self.env
+            result = self.env["square.refund"]._process_refund_event(
+                refund_data, "created"
             )
 
             self.assertEqual(result["status"], "success")
@@ -1017,20 +1012,15 @@ class TestSquareWebhook(SquareHttpCase):
             "reason": "Test refund with USD (should fail)",
         }
 
-        from odoo.addons.odoo_square.controllers.square_webhook import (
-            SquareWebhookController,
-        )
-
-        webhook_controller = SquareWebhookController()
 
         with self.env.cr.savepoint():
-            result = webhook_controller._process_refund(
-                eur_refund_data, "created", env=self.env
+            result = self.env["square.refund"]._process_refund_event(
+                eur_refund_data, "created"
             )
             self.assertEqual(result["status"], "success")
 
-            result_usd = webhook_controller._process_refund(
-                usd_refund_data, "created", env=self.env
+            result_usd = self.env["square.refund"]._process_refund_event(
+                usd_refund_data, "created"
             )
             self.assertEqual(result_usd["status"], "error")
             err = (result_usd.get("message") or "").lower()
