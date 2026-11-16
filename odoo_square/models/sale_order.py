@@ -256,7 +256,7 @@ class SaleOrder(models.Model):
         sale_order.invalidate_recordset(["create_date"])
 
     @api.model
-    def create_from_square(self, square_data):
+    def create_from_square(self, square_data, *, order_data_fetched=False):
         """
         Create a sale order from Square webhook data.
 
@@ -270,7 +270,9 @@ class SaleOrder(models.Model):
         try:
             # Note: Duplicate check is handled at the processor level for better idempotency
             # Get or create customer (returns API-enriched payload so created_at / line_items apply)
-            customer, square_data = self._get_or_create_customer_from_square(square_data)
+            customer, square_data = self._get_or_create_customer_from_square(
+                square_data, order_data_fetched=order_data_fetched
+            )
             if square_data.get("id") and not square_data.get("order_id"):
                 square_data["order_id"] = square_data["id"]
             square_order_id = square_data.get("order_id")
@@ -395,15 +397,8 @@ class SaleOrder(models.Model):
 
             raise
 
-    def _get_or_create_customer_from_square(self, square_data):
-        """
-        Get or create customer from Square order data.
-        Matching strategy: email -> phone -> name -> create new.
-
-        Returns:
-            tuple: (res.partner, order dict) — order dict is Retrieve Order payload when
-            the API call succeeds, otherwise the input payload (so ``created_at`` is not lost).
-        """
+    @api.model
+    def _fetch_square_order_payload(self, square_data):
         payload = dict(square_data or {})
         square_order_id = payload.get("order_id") or payload.get("id")
         if square_order_id:
@@ -424,7 +419,20 @@ class SaleOrder(models.Model):
                 _logger.error(
                     "Error fetching full order data for customer info: %s", str(e)
                 )
+        return payload
 
+    def _get_or_create_customer_from_square(self, square_data, *, order_data_fetched=False):
+        """
+        Get or create customer from Square order data.
+        Matching strategy: email -> phone -> name -> create new.
+
+        Returns:
+            tuple: (res.partner, order dict) — order dict is Retrieve Order payload when
+            the API call succeeds, otherwise the input payload (so ``created_at`` is not lost).
+        """
+        payload = (
+            dict(square_data) if order_data_fetched else self._fetch_square_order_payload(square_data)
+        )
         customer_info = self._extract_customer_info_from_square(payload)
 
         if not customer_info:

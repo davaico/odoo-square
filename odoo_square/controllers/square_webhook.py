@@ -621,6 +621,8 @@ class SquareWebhookController(http.Controller):
                     "payment_id": payment_id,
                 }
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error processing payment.updated event: {str(e)}", exc_info=True

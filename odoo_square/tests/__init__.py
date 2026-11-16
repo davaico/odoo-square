@@ -6,3 +6,4 @@ from . import test_stock_return
 from . import test_manual_resync
 from . import test_module_contracts
 from . import test_stock_sync
+from . import test_square_exchange
