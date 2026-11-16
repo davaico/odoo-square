@@ -7,6 +7,7 @@ import hmac
 from datetime import timedelta
 from odoo import http, fields
 from odoo.http import request
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo.exceptions import UserError, ValidationError, AccessError
 
 _logger = logging.getLogger(__name__)
@@ -121,6 +122,8 @@ class SquareWebhookController(http.Controller):
                 content_type="application/json",
                 status=403,
             )
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Square webhook error: {str(e)}", exc_info=True)
 
@@ -236,6 +239,8 @@ class SquareWebhookController(http.Controller):
                     "message": f"Event type {event_type} not handled",
                 }
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error processing {event_type} event: {str(e)}", exc_info=True
@@ -858,6 +863,8 @@ class SquareWebhookController(http.Controller):
                 "refund_record_id": refund_record.id,
             }
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error processing {event_type} refund: {str(e)}", exc_info=True

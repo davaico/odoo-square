@@ -3,8 +3,13 @@ from odoo import models, fields, api
 from odoo.exceptions import ValidationError, UserError, AccessError
 from datetime import timedelta
 import logging
+from psycopg2 import errorcodes, errors
 
 _logger = logging.getLogger(__name__)
+
+
+class _ConcurrentRefundCreation(errors.SerializationFailure):
+    pgcode = errorcodes.SERIALIZATION_FAILURE
 
 
 class SquareRefund(models.Model):
@@ -192,7 +197,14 @@ class SquareRefund(models.Model):
             "sale_order_id": sale_order.id,
             "webhook_event_id": refund_data.get("webhook_event_id"),
         })
-        return self.with_user(self._get_bot_user()).create(vals)
+        try:
+            return self.with_user(self._get_bot_user()).create(vals)
+        except errors.UniqueViolation as error:
+            if error.diag.constraint_name != f"{self._table}_square_refund_id_unique":
+                raise
+            # The winning row is outside this transaction's repeatable-read
+            # snapshot. Let Odoo retry the webhook in a fresh transaction.
+            raise _ConcurrentRefundCreation("Concurrent Square refund creation") from error
 
     def _get_bot_user(self):
         """Get the Square integration bot user"""
