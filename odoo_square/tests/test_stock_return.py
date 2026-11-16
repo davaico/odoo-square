@@ -48,7 +48,7 @@ class TestStockReturn(SquareHttpCase):
                 "name": "Cardigan Selmana Jaune S",
                 "default_code": "25FWFESUCARSLMJAC-S",
                 "list_price": 110.00,
-                "type": "product",
+                "is_storable": True,
             }
         )
 
@@ -406,9 +406,8 @@ class TestStockReturn(SquareHttpCase):
     )
     def test_sync_skips_when_payload_has_returns(self):
         """
-        When an order.updated (OPEN) payload contains a 'returns' key,
-        _sync_order_line_changes should not be called at all — the return
-        must go through the dedicated refund/exchange flow.
+        An OPEN update with returns and a positive line quantity must leave
+        the sale quantity unchanged for the dedicated refund/exchange flow.
         """
         processor = self.env["square.order.processor"]
 
@@ -451,8 +450,8 @@ class TestStockReturn(SquareHttpCase):
                 {
                     "uid": "line_ret_1",
                     "name": "Cardigan Selmana Jaune S",
-                    "quantity": "0",
-                    "total_money": {"amount": 0, "currency": "EUR"},
+                    "quantity": "3",
+                    "total_money": {"amount": 33000, "currency": "EUR"},
                 }
             ],
         }
