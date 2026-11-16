@@ -3,6 +3,7 @@ from decimal import Decimal
 from odoo import fields, models
 from odoo.exceptions import UserError
 from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
+from odoo.tools.float_utils import float_is_zero
 import logging
 
 _logger = logging.getLogger(__name__)
@@ -73,6 +74,48 @@ class SquareOrderProcessor(models.Model):
                 return existing_order
 
         return None
+
+    def _get_webhook_replay_result(self, order_id, order_state, event_type, event_id):
+        """Identify replayed order states and previously successful event IDs."""
+        logs = self.env["square.integration.log"].sudo()
+        # Open orders can receive several distinct updates before changing state.
+        # Deduplicate those updates by event ID so each change can be applied.
+        if event_type != "updated" or order_state not in ("OPEN", "DRAFT"):
+            state_domain = [("description", "ilike", f"state: {order_state}")]
+            if event_type == "updated" and str(order_state).upper() in (
+                "CANCELED",
+                "CANCELLED",
+            ):
+                # Match historical success logs for either spelling.
+                state_domain = [
+                    ("event_type", "=", "order_updated"),
+                    "|",
+                    ("description", "ilike", "state: CANCELED"),
+                    ("description", "ilike", "state: CANCELLED"),
+                ]
+            existing_log = logs.search(
+                [
+                    ("square_order_id", "=", order_id),
+                    ("status", "=", "success"),
+                ] + state_domain,
+                limit=1,
+            )
+
+            if existing_log:
+                _logger.info(
+                    f"Order {order_id} with state {order_state} already processed successfully, skipping event {event_id}"
+                )
+                return {
+                    "status": "already_processed",
+                    "order_id": order_id,
+                    "state": order_state,
+                }
+
+        if event_id and logs.search(
+            [("webhook_event_id", "=", event_id), ("status", "=", "success")], limit=1
+        ):
+            _logger.info(f"Event {event_id} already processed successfully, skipping")
+            return {"status": "already_processed", "event_id": event_id}
 
     def process_square_order(self, square_order_data):
         """
@@ -246,14 +289,15 @@ class SquareOrderProcessor(models.Model):
                 self._process_order_completion(sale_order, square_order_data)
 
             elif square_order_state in ["OPEN", "DRAFT"]:
+                # A delayed update can arrive after the quote is closed.
+                if sale_order.state not in ("draft", "sent"):
+                    return result
+
                 # Square's order.updated notification contains order metadata.
                 if not any(
                     key in square_order_data
                     for key in ("line_items", "returns", "return_line_items")
                 ):
-                    # A delayed OPEN notice can arrive after the quote is closed.
-                    if sale_order.state not in ("draft", "sent"):
-                        return result
                     fetched_order = self.env["square.api.client"].get_order(square_order_id)
                     if not fetched_order:
                         raise ValueError(f"Could not retrieve Square order {square_order_id}")
@@ -995,21 +1039,11 @@ class SquareOrderProcessor(models.Model):
             if not remaining.get(catalog_id):
                 continue
 
-            available = move.product_uom._compute_quantity(move.quantity, line.uom_id)
-            for returned_move in move.returned_move_ids.filtered(
-                lambda returned_move: returned_move.state != "cancel"
-            ):
-                returned_quantity = (
-                    returned_move.quantity
-                    if returned_move.state == "done"
-                    else returned_move.product_uom_qty
-                )
-                available -= returned_move.product_uom._compute_quantity(
-                    returned_quantity, line.uom_id
-                )
-
-            line.quantity = min(max(available, 0), remaining[catalog_id])
+            available = move._get_square_returnable_quantity(line.uom_id)
+            line.quantity = min(available, remaining[catalog_id])
             remaining[catalog_id] -= line.quantity
+            if float_is_zero(remaining[catalog_id], precision_rounding=line.uom_id.rounding):
+                remaining[catalog_id] = 0
 
         if not any(wizard.product_return_moves.mapped("quantity")):
             return

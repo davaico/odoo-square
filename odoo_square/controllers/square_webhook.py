@@ -255,66 +255,15 @@ class SquareWebhookController(http.Controller):
             if order_data.get("id") and not order_data.get("order_id"):
                 order_data["order_id"] = order_data["id"]
 
-        # 1. Extract event and order IDs
-        # Event ID comes from the webhook root level, passed as parameter
         order_id = order_data.get("order_id") if order_data else None
-
         order_state = order_data.get("state")
 
-        # Open orders can receive several distinct updates before changing state.
-        # Deduplicate those updates by event ID so each change can be applied.
-        if event_type != "updated" or order_state not in ("OPEN", "DRAFT"):
-            state_domain = [("description", "ilike", f"state: {order_state}")]
-            if event_type == "updated" and str(order_state).upper() in (
-                "CANCELED",
-                "CANCELLED",
-            ):
-                # Match historical success logs for either spelling.
-                state_domain = [
-                    ("event_type", "=", "order_updated"),
-                    "|",
-                    ("description", "ilike", "state: CANCELED"),
-                    ("description", "ilike", "state: CANCELLED"),
-                ]
-            existing_log = (
-                request.env["square.integration.log"]
-                .sudo()
-                .search(
-                    [
-                        ("square_order_id", "=", order_id),
-                        ("status", "=", "success"),
-                    ] + state_domain,
-                    limit=1,
-                )
-            )
+        replay = request.env["square.order.processor"]._get_webhook_replay_result(
+            order_id, order_state, event_type, event_id
+        )
+        if replay:
+            return replay
 
-            if existing_log:
-                _logger.info(
-                    f"Order {order_id} with state {order_state} already processed successfully, skipping event {event_id}"
-                )
-                return {
-                    "status": "already_processed",
-                    "order_id": order_id,
-                    "state": order_state,
-                }
-
-        if event_id:
-            existing_event_log = (
-                request.env["square.integration.log"]
-                .sudo()
-                .search(
-                    [("webhook_event_id", "=", event_id), ("status", "=", "success")],
-                    limit=1,
-                )
-            )
-
-            if existing_event_log:
-                _logger.info(
-                    f"Event {event_id} already processed successfully, skipping"
-                )
-                return {"status": "already_processed", "event_id": event_id}
-
-        # 3. Process the order based on event type with transaction isolation
         bot_user = None
         try:
             # Get bot user in separate transaction
@@ -816,65 +765,9 @@ class SquareWebhookController(http.Controller):
                 f"Successfully linked refund {refund_id} to order {sale_order.name} using strategy: {search_strategy}"
             )
 
-            refund_status = (refund_status or "PENDING").strip().upper()
-            if refund_status == "CANCELED":
-                refund_status = "CANCELLED"
-            if refund_status not in ("PENDING", "COMPLETED", "FAILED", "CANCELLED"):
-                return {"status": "error", "message": f"Statut de remboursement inconnu: {refund_status}"}
-
-            messages = {
-                "PENDING": "Actions de remboursement préparées (en attente de confirmation Square)",
-                "COMPLETED": "Refund processed successfully",
-                "FAILED": "Failed refund processed",
-                "CANCELLED": "Cancelled refund processed",
-            }
-            refund_model = req_env["square.refund"].sudo()
-            with req_env.cr.savepoint():
-                refund_record = refund_model.with_user(
-                    refund_model._get_bot_user()
-                ).create_from_square_data(refund_data, sale_order)
-
-                if refund_record.processed_at:
-                    return {
-                        "status": "already_processed",
-                        "message": f"Refund {refund_id} already fully processed",
-                        "refund_id": refund_id,
-                    }
-
-                if webhook_event_id:
-                    refund_record.webhook_event_id = webhook_event_id
-                refund_record.action_process_refund()
-
-            result_message = messages[refund_status]
-
-            # Log webhook processing
-            req_env["square.integration.log"].sudo().log_square_event(
-                event_type=f"refund_{event_type}",
-                title=f"Remboursement {event_type} traité pour la commande {sale_order.name}",
-                description=f"""
-                    <p><strong>Square Refund {event_type.title()} Traité</strong></p>
-                    <ul>
-                        <li>Odoo Order: <strong>{sale_order.name}</strong></li>
-                        <li>ID Square Refund : <code>{refund_id}</code></li>
-                        <li>Statut : {refund_status}</li>
-                        <li>Montant : {refund_record.refund_amount} {refund_record.currency_id.name}</li>
-                        <li>Type : {'Partiel' if refund_record._is_partial_refund() else 'Complet'}</li>
-                        <li>Action : {result_message}</li>
-                    </ul>
-                """,
-                status="success",
-                square_order_id=order_id,
-                square_refund_id=refund_id,
-                sale_order_id=sale_order.id,
-                webhook_event_id=webhook_event_id,
+            return req_env["square.refund"].sudo()._process_webhook_refund(
+                refund_data, sale_order, event_type, webhook_event_id
             )
-
-            return {
-                "status": "success",
-                "message": result_message,
-                "refund_id": refund_id,
-                "refund_record_id": refund_record.id,
-            }
 
         except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
             raise

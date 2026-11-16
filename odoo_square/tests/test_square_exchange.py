@@ -316,6 +316,49 @@ class TestSquareExchange(SquareHttpCase):
         self._set_replacement_price(amount=1200, tax=200)
         self._exercise_exchange(payment_amount=0, invoice_total=12)
 
+    def test_exchange_rounds_returnable_stock_after_converting_pending_returns(self):
+        self._set_replacement_price(amount=1200, tax=200)
+        _, _, _, delivery = self._import_original_sale()
+        unit = self.original_product.uom_id
+        unit.rounding = 0.01
+        subunit = self.env["uom.uom"].create({
+            "name": "Test subunit",
+            "category_id": unit.category_id.id,
+            "uom_type": "smaller",
+            "factor": 250,
+            "rounding": 1,
+        })
+        pending = self.env["stock.picking"].create({
+            "picking_type_id": self.warehouse.in_type_id.id,
+            "location_id": delivery.location_dest_id.id,
+            "location_dest_id": delivery.location_id.id,
+            "return_id": delivery.id,
+        })
+        # These draft moves commit 0.504 and 0.492 units of the original delivery.
+        # One of the two delivered units can still be exchanged.
+        self.env["stock.move"].create([
+            {
+                "name": f"Pending return of {quantity} subunits",
+                "product_id": self.original_product.id,
+                "product_uom": subunit.id,
+                "product_uom_qty": quantity,
+                "location_id": pending.location_id.id,
+                "location_dest_id": pending.location_dest_id.id,
+                "picking_id": pending.id,
+                "origin_returned_move_id": delivery.move_ids.id,
+            }
+            for quantity in (126, 123)
+        ])
+
+        self._send_webhook(
+            "payment.updated", "exchange-with-pending-returns",
+            {"payment": self._payment_notice("COMPLETED", 0)}, "success",
+        )
+        self.assertEqual(pending.state, "draft")
+        returned = delivery.return_ids - pending
+        self._assert_movement(returned, "incoming", self.original_product, 1)
+        self.assertEqual(self._stock_quantities(self.warehouse), (4, 4))
+
     def test_higher_price_exchange_records_only_the_extra_payment(self):
         self._set_replacement_price(amount=1800, tax=300)
         self._exercise_exchange(payment_amount=600, invoice_total=18, payment_direction="inbound", delta=6)

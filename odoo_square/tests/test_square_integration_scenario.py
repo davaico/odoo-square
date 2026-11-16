@@ -362,6 +362,51 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             ]), 1)
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
+    def test_late_inline_open_update_leaves_paid_sale_intact(self):
+        self._test_sale_processing()
+        self._test_stock_updates()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        lines = order.order_line
+        delivery = order.picking_ids
+        self.assertEqual(len(delivery), 1)
+        self.assertEqual(delivery.state, "done")
+        sale_payment = self.assert_reconciled_payment(invoice, "inbound", 3.00)
+        stale_order = self._mock_get_order(order.square_order_id)
+        stale_order["state"] = "OPEN"
+        stale_order["line_items"][0].update({
+            "quantity": "3",
+            "total_money": {"amount": 360, "currency": "EUR"},
+        })
+
+        response = self.url_open(
+            "/square/webhook",
+            data=json.dumps({
+                "type": "order.updated",
+                "event_id": "evt-late-inline-open",
+                "data": {"object": {"order_updated": stale_order}},
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "updated", response.text)
+        self.assertEqual(self.env["sale.order"].search([
+            ("square_order_id", "=", order.square_order_id),
+        ]), order)
+        self.assertEqual(order.state, "sale")
+        self.assertEqual(order.order_line, lines)
+        self.assertEqual(lines.mapped("product_uom_qty"), [1, 1])
+        self.assertEqual(lines.mapped("qty_delivered"), [1, 1])
+        self.assertEqual(order.amount_total, 3.00)
+        self.assertEqual(order.invoice_ids, invoice)
+        self.assertEqual(self.assert_reconciled_payment(invoice, "inbound", 3.00), sale_payment)
+        self.assertEqual(self.env["account.payment"].search([
+            ("partner_id", "=", order.partner_id.id),
+        ]), sale_payment)
+        self.assertEqual(order.picking_ids, delivery)
+        self.assertEqual(delivery.move_ids.mapped("quantity"), [1, 1])
+        self._assert_warehouse_stock(49)
+
     def test_failed_and_cancelled_refunds_leave_paid_sale_intact(self):
         self._test_sale_processing()
         self._test_stock_updates()
@@ -404,6 +449,51 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                 ]))
                 self.assert_reconciled_payment(self.created_invoice, "inbound", 3.00)
                 self._assert_warehouse_stock(49)
+
+    def test_completed_refund_can_prepare_a_return_after_its_credit_note(self):
+        self._test_sale_processing()
+        self._test_stock_updates()
+        order = self.created_sale_order
+        delivery = order.picking_ids
+        reserved = {
+            "id": "reserved-refund",
+            "order_id": order.square_order_id,
+            "amount_money": {"amount": 300, "currency": "EUR"},
+        }
+        refund_data = {
+            "id": "late-return-details",
+            "order_id": order.square_order_id,
+            "amount_money": {"amount": 120, "currency": "EUR"},
+        }
+        self._send_refund_webhook(reserved, "created", "PENDING", "evt-reserve-products")
+        self._send_refund_webhook(refund_data, "created", "PENDING", "evt-prepare-credit")
+        refund = order.square_refund_ids.filtered(
+            lambda record: record.square_refund_id == refund_data["id"]
+        )
+        credit = refund.credit_note_id
+        self.assertEqual(credit.state, "draft")
+        self.assertFalse(refund.return_picking_ids)
+        self.assertFalse(credit.reconciled_payment_ids)
+        self._assert_warehouse_stock(49)
+
+        self._send_refund_webhook(reserved, "updated", "CANCELED", "evt-release-products")
+        self._send_refund_webhook(
+            {**refund_data, "refunded_line_ids": ["line_1"]},
+            "updated", "COMPLETED", "evt-complete-with-return",
+        )
+        self.assertTrue(refund.processed_at)
+        self.assertEqual(refund.credit_note_id, credit)
+        self.assert_reconciled_payment(credit, "outbound", 1.20)
+        returned = refund.return_picking_ids
+        self.assertEqual(len(returned), 1)
+        self.assertEqual(returned.return_id, delivery)
+        self.assertEqual(returned.state, "done")
+        self.assertEqual(returned.location_dest_id, self.warehouse_w1.lot_stock_id)
+        self.assertEqual(returned.move_ids.product_id, self.product_p1)
+        self.assertEqual(returned.move_ids.quantity, 1)
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 50)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 49)
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w2), 50)
 
     def test_successive_partial_refunds_of_paid_square_sale(self):
         self.p2_order_quantity = 2

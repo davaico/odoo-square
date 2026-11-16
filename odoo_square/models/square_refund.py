@@ -207,6 +207,72 @@ class SquareRefund(models.Model):
             # snapshot. Let Odoo retry the webhook in a fresh transaction.
             raise _ConcurrentRefundCreation("Concurrent Square refund creation") from error
 
+    def _process_webhook_refund(self, refund_data, sale_order, event_type, webhook_event_id):
+        """Apply a Square refund event atomically and preserve completed refunds on replay."""
+        refund_id = refund_data.get("id")
+        order_id = refund_data.get("order_id")
+        refund_status = (refund_data.get("status") or "PENDING").strip().upper()
+        if refund_status == "CANCELED":
+            refund_status = "CANCELLED"
+
+        messages = {
+            "PENDING": "Actions de remboursement préparées (en attente de confirmation Square)",
+            "COMPLETED": "Refund processed successfully",
+            "FAILED": "Failed refund processed",
+            "CANCELLED": "Cancelled refund processed",
+        }
+        result_message = messages.get(refund_status)
+        if result_message is None:
+            return {
+                "status": "error",
+                "message": f"Statut de remboursement inconnu: {refund_status}",
+            }
+
+        with self.env.cr.savepoint():
+            refund_record = self.with_user(self._get_bot_user()).create_from_square_data(
+                refund_data, sale_order
+            )
+
+            if refund_record.processed_at:
+                return {
+                    "status": "already_processed",
+                    "message": f"Refund {refund_id} already fully processed",
+                    "refund_id": refund_id,
+                }
+
+            if webhook_event_id:
+                refund_record.webhook_event_id = webhook_event_id
+            refund_record.action_process_refund()
+
+        # Log webhook processing
+        self.env["square.integration.log"].log_square_event(
+            event_type=f"refund_{event_type}",
+            title=f"Remboursement {event_type} traité pour la commande {sale_order.name}",
+            description=f"""
+                <p><strong>Square Refund {event_type.title()} Traité</strong></p>
+                <ul>
+                    <li>Odoo Order: <strong>{sale_order.name}</strong></li>
+                    <li>ID Square Refund : <code>{refund_id}</code></li>
+                    <li>Statut : {refund_status}</li>
+                    <li>Montant : {refund_record.refund_amount} {refund_record.currency_id.name}</li>
+                    <li>Type : {'Partiel' if refund_record._is_partial_refund() else 'Complet'}</li>
+                    <li>Action : {result_message}</li>
+                </ul>
+            """,
+            status="success",
+            square_order_id=order_id,
+            square_refund_id=refund_id,
+            sale_order_id=sale_order.id,
+            webhook_event_id=webhook_event_id,
+        )
+
+        return {
+            "status": "success",
+            "message": result_message,
+            "refund_id": refund_id,
+            "refund_record_id": refund_record.id,
+        }
+
     def _get_bot_user(self):
         """Get the Square integration bot user"""
         try:
@@ -289,14 +355,7 @@ class SquareRefund(models.Model):
                 sale_order = self.sale_order_id
 
                 is_partial = self._is_partial_refund()
-                self.return_picking_ids = self.return_picking_ids.filtered(
-                    lambda picking: picking.state != "cancel"
-                )
-                if not self.return_picking_ids:
-                    if is_partial:
-                        self._create_partial_return_picking()
-                    else:
-                        self._create_full_return_picking()
+                self._prepare_return_pickings(is_partial)
 
                 if not self.credit_note_id or self.credit_note_id.state == "cancel":
                     self.credit_note_id = self._create_credit_note()
@@ -344,6 +403,8 @@ class SquareRefund(models.Model):
             try:
                 if not self.credit_note_id or self.credit_note_id.state == "cancel":
                     self._create_pending_refund_actions()
+                else:
+                    self._prepare_return_pickings(self._is_partial_refund())
 
                 credit_note = self.credit_note_id
                 if not self.invoice_id:
@@ -460,17 +521,31 @@ class SquareRefund(models.Model):
             lambda picking: picking.picking_type_code == "outgoing" and picking.state == "done"
         )
 
-    def _create_partial_return_picking(self):
-        """Prepare partial returns against the quantities left on each delivery."""
+    def _prepare_return_pickings(self, is_partial):
+        """Create missing return pickings from the stock currently available to return."""
+        self.return_picking_ids = self.return_picking_ids.filtered(
+            lambda picking: picking.state != "cancel"
+        )
+        if self.return_picking_ids:
+            return
+
         deliveries = self._get_completed_deliveries()
         if not deliveries:
             return
 
         wizard_model = self.env["stock.return.picking"].with_user(self._get_bot_user())
         wizards = wizard_model.create([{"picking_id": delivery.id} for delivery in deliveries])
-        return_lines = wizards.product_return_moves.filtered(lambda line: line.move_id.sale_line_id)
-        available = {line: self._get_unreturned_quantity(line) for line in return_lines}
-        if self.refunded_line_ids:
+        return_lines = wizards.product_return_moves
+        if is_partial:
+            return_lines = return_lines.filtered(lambda line: line.move_id.sale_line_id)
+        available = {
+            line: line.move_id._get_square_returnable_quantity(line.uom_id)
+            for line in return_lines
+        }
+        if not is_partial:
+            for line in return_lines:
+                line.quantity = available[line]
+        elif self.refunded_line_ids:
             self._configure_partial_return_lines(return_lines, available)
         else:
             self._configure_proportional_return_lines(return_lines, available)
@@ -479,25 +554,6 @@ class SquareRefund(models.Model):
             if any(wizard.product_return_moves.mapped("quantity")):
                 result = wizard.action_create_returns()
                 self.return_picking_ids = [Command.link(result["res_id"])]
-
-    def _get_unreturned_quantity(self, return_line):
-        move = return_line.move_id
-        uom = return_line.uom_id
-        delivered = move.product_uom._compute_quantity(move.quantity, uom, round=False)
-        reserved_for_returns = sum(
-            returned.product_uom._compute_quantity(
-                returned.quantity if returned.state == "done" else returned.product_uom_qty,
-                uom,
-                round=False,
-            )
-            for returned in move.returned_move_ids
-            if returned.state != "cancel"
-        )
-        return float_round(
-            max(0, delivered - reserved_for_returns),
-            precision_rounding=uom.rounding,
-            rounding_method="DOWN",
-        )
 
     def _configure_partial_return_lines(self, return_lines, available):
         legacy_lines = return_lines.filtered(lambda line: not line.move_id.sale_line_id.square_line_id)
@@ -558,14 +614,6 @@ class SquareRefund(models.Model):
                 return square_item
 
         return None
-
-    def _create_full_return_picking(self):
-        """Return the full delivery for an initial full refund."""
-        wizard_model = self.env["stock.return.picking"].with_user(self._get_bot_user())
-        for delivery in self._get_completed_deliveries():
-            wizard = wizard_model.create({"picking_id": delivery.id})
-            result = wizard.action_create_returns_all()
-            self.return_picking_ids = [Command.link(result["res_id"])]
 
     def _create_credit_note(self):
         """
