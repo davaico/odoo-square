@@ -254,7 +254,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         )
         return sum(quants.mapped("quantity"))
 
-    def _send_square_order_event(self, event_type, event_id, state):
+    def _send_square_order_event(self, event_type, event_id, state, **order_data):
         payload = {
             "type": event_type,
             "event_id": event_id,
@@ -264,6 +264,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                         "id": "ORDER_L1_001",
                         "location_id": "L1",
                         "state": state,
+                        **order_data,
                     }
                 }
             },
@@ -282,6 +283,155 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         )
         self.assertIn(result["status"], ("success", "updated"), result)
         self._assert_paid_square_sale()
+
+    def test_open_and_draft_square_order_updates_and_replay(self):
+        initial_order = self._mock_get_order("ORDER_L1_001")
+        initial_order.update(state="OPEN", tenders=[])
+        with patch.object(SquareApiClient, "get_order", return_value=initial_order):
+            result = self._send_square_order_event(
+                "order.created", "evt_open_order_created", "OPEN"
+            )
+        self.assertEqual(result["status"], "success", result)
+
+        order_domain = [("square_order_id", "=", "ORDER_L1_001")]
+        order = self.env["sale.order"].search(order_domain)
+        self.assertEqual(len(order), 1)
+        self.assertEqual(order.partner_id, self.customer)
+        self.assertEqual(order.warehouse_id, self.warehouse_w1)
+        self.assertEqual(order.amount_total, 3.60)
+        lines = order.order_line
+        self.assertEqual(lines.mapped("square_line_id"), ["line_1", "line_2"])
+        order_log_domain = [("sale_order_id", "=", order.id)]
+        creation_logs = self.env["square.integration.log"].search(
+            order_log_domain + [("event_type", "=", "order_created")]
+        )
+        self.assertTrue(creation_logs)
+
+        for state, event_id, quantity, line_total, order_total in (
+            ("OPEN", "evt_open_order_updated", 3, 3.60, 6.00),
+            ("DRAFT", "evt_draft_order_updated", 4, 4.80, 7.20),
+            ("DRAFT", "evt_draft_order_updated_again", 5, 6.00, 8.40),
+        ):
+            with self.subTest(event_id=event_id):
+                line_items = [
+                    dict(
+                        initial_order["line_items"][0],
+                        quantity=str(quantity),
+                        total_money={
+                            "amount": round(line_total * 100),
+                            "currency": "EUR",
+                        },
+                        total_tax_money={"amount": 20 * quantity, "currency": "EUR"},
+                    ),
+                    initial_order["line_items"][1],
+                ]
+                result = self._send_square_order_event(
+                    "order.updated", event_id, state, line_items=line_items
+                )
+                self.assertEqual(result["status"], "updated", result)
+                result = self._send_square_order_event(
+                    "order.updated", event_id, state, line_items=line_items
+                )
+                self.assertEqual(result["status"], "already_processed", result)
+
+                self.assertEqual(self.env["sale.order"].search(order_domain), order)
+                self.assertEqual(order.state, "draft")
+                self.assertEqual(order.order_line, lines)
+                self.assertEqual(lines.mapped("product_uom_qty"), [quantity, 2])
+                self.assertAlmostEqual(lines[0].price_total, line_total, places=2)
+                self.assertAlmostEqual(lines[1].price_total, 2.40, places=2)
+                self.assertAlmostEqual(order.amount_total, order_total, places=2)
+
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(
+            self.env["account.payment"].search_count(
+                [("partner_id", "=", self.customer.id)]
+            )
+        )
+        self.assertFalse(order.picking_ids)
+        for product in (self.product_p1, self.product_p2):
+            for warehouse in (self.warehouse_w1, self.warehouse_w2):
+                self.assertEqual(self._get_stock_quantity(product, warehouse), 50)
+        order_logs = self.env["square.integration.log"].search(order_log_domain)
+        self.assertTrue(creation_logs <= order_logs)
+        self.assertEqual(
+            len(order_logs.filtered(lambda entry: entry.event_type == "order_updated")),
+            3,
+        )
+
+    def test_paid_and_delivered_square_order_cancellation_and_replay(self):
+        self._import_paid_square_sale()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        payment = invoice.reconciled_payment_ids
+        delivery = order.picking_ids
+        order_lines = order.order_line
+        log_domain = [("sale_order_id", "=", order.id)]
+        original_logs = self.env["square.integration.log"].search(log_domain)
+        self.assertTrue(original_logs)
+
+        result = self._send_square_order_event(
+            "order.updated", "evt_paid_order_canceled", "CANCELED"
+        )
+        self.assertEqual(result["status"], "updated", result)
+        reversal = invoice.reversal_move_ids
+        self.assertEqual(len(reversal), 1)
+
+        for event_id, state in (
+            ("evt_paid_order_canceled", "CANCELED"),
+            ("evt_paid_order_cancelled", "CANCELLED"),
+        ):
+            result = self._send_square_order_event("order.updated", event_id, state)
+            self.assertIn(result["status"], ("already_processed", "updated"), result)
+
+        self.assertEqual(
+            self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")]),
+            order,
+        )
+        self.assertEqual(order.state, "sale")
+        self.assertEqual(order.order_line, order_lines)
+        self.assertEqual(order.invoice_ids, invoice | reversal)
+        self.assertEqual(invoice.reversal_move_ids, reversal)
+        self.assertEqual(invoice.state, "posted")
+        self.assertEqual(invoice.payment_state, "paid")
+        self.assertAlmostEqual(invoice.amount_total, 3.60, places=2)
+        self.assertAlmostEqual(invoice.amount_residual, 0.0, places=2)
+        self.assertEqual(invoice.reconciled_payment_ids, payment)
+
+        self.assertEqual(reversal.move_type, "out_refund")
+        self.assertEqual(reversal.state, "posted")
+        self.assertEqual(reversal.reversed_entry_id, invoice)
+        self.assertEqual(reversal.currency_id, invoice.currency_id)
+        self.assertAlmostEqual(reversal.amount_total, 3.60, places=2)
+        self.assertAlmostEqual(reversal.amount_residual, 3.60, places=2)
+        self.assertEqual(
+            self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+            payment,
+        )
+        self.assertEqual(payment.payment_type, "inbound")
+        self.assertEqual(payment.move_id.state, "posted")
+        self.assertAlmostEqual(payment.amount, 3.60, places=2)
+        self.assertFalse(order.square_refund_ids)
+
+        self.assertEqual(order.picking_ids, delivery)
+        self.assertEqual(delivery.state, "done")
+        self.assertEqual(delivery.picking_type_code, "outgoing")
+        self.assertEqual(
+            {move.product_id: move.quantity for move in delivery.move_ids},
+            {self.product_p1: 1, self.product_p2: 2},
+        )
+        for product, quantity in ((self.product_p1, 49), (self.product_p2, 48)):
+            self.assertEqual(
+                self._get_stock_quantity(product, self.warehouse_w1), quantity
+            )
+            self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
+
+        logs = self.env["square.integration.log"].search(log_domain)
+        self.assertTrue(original_logs <= logs)
+        cancellation_logs = logs - original_logs
+        self.assertEqual(len(cancellation_logs), 1)
+        self.assertEqual(cancellation_logs.event_type, "order_updated")
+        self.assertIn(reversal.name, cancellation_logs.description)
 
     def _assert_square_sale_order(self, state):
         order = self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")])
@@ -360,6 +510,232 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
 
         self.created_invoice = invoice
+
+    def _send_square_exchange_event(self, event_type, event_id, object_type, data):
+        response = self.url_open(
+            "/square/webhook",
+            json={
+                "type": event_type,
+                "event_id": event_id,
+                "data": {"object": {object_type: data}},
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def _run_square_exchange(self, replacement_cents, payment_cents, retry_after_catalog_failure=False):
+        self._import_paid_square_sale()
+        self.replacement_product = self.env["product.product"].create(
+            {
+                "name": "Replacement Product",
+                "default_code": "REPLACEMENT-SKU",
+                "type": "consu",
+                "is_storable": True,
+                "invoice_policy": "order",
+                "taxes_id": [(6, 0, self.sale_tax.ids)],
+            }
+        )
+        for warehouse in self.warehouse_w1 | self.warehouse_w2:
+            self._set_initial_stock(self.replacement_product, warehouse, 50)
+
+        exchange_order = {
+            "id": "EXCHANGE_L1_001",
+            "location_id": "L1",
+            "state": "COMPLETED",
+            "returns": [
+                {
+                    "source_order_id": self.created_sale_order.square_order_id,
+                    "return_line_items": [
+                        {"catalog_object_id": "P1-SKU", "quantity": "1"},
+                    ],
+                },
+            ],
+        }
+        self.enterContext(
+            patch.object(
+                SquareApiClient,
+                "get_order",
+                return_value={
+                    **exchange_order,
+                    "line_items": [
+                        {
+                            "uid": "replacement_line",
+                            "name": self.replacement_product.name,
+                            "catalog_object_id": "REPLACEMENT-CATALOG",
+                            "quantity": "1",
+                            "total_money": {"amount": replacement_cents, "currency": "EUR"},
+                        },
+                    ],
+                },
+            )
+        )
+        catalog_match = {"success": True, "sku": self.replacement_product.default_code}
+        get_catalog_object = self.enterContext(
+            patch.object(
+                SquareApiClient,
+                "get_catalog_object",
+                return_value=catalog_match,
+            )
+        )
+
+        result = self._send_square_exchange_event(
+            "order.created", "evt_exchange_created", "order_created", exchange_order
+        )
+        self.assertEqual(result["status"], "success", result)
+        self._assert_exchange_pending()
+
+        payment = {
+            "id": "payment_exchange_001",
+            "order_id": exchange_order["id"],
+            "status": "APPROVED",
+            "amount_money": {"amount": payment_cents, "currency": "EUR"},
+        }
+        result = self._send_square_exchange_event(
+            "payment.updated", "evt_exchange_approved", "payment", payment
+        )
+        self.assertEqual(result["status"], "ignored", result)
+        self._assert_exchange_pending()
+
+        payment["status"] = "COMPLETED"
+        if retry_after_catalog_failure:
+            get_catalog_object.return_value = {"success": False, "not_found": True}
+            result = self._send_square_exchange_event(
+                "payment.updated", "evt_exchange_completed", "payment", payment
+            )
+            self.assertEqual(result["status"], "error", result)
+            self._assert_exchange_pending()
+            get_catalog_object.return_value = catalog_match
+
+        result = self._send_square_exchange_event(
+            "payment.updated", "evt_exchange_completed", "payment", payment
+        )
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(result["original_order_id"], self.created_sale_order.id)
+        return payment
+
+    def _assert_exchange_pending(self):
+        self._assert_paid_square_sale()
+        self.assertFalse(self.created_invoice.reversal_move_ids)
+        self.assertFalse(self.created_sale_order.picking_ids.return_ids)
+        self.assertFalse(self.env["sale.order"].search([("square_order_id", "=", "EXCHANGE_L1_001")]))
+        self.assertEqual(self._get_stock_quantity(self.replacement_product, self.warehouse_w1), 50)
+        self.assertEqual(self._get_stock_quantity(self.replacement_product, self.warehouse_w2), 50)
+
+    def _assert_settled_exchange(self, replacement_total, payment_delta):
+        original_order = self._assert_square_sale_order("sale")
+        original_invoice = self.created_invoice
+        self.assertEqual(original_order.invoice_ids, original_invoice)
+        self.assertEqual(original_invoice.payment_state, "paid")
+        self.assertAlmostEqual(original_invoice.amount_total, 3.60, places=2)
+        self.assertAlmostEqual(original_invoice.amount_residual, 0.0, places=2)
+
+        replacement_order = self.env["sale.order"].search([("square_order_id", "=", "EXCHANGE_L1_001")])
+        self.assertEqual(len(replacement_order), 1)
+        self.assertIn(original_order.name, replacement_order.origin)
+        self.assertEqual(replacement_order.partner_id, original_order.partner_id)
+        self.assertEqual(replacement_order.warehouse_id, self.warehouse_w1)
+        self.assertEqual(replacement_order.state, "sale")
+        self.assertEqual(len(replacement_order.order_line), 1)
+        self.assertEqual(replacement_order.order_line.product_id, self.replacement_product)
+        self.assertEqual(replacement_order.order_line.product_uom_qty, 1)
+        self.assertAlmostEqual(replacement_order.amount_total, replacement_total, places=2)
+
+        credit_note = original_invoice.reversal_move_ids
+        replacement_invoice = replacement_order.invoice_ids
+        self.assertEqual(len(credit_note), 1)
+        self.assertEqual(len(replacement_invoice), 1)
+        self.assertEqual(credit_note.move_type, "out_refund")
+        self.assertEqual(credit_note.invoice_origin, original_order.name)
+        self.assertEqual(credit_note.reversed_entry_id, original_invoice)
+        self.assertEqual(len(credit_note.invoice_line_ids), 1)
+        self.assertEqual(credit_note.invoice_line_ids.product_id, self.product_p1)
+        self.assertEqual(credit_note.invoice_line_ids.quantity, 1)
+        self.assertAlmostEqual(credit_note.amount_total, 1.20, places=2)
+        self.assertEqual(replacement_invoice.move_type, "out_invoice")
+        self.assertAlmostEqual(replacement_invoice.amount_total, replacement_total, places=2)
+        for document in credit_note | replacement_invoice:
+            self.assertEqual(document.state, "posted")
+            self.assertEqual(document.currency_id, self.env.ref("base.EUR"))
+            self.assertAlmostEqual(document.amount_residual, 0.0, places=2)
+
+        exchange_lines = (credit_note | replacement_invoice).line_ids.filtered(
+            lambda line: line.account_id.account_type == "asset_receivable"
+        )
+        self.assertEqual(len(exchange_lines), 2)
+        reconciliation = exchange_lines.full_reconcile_id
+        self.assertEqual(len(reconciliation), 1)
+        self.assertTrue(all(line.full_reconcile_id == reconciliation for line in exchange_lines))
+
+        partner_payments = self.env["account.payment"].search([("partner_id", "=", self.customer.id)])
+        original_payment = original_invoice.reconciled_payment_ids
+        self.assertEqual(len(original_payment), 1)
+        self.assertAlmostEqual(original_payment.amount, 3.60, places=2)
+        exchange_payments = partner_payments - original_payment
+        if payment_delta:
+            self.assertEqual(len(exchange_payments), 1)
+            payment_type = "inbound" if payment_delta > 0 else "outbound"
+            self.assertEqual(exchange_payments.payment_type, payment_type)
+            self.assertAlmostEqual(exchange_payments.amount, abs(payment_delta), places=2)
+            self.assertEqual(exchange_payments.journal_id, self.payment_journal)
+            self.assertEqual(exchange_payments.currency_id, original_payment.currency_id)
+            self.assertEqual(exchange_payments.move_id.state, "posted")
+            paid_document = replacement_invoice if payment_delta > 0 else credit_note
+            self.assertEqual(paid_document.reconciled_payment_ids, exchange_payments)
+            payment_line = exchange_payments.move_id.line_ids.filtered(
+                lambda line: line.account_id.account_type == "asset_receivable"
+            )
+            self.assertEqual(len(payment_line), 1)
+            self.assertEqual(payment_line.full_reconcile_id, reconciliation)
+        else:
+            self.assertFalse(exchange_payments)
+
+        original_delivery = original_order.picking_ids.filtered(lambda picking: picking.picking_type_code == "outgoing")
+        self.assertEqual(len(original_delivery), 1)
+        return_picking = original_delivery.return_ids
+        self.assertEqual(len(return_picking), 1)
+        self.assertEqual(return_picking.picking_type_code, "incoming")
+        self.assertEqual(return_picking.location_dest_id, self.warehouse_w1.lot_stock_id)
+        self.assertEqual(return_picking.move_ids.origin_returned_move_id, original_delivery.move_ids.filtered(lambda move: move.product_id == self.product_p1))
+        replacement_delivery = replacement_order.picking_ids
+        self.assertEqual(len(replacement_delivery), 1)
+        self.assertEqual(replacement_delivery.picking_type_code, "outgoing")
+        self.assertEqual(replacement_delivery.location_id, self.warehouse_w1.lot_stock_id)
+        for picking, product in (
+            (return_picking, self.product_p1),
+            (replacement_delivery, self.replacement_product),
+        ):
+            self.assertEqual(picking.state, "done")
+            self.assertEqual(len(picking.move_ids), 1)
+            self.assertEqual(picking.move_ids.state, "done")
+            self.assertEqual(picking.move_ids.product_id, product)
+            self.assertEqual(picking.move_ids.quantity, 1)
+        for product, quantity in (
+            (self.product_p1, 50), (self.product_p2, 48), (self.replacement_product, 49),
+        ):
+            self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), quantity)
+            self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
+
+    def test_equal_price_exchange_settles_without_another_payment(self):
+        payment = self._run_square_exchange(replacement_cents=120, payment_cents=0)
+        self._assert_settled_exchange(replacement_total=1.20, payment_delta=0.0)
+
+        for event_id, status in (
+            ("evt_exchange_completed", "already_processed"),
+            ("evt_exchange_replay", "skipped"),
+        ):
+            result = self._send_square_exchange_event("payment.updated", event_id, "payment", payment)
+            self.assertEqual(result["status"], status, result)
+            self._assert_settled_exchange(replacement_total=1.20, payment_delta=0.0)
+
+    def test_exchange_records_one_cent_payment_after_retry(self):
+        self._run_square_exchange(
+            replacement_cents=121, payment_cents=1, retry_after_catalog_failure=True
+        )
+        self._assert_settled_exchange(replacement_total=1.21, payment_delta=0.01)
+
+    def test_cheaper_exchange_records_the_refund_difference(self):
+        self._run_square_exchange(replacement_cents=60, payment_cents=0)
+        self._assert_settled_exchange(replacement_total=0.60, payment_delta=-0.60)
 
     def _call_admin_button(self, record, method):
         response = self.url_open(
