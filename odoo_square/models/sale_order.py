@@ -90,7 +90,11 @@ class SaleOrder(models.Model):
             order.total_refunded_amount = total_refunded
 
     @api.depends(
-        "square_refund_ids.refund_amount", "square_refund_ids.status", "amount_total"
+        "square_refund_ids.refund_amount",
+        "square_refund_ids.status",
+        "amount_total",
+        "invoice_ids.state",
+        "invoice_ids.amount_total",
     )
     def _compute_refund_status(self):
         """Compute refund status"""
@@ -106,10 +110,20 @@ class SaleOrder(models.Model):
             # Determine refund status
             if total_refunded == 0:
                 order.refund_status = "not_refunded"
-            elif total_refunded >= order.amount_total:
+            elif order.currency_id.compare_amounts(
+                total_refunded, order._get_original_sale_total()
+            ) >= 0:
                 order.refund_status = "fully_refunded"
             else:
                 order.refund_status = "partially_refunded"
+
+    def _get_original_sale_total(self):
+        self.ensure_one()
+        invoices = self.invoice_ids.filtered(
+            lambda move: move.move_type == "out_invoice" and move.state == "posted"
+        )
+        # Return adjustments change the order total; the original invoices retain the sale amount.
+        return sum(invoices.mapped("amount_total")) if invoices else self.amount_total
 
     def _get_square_bot_user(self):
         """Get the Square integration bot user"""

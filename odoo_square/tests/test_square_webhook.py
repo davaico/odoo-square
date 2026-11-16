@@ -1262,13 +1262,16 @@ class TestSquareWebhook(SquareHttpCase):
                             "product_id": self.product.id,
                             "product_uom_qty": 6,
                             "price_unit": 0.50,  # Total: 3.00 EUR
+                            "tax_ids": [(5, 0, 0)],
                         },
                     )
                 ],
             }
         )
 
-        self._confirm_pick_deliver_invoice(sale_order)
+        invoice = self._confirm_pick_deliver_invoice(sale_order)
+        delivery = sale_order.picking_ids
+        self.assertEqual(len(delivery), 1)
 
         # Sample Square webhook data for refund.created (partial refund)
         webhook_data = {
@@ -1298,11 +1301,12 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Process the webhook
-        response = self.url_open(
-            "/square/webhook",
-            data=json.dumps(webhook_data),
-            headers={"Content-Type": "application/json"},
-        )
+        with patch.object(SquareApiClient, "get_order", return_value=None):
+            response = self.url_open(
+                "/square/webhook",
+                data=json.dumps(webhook_data),
+                headers={"Content-Type": "application/json"},
+            )
 
         self.assertEqual(response.status_code, 200)
         response_data = response.json()
@@ -1320,8 +1324,14 @@ class TestSquareWebhook(SquareHttpCase):
         self.assertTrue(refund._is_partial_refund())
 
         credit_note = refund.credit_note_id
-        self.assertTrue(credit_note)
-        sale_order.invalidate_recordset()
+        self.assertEqual(credit_note.reversed_entry_id, invoice)
+        self.assertEqual(credit_note.state, "posted")
+        self.assertAlmostEqual(credit_note.amount_total, 1.00, places=2)
+        self.assertAlmostEqual(credit_note.amount_residual, 0.00, places=2)
+        payment = credit_note.reconciled_payment_ids
+        self.assertEqual(len(payment), 1)
+        self.assertEqual(payment.payment_type, "outbound")
+        self.assertAlmostEqual(payment.amount, 1.00, places=2)
 
         # Verify order refund status
         self.assertEqual(sale_order.refund_status, "partially_refunded")
@@ -1331,12 +1341,18 @@ class TestSquareWebhook(SquareHttpCase):
         # Original order: 6 products at 0.50 each = 3.00 total
         # Refund: 1.00 = 33.33% of order
         # Expected returned quantity: 6 * 0.3333 = ~2.00 units
-        order_line = sale_order.order_line[0]
-        self.assertAlmostEqual(order_line.returned_qty, 2.00, places=1)
-        self.assertEqual(
-            order_line.effective_qty,
-            order_line.product_uom_qty - order_line.returned_qty,
-        )
+        order_line = sale_order.order_line.filtered(lambda line: line.product_uom_qty > 0)
+        self.assertEqual(len(order_line), 1)
+        self.assertEqual(order_line.product_uom_qty, 6)
+        self.assertEqual(order_line.returned_qty, 2)
+        self.assertEqual(order_line.effective_qty, 4)
+        self.assertEqual(order_line.qty_delivered, 4)
+        picking = refund.return_picking_ids
+        self.assertEqual(len(picking), 1)
+        self.assertEqual(picking.return_id, delivery)
+        self.assertEqual(picking.state, "done")
+        self.assertEqual(picking.move_ids.origin_returned_move_id, delivery.move_ids)
+        self.assertEqual(picking.move_ids.quantity, 2)
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_full_refund_processing(self):
@@ -1433,74 +1449,3 @@ class TestSquareWebhook(SquareHttpCase):
         order_line = sale_order.order_line[0]
         self.assertEqual(order_line.returned_qty, order_line.product_uom_qty)
         self.assertEqual(order_line.effective_qty, 0.0)
-
-    @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
-    def test_multiple_partial_refunds(self):
-        """Partial COMPLETED refund on a delivered, invoiced order (stable in Odoo 17)."""
-
-        sale_order = self.env["sale.order"].create(
-            {
-                "partner_id": self.partner.id,
-                "square_order_id": "test_multiple_refunds_order_001",
-                "order_line": [
-                    (
-                        0,
-                        0,
-                        {
-                            "product_id": self.product.id,
-                            "product_uom_qty": 10,
-                            "price_unit": 0.50,  # Total: 5.00 EUR
-                        },
-                    )
-                ],
-            }
-        )
-
-        self._confirm_pick_deliver_invoice(sale_order)
-
-        webhook_data_1 = {
-            "merchant_id": "TEST_MERCHANT_ID",
-            "type": "refund.created",
-            "event_id": "test_multiple_refund_1_event_001",
-            "created_at": "2025-01-15T10:00:00.000Z",
-            "data": {
-                "type": "refund",
-                "id": "test_multiple_refund_001",
-                "object": {
-                    "refund": {
-                        "amount_money": {"amount": 100, "currency": "EUR"},  # 1.00 EUR
-                        "created_at": "2025-01-15T10:00:00.000Z",
-                        "destination_type": "CARD",
-                        "id": "test_multiple_refund_001",
-                        "location_id": "TEST_LOCATION",
-                        "order_id": "test_multiple_refunds_order_001",
-                        "payment_id": "test_payment_001",
-                        "reason": "Returned goods",
-                        "status": "COMPLETED",
-                        "updated_at": "2025-01-15T10:00:00.000Z",
-                        "version": 1,
-                    }
-                },
-            },
-        }
-
-        response_1 = self.url_open(
-            "/square/webhook",
-            data=json.dumps(webhook_data_1),
-            headers={"Content-Type": "application/json"},
-        )
-        self.assertEqual(response_1.status_code, 200)
-        self.assertEqual(response_1.json()["status"], "success")
-
-        sale_order.invalidate_recordset()
-        self.assertEqual(sale_order.refund_status, "partially_refunded")
-        self.assertEqual(sale_order.total_refunded_amount, 1.00)
-
-        order_line = sale_order.order_line[0]
-        self.assertAlmostEqual(order_line.returned_qty, 2.0, places=1)
-        self.assertAlmostEqual(order_line.effective_qty, 8.0, places=1)
-
-        refunds = self.env["square.refund"].search(
-            [("sale_order_id", "=", sale_order.id), ("status", "=", "completed")]
-        )
-        self.assertEqual(len(refunds), 1)

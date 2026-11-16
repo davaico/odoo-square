@@ -6,7 +6,6 @@ from unittest.mock import call, patch
 
 from odoo.tests import Form
 from odoo.tests.common import tagged
-from odoo.tools import mute_logger
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
 
 from .common import SquareHttpCase
@@ -143,7 +142,6 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         # Track created records for assertions
         self.created_sale_order = None
         self.created_invoice = None
-        self.created_credit_note = None
         self.created_customer = None
 
     def _set_initial_stock(self, product, warehouse, quantity):
@@ -244,24 +242,6 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         if not catalog_id or not isinstance(catalog_id, str):
             return {"success": False, "not_found": True}
         return self._mock_get_catalog_object(catalog_id)
-
-    def _confirm_deliver_invoice_mapped_wh(self, sale_order):
-        """Confirm SO, deliver from mapped W1, post invoice (for refund tests)."""
-        wh = self.warehouse_w1
-        for line in sale_order.order_line:
-            self._set_initial_stock(line.product_id, wh, 100)
-        sale_order.action_confirm()
-        picking = sale_order.picking_ids.filtered(
-            lambda p: p.picking_type_code == "outgoing"
-            and p.state not in ("done", "cancel")
-        )[:1]
-        self.assertTrue(picking)
-        picking.action_assign()
-        for move in picking.move_ids:
-            move.quantity = move.product_uom_qty
-        picking.button_validate()
-        inv = sale_order._create_invoices()
-        inv.action_post()
 
     def _get_stock_quantity(self, product, warehouse):
         """Get current stock quantity for a product in a warehouse"""
@@ -733,6 +713,51 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         ])
         self.assertEqual(len(completion_log), 1)
 
+    def test_partial_refund_of_paid_sale(self):
+        self._import_paid_square_sale()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        delivery = order.picking_ids
+        sale_payment = invoice.reconciled_payment_ids
+        refund_id = "REFUND_L1_PARTIAL"
+
+        result = self._send_square_refund_event(
+            "refund.created", "evt_partial_pending", refund_id, "PENDING", 120,
+            ("line_1",),
+        )
+        self.assertEqual(result["status"], "success", result)
+        refund = self._assert_refund_links(refund_id, 1.20)
+        self.assertEqual(refund.credit_note_id.state, "draft")
+        self.assertFalse(refund.credit_note_id.reconciled_payment_ids)
+        self.assertEqual(refund.status, "pending")
+        self.assertFalse(refund.processed_at)
+        return_picking = refund.return_picking_ids
+        self.assertEqual(len(return_picking), 1)
+        self.assertNotIn(return_picking.state, ("done", "cancel"))
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+
+        result = self._send_square_refund_event(
+            "refund.updated", "evt_partial_completed", refund_id, "COMPLETED", 120,
+            ("line_1",),
+        )
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(self._assert_refund_links(refund_id, 1.20), refund)
+        self.assertEqual(refund.status, "completed")
+        self.assertTrue(refund.processed_at)
+        self.assertEqual(refund.return_picking_ids, return_picking)
+        payment = self._assert_refund_payment(refund)
+        self._assert_completed_return(refund, delivery, {self.product_p1: 1})
+        self.assertEqual(order.square_refund_ids, refund)
+        self.assertEqual(invoice.reversal_move_ids, refund.credit_note_id)
+        self.assertEqual(invoice.reconciled_payment_ids, sale_payment)
+        self.assertAlmostEqual(invoice.amount_residual, 0, places=2)
+        self.assertEqual(
+            self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+            sale_payment | payment,
+        )
+        self.assertAlmostEqual(order.total_refunded_amount, 1.20, places=2)
+        self.assertEqual(order.refund_status, "partially_refunded")
+
     def test_unsuccessful_full_refunds_cancel_prepared_actions(self):
         self._import_paid_square_sale()
         order = self.created_sale_order
@@ -766,27 +791,93 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
         self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
 
-    @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
-    def test_complete_square_integration_scenario(self):
-        """Test the complete Square integration scenario"""
-
-        # ===== PHASE 1: Initial Setup Verification =====
+    def test_multiple_partial_refunds_and_replay(self):
         self._test_initial_setup()
-
-        # ===== PHASE 2: Sale Processing =====
         self._test_sale_processing()
-
-        # ===== PHASE 3: Stock Updates =====
         self._test_stock_updates()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        delivery = order.picking_ids
+        sale_payment = invoice.reconciled_payment_ids
+        original_lines = order.order_line
 
-        # ===== PHASE 4: Refund Processing =====
-        self._test_refund_processing()
+        first_refund = ("evt_partial_first", "REFUND_L1_FIRST", ("line_1",))
+        second_refund = ("evt_partial_second", "REFUND_L1_SECOND", ())
+        refunds = self.env["square.refund"]
+        notes = self.env["account.move"]
+        payments = self.env["account.payment"]
+        returns = self.env["stock.picking"]
 
-        # ===== PHASE 5: Stock Restoration =====
-        self._test_stock_restoration()
+        for event, expected_status, total, balance, p2_returned in (
+            (first_refund, "success", 1.20, 2.40, 0),
+            (first_refund, "already_processed", 1.20, 2.40, 0),
+            (second_refund, "success", 2.40, 1.20, 1),
+            (first_refund, "already_processed", 2.40, 1.20, 1),
+        ):
+            event_id, refund_id, line_ids = event
+            result = self._send_square_refund_event(
+                "refund.created", event_id, refund_id, "COMPLETED", 120, line_ids
+            )
+            self.assertEqual(result["status"], expected_status, result)
+            refund = self._assert_refund_links(refund_id, 1.20)
+            self.assertEqual(refund.status, "completed")
+            self.assertTrue(refund.processed_at)
+            self.assertEqual(refund.webhook_event_id, event_id)
+            payment = self._assert_refund_payment(refund)
+            product = self.product_p1 if event == first_refund else self.product_p2
+            self._assert_completed_return(refund, delivery, {product: 1})
 
-        # ===== PHASE 6: Final State Verification =====
-        self._test_final_state()
+            if expected_status == "success":
+                refunds |= refund
+                notes |= refund.credit_note_id
+                payments |= payment
+                returns |= refund.return_picking_ids
+            expected_count = 2 if p2_returned else 1
+            self.assertEqual(len(refunds), expected_count)
+            self.assertEqual(len(notes), expected_count)
+            self.assertEqual(len(payments), expected_count)
+            self.assertEqual(len(returns), expected_count)
+            self.assertEqual(order.square_refund_ids, refunds)
+            self.assertEqual(invoice.reversal_move_ids, notes)
+            self.assertEqual(refunds.credit_note_id, notes)
+            self.assertEqual(refunds.return_picking_ids, returns)
+            self.assertEqual(notes.reconciled_payment_ids, payments)
+            self.assertEqual(delivery.return_ids, returns)
+            self.assertEqual(
+                self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+                sale_payment | payments,
+            )
+            self.assertEqual(invoice.reconciled_payment_ids, sale_payment)
+            self.assertEqual(invoice.payment_state, "paid")
+            self.assertAlmostEqual(invoice.amount_residual, 0, places=2)
+            self.assertAlmostEqual(invoice.amount_total, 3.60, places=2)
+            self.assertAlmostEqual(order.total_refunded_amount, total, places=2)
+            self.assertAlmostEqual(sum(notes.mapped("amount_total")), total, places=2)
+            self.assertAlmostEqual(sum(payments.mapped("amount")), total, places=2)
+            self.assertAlmostEqual(invoice.amount_total - total, balance, places=2)
+            self.assertEqual(order.refund_status, "partially_refunded")
+
+            for product, sold, returned in (
+                (self.product_p1, 1, 1), (self.product_p2, 2, p2_returned),
+            ):
+                line = original_lines.filtered(lambda line: line.product_id == product)
+                self.assertEqual(line.product_uom_qty, sold)
+                self.assertEqual(line.returned_qty, returned)
+                self.assertEqual(line.effective_qty, sold - returned)
+                self.assertEqual(line.qty_delivered, sold - returned)
+                self.assertEqual(
+                    self._get_stock_quantity(product, self.warehouse_w1),
+                    50 - sold + returned,
+                )
+                self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
+
+            completion_log = self.env["square.integration.log"].search([
+                ("webhook_event_id", "=", event_id),
+                ("square_refund_id", "=", refund_id),
+                ("sale_order_id", "=", order.id),
+                ("status", "=", "success"),
+            ])
+            self.assertEqual(len(completion_log), 1)
 
     def _test_initial_setup(self):
         """Test initial setup: warehouses, products, stock levels"""
@@ -844,220 +935,52 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.assertIn(result["status"], ("success", "updated"), result)
         self._assert_paid_square_sale()
 
-    def _test_refund_processing(self):
-        """Test partial refund processing"""
-
-        # Create refund record manually for testing (simulating refund.created webhook)
-        refund_record = self.env["square.refund"].create(
-            {
-                "square_refund_id": "REFUND_L1_001",
-                "square_order_id": "ORDER_L1_001",
-                "status": "pending",
-                "refund_amount": 1.20,  # Partial refund for P1
-                "currency_id": self.env.ref("base.EUR").id,
-                "sale_order_id": self.created_sale_order.id,
-                "refund_reason": "Customer return",
-                "refunded_line_ids": ["line_1"],  # Refund P1 specifically
-                "webhook_event_id": "evt_refund_created_001",
-            }
-        )
-
-        # Same as webhook COMPLETED: pending actions then finalize
-        refund_record.action_process_refund()
-        refund_record.invalidate_recordset()
-        refund_record.write({"status": "completed"})
-        refund_record.action_process_refund()
-
-        # Verify refund status changed to completed
-        refund_record.invalidate_recordset()
-        self.assertEqual(refund_record.status, "completed")
-
-        # Verify credit note was created
-        self.assertTrue(refund_record.credit_note_id.exists())
-        self.created_credit_note = refund_record.credit_note_id
-        self.assertEqual(self.created_credit_note.state, "posted")
-        self.assertIn(
-            self.created_credit_note.payment_state,
-            ("paid", "partial", "in_payment"),
-        )
-
-        _logger.info("✓ Refund processing verification passed")
-
-    def _test_stock_restoration(self):
-        """Test stock restoration after refund"""
-
-        # Verify return picking was created and processed
-        return_pickings = self.env["stock.picking"].search(
-            [
-                ("sale_id", "=", self.created_sale_order.id),
-                ("picking_type_code", "=", "incoming"),
-            ]
-        )
-        if not return_pickings:
-            _logger.warning(
-                "No incoming return picking on sale order — skip stock restoration asserts"
-            )
-            return
-
-        # Verify return picking was processed (assuming it was auto-validated)
-        processed_returns = return_pickings.filtered(lambda p: p.state == "done")
-        if processed_returns:
-            self.assertGreaterEqual(
-                self._get_stock_quantity(self.product_p1, self.warehouse_w1), 50
-            )
-        else:
-            _logger.warning(
-                "Return picking not auto-processed - manual verification needed"
-            )
-
-        _logger.info("✓ Stock restoration verification passed")
-
-    def _test_final_state(self):
-        """Test final state of all records"""
-
-        # Verify sale order final state (SO total drops after partial refund / line updates)
-        self.assertEqual(self.created_sale_order.state, "sale")
-        self.created_sale_order.invalidate_recordset()
-        self.assertGreater(self.created_sale_order.amount_total, 0)
-        self.assertLessEqual(self.created_sale_order.amount_total, 3.60)
-
-        # Verify refund tracking
-        self.assertEqual(len(self.created_sale_order.square_refund_ids), 1)
-        refund = self.created_sale_order.square_refund_ids[0]
-        self.assertEqual(refund.status, "completed")
-        self.assertEqual(refund.refund_amount, 1.20)
-
-        # Verify total refunded amount
-        self.assertEqual(self.created_sale_order.total_refunded_amount, 1.20)
-
-        # Verify refund status
-        self.assertEqual(self.created_sale_order.refund_status, "partially_refunded")
-
-        # Verify final stock levels
-        self.assertGreaterEqual(
-            self._get_stock_quantity(self.product_p1, self.warehouse_w1), 50
-        )
-        self.assertLessEqual(
-            self._get_stock_quantity(self.product_p2, self.warehouse_w1), 50
-        )
-        self.assertEqual(
-            self._get_stock_quantity(self.product_p1, self.warehouse_w2), 50
-        )  # Unchanged
-        self.assertEqual(
-            self._get_stock_quantity(self.product_p2, self.warehouse_w2), 50
-        )  # Unchanged
-
-        # Verify invoice and credit note
-        self.assertAlmostEqual(self.created_invoice.amount_total, 3.60, places=2)
-        self.assertIn(
-            self.created_invoice.payment_state,
-            ("paid", "partial", "in_payment"),
-        )
-        self.assertTrue(self.created_credit_note.exists())
-        self.assertIn(
-            self.created_credit_note.payment_state,
-            ("paid", "partial", "in_payment"),
-        )
-
-        _logger.info("✓ Final state verification passed")
-
-    def test_refund_idempotency_simple(self):
-        """Test that the same refund is not processed twice (simple idempotency)"""
-
-        # First, simulate order creation and completion
-        self._test_sale_processing()
-        self._test_stock_updates()
-
-        # Create initial refund record
-        refund_record = self.env["square.refund"].create(
-            {
-                "square_refund_id": "REFUND_IDEMPOTENCY_TEST",
-                "square_order_id": "ORDER_L1_001",
-                "status": "pending",
-                "refund_amount": 1.00,
-                "currency_id": self.env.ref("base.EUR").id,
-                "sale_order_id": self.created_sale_order.id,
-            }
-        )
-
-        # Process the refund once (pending → actions → completed)
-        refund_record.action_process_refund()
-        refund_record.invalidate_recordset()
-        refund_record.write({"status": "completed"})
-        refund_record.action_process_refund()
-        refund_record.invalidate_recordset()
-        self.assertEqual(refund_record.status, "completed")
-
-        # Try to create the same refund again (simulate duplicate webhook)
-        duplicate_refund = self.env["square.refund"].create_from_square_data(
-            {
-                "id": "REFUND_IDEMPOTENCY_TEST",
-                "order_id": "ORDER_L1_001",
-                "status": "COMPLETED",
-                "amount_money": {"amount": 100, "currency": "EUR"},
-            },
-            self.created_sale_order,
-        )
-
-        # Should return the existing completed refund, not create a new one
-        self.assertEqual(duplicate_refund.id, refund_record.id)
-        self.assertEqual(duplicate_refund.status, "completed")
-
-        _logger.info("✓ Simple refund idempotency test passed")
-
     def test_partial_refund_single_line_quantity_fix(self):
-        """Test that partial refund on single line order returns exact quantity"""
+        """Return one unit when the refund matches the VAT-inclusive unit price."""
+        square_order = self._mock_get_order("ORDER_L1_001")
+        square_order["line_items"] = [dict(
+            square_order["line_items"][0],
+            quantity="2",
+            total_money={"amount": 240, "currency": "EUR"},
+            total_tax_money={"amount": 40, "currency": "EUR"},
+        )]
+        square_order["total_money"]["amount"] = 240
+        square_order["total_tax_money"]["amount"] = 40
+        square_order["tenders"][0]["amount_money"]["amount"] = 240
 
-        self._test_sale_processing()
+        with patch.object(SquareApiClient, "get_order", return_value=square_order):
+            result = self._send_square_order_event(
+                "order.updated", "evt_single_line_sale", "COMPLETED"
+            )
+            self.assertIn(result["status"], ("success", "updated"), result)
+            order = self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")])
+            self.assertEqual(len(order), 1)
+            self.created_sale_order = order
+            self.created_invoice = invoice = order.invoice_ids
+            self.assertEqual(len(invoice), 1)
+            self.assertAlmostEqual(invoice.amount_total, 2.40, places=2)
+            self.assertAlmostEqual(invoice.amount_residual, 0.0, places=2)
+            self.assertEqual(invoice.payment_state, "paid")
+            delivery = order.picking_ids
+            self.assertEqual(len(delivery), 1)
+            self.assertEqual(delivery.state, "done")
+            line = order.order_line
+            self.assertEqual(len(line), 1)
+            self.assertEqual(line.product_uom_qty, 2)
+            self.assertEqual(line.qty_delivered, 2)
+            self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 48)
 
-        # Draft order: keep one line only, then confirm / deliver / invoice
-        single_line = self.created_sale_order.order_line[0]
-        other_lines = self.created_sale_order.order_line.filtered(
-            lambda l: l.id != single_line.id
-        )
-        if other_lines:
-            other_lines.unlink()
+            result = self._send_square_refund_event(
+                "refund.created", "evt_single_line_refund", "SINGLE_LINE_REFUND_TEST",
+                "COMPLETED", 120,
+            )
 
-        single_line.product_uom_qty = 2
-        single_line.price_unit = 1.0  # €1.20 per unit including VAT
-
-        self._confirm_deliver_invoice_mapped_wh(self.created_sale_order)
-
-        # Refund one item at its VAT-inclusive price
-        refund_record = self.env["square.refund"].create(
-            {
-                "square_refund_id": "SINGLE_LINE_REFUND_TEST",
-                "square_order_id": "ORDER_L1_001",
-                "status": "pending",
-                "refund_amount": 1.20,
-                "currency_id": self.env.ref("base.EUR").id,
-                "sale_order_id": self.created_sale_order.id,
-            }
-        )
-
-        refund_record.action_process_refund()
-        refund_record.invalidate_recordset()
-        refund_record.write({"status": "completed"})
-        refund_record.action_process_refund()
-        refund_record.invalidate_recordset()
-        self.assertEqual(refund_record.status, "completed")
-
-        # Refresh the line to get updated values
-        single_line.invalidate_recordset()
-
-        # Verify that exactly 1 unit was returned (not 1.2 or other proportional amount)
-        self.assertEqual(
-            single_line.returned_qty,
-            1.0,
-            "A refund of one unit’s price should return exactly one unit",
-        )
-
-        # Verify order quantity is updated correctly
-        self.assertEqual(
-            single_line.product_uom_qty, 2.0, "Order line quantity should remain 2"
-        )
-        self.assertGreaterEqual(single_line.qty_delivered, 1.0)
-
-        self.assertTrue(refund_record.credit_note_id)
-
-        _logger.info("✓ Single line partial refund quantity fix test passed")
+        self.assertEqual(result["status"], "success", result)
+        refund = self._assert_refund_links("SINGLE_LINE_REFUND_TEST", 1.20)
+        self._assert_refund_payment(refund)
+        self._assert_completed_return(refund, delivery, {self.product_p1: 1})
+        self.assertEqual(line.product_uom_qty, 2)
+        self.assertEqual(line.qty_delivered, 1)
+        self.assertEqual(line.returned_qty, 1)
+        self.assertEqual(line.effective_qty, 1)
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
