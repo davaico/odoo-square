@@ -48,7 +48,8 @@ class TestStockReturn(SquareHttpCase):
                 "name": "Cardigan Selmana Jaune S",
                 "default_code": "25FWFESUCARSLMJAC-S",
                 "list_price": 110.00,
-                "type": "product",
+                "type": "consu",
+                "is_storable": True,
             }
         )
 
@@ -405,11 +406,7 @@ class TestStockReturn(SquareHttpCase):
         "odoo.addons.odoo_square.models.square_order_processor",
     )
     def test_sync_skips_when_payload_has_returns(self):
-        """
-        When an order.updated (OPEN) payload contains a 'returns' key,
-        _sync_order_line_changes should not be called at all — the return
-        must go through the dedicated refund/exchange flow.
-        """
+        """An open order update carrying returns leaves the sale line intact."""
         processor = self.env["square.order.processor"]
 
         so = self.env["sale.order"].create(
@@ -451,15 +448,16 @@ class TestStockReturn(SquareHttpCase):
                 {
                     "uid": "line_ret_1",
                     "name": "Cardigan Selmana Jaune S",
-                    "quantity": "0",
-                    "total_money": {"amount": 0, "currency": "EUR"},
+                    "quantity": "3",
+                    "total_money": {"amount": 33000, "currency": "EUR"},
                 }
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        result = processor.process_square_order_update(order_data, so)
 
         line.invalidate_recordset()
+        self.assertEqual(result["status"], "updated")
         self.assertEqual(
             line.product_uom_qty,
             1,
