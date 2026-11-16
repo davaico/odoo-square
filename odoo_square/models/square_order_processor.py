@@ -1646,6 +1646,8 @@ class SquareOrderProcessor(models.Model):
             )
             return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error finding outbound payment method line: {str(e)}")
             return None
@@ -1686,6 +1688,8 @@ class SquareOrderProcessor(models.Model):
 
             return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error finding payment journal: {str(e)}")
             return None

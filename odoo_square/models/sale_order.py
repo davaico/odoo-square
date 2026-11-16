@@ -87,17 +87,25 @@ class SaleOrder(models.Model):
         version = order_data.get("version")
         return version if type(version) is int and 0 < version <= 2**31 - 1 else 0
 
-    def _square_applied_order_version(self):
+    def _square_order_snapshot(self):
+        """Read the original Square order stored as a Python dictionary literal."""
         self.ensure_one()
-        if self.square_order_version or not self.square_order_data:
-            return self.square_order_version
-
-        # Imported quotes already retain the original Square snapshot as str(dict).
+        if not self.square_order_data:
+            return {}
         try:
             order_data = literal_eval(self.square_order_data)
         except (SyntaxError, ValueError):
-            return 0
-        if isinstance(order_data, dict) and "line_items" in order_data:
+            return {}
+        return order_data if isinstance(order_data, dict) else {}
+
+    def _square_applied_order_version(self):
+        self.ensure_one()
+        if self.square_order_version:
+            return self.square_order_version
+
+        # Imported quotes already retain the original Square snapshot as str(dict).
+        order_data = self._square_order_snapshot()
+        if "line_items" in order_data:
             return self._square_snapshot_version(order_data)
         return 0
 

@@ -145,9 +145,11 @@ class SquareRefund(models.Model):
             return self.browse(result[0])
 
     def create_from_square_data(self, refund_data, sale_order):
-        """
-        Create a refund record from Square webhook data
-        """
+        """Create or update a refund record from Square webhook data."""
+        refund, _details_changed = self._upsert_from_square_data(refund_data, sale_order)
+        return refund
+
+    def _upsert_from_square_data(self, refund_data, sale_order):
         if not refund_data:
             raise ValidationError("Refund data is required")
 
@@ -191,9 +193,16 @@ class SquareRefund(models.Model):
         if existing_refund:
             if existing_refund.sale_order_id != sale_order:
                 raise ValidationError("Square refund is already linked to a different sale order")
+            details_changed = False
             if not existing_refund.processed_at:
+                previous_items = existing_refund.refunded_line_ids
+                updated_items = vals.get("refunded_line_ids", previous_items)
+                details_changed = (
+                    currency.compare_amounts(refund_amount, existing_refund.refund_amount) != 0
+                    or set(updated_items or ()) != set(previous_items or ())
+                )
                 existing_refund.write(vals)
-            return existing_refund
+            return existing_refund, details_changed
 
         vals.update({
             "square_refund_id": square_refund_id,
@@ -202,7 +211,7 @@ class SquareRefund(models.Model):
             "webhook_event_id": refund_data.get("webhook_event_id"),
         })
         try:
-            return self.with_user(self._get_bot_user()).create(vals)
+            return self.with_user(self._get_bot_user()).create(vals), False
         except errors.UniqueViolation as error:
             if error.diag.constraint_name != f"{self._table}_square_refund_id_unique":
                 raise
@@ -232,7 +241,7 @@ class SquareRefund(models.Model):
             }
 
         with self.env.cr.savepoint():
-            refund_record = self.with_user(self._get_bot_user()).create_from_square_data(
+            refund_record, details_changed = self.with_user(self._get_bot_user())._upsert_from_square_data(
                 refund_data, sale_order
             )
 
@@ -245,7 +254,7 @@ class SquareRefund(models.Model):
 
             if webhook_event_id:
                 refund_record.webhook_event_id = webhook_event_id
-            refund_record.action_process_refund()
+            refund_record.with_context(square_refund_details_changed=details_changed).action_process_refund()
 
         # Log webhook processing
         self.env["square.integration.log"].log_square_event(
@@ -565,7 +574,8 @@ class SquareRefund(models.Model):
             for line in return_lines:
                 line.quantity = available[line]
         elif self.refunded_line_ids:
-            self._configure_partial_return_lines(return_lines, available)
+            if not self._configure_partial_return_lines(return_lines, available, prepared):
+                return
         else:
             self._configure_proportional_return_lines(return_lines, available)
 
@@ -617,23 +627,51 @@ class SquareRefund(models.Model):
             else:
                 picking.action_cancel()
 
-    def _configure_partial_return_lines(self, return_lines, available):
+    def _configure_partial_return_lines(self, return_lines, available, prepared):
         legacy_lines = return_lines.filtered(lambda line: not line.move_id.sale_line_id.square_line_id)
-        square_items = []
-        if legacy_lines:
-            square_items = (self._fetch_order_details_from_square() or {}).get("line_items", [])
-        if return_lines == legacy_lines and not square_items:
-            self._configure_proportional_return_lines(return_lines, available)
-            return
-
+        square_items = self._get_legacy_refund_items() if legacy_lines else []
+        item_ids = {}
         for line in return_lines:
             sale_line = line.move_id.sale_line_id
             square_uid = sale_line.square_line_id
             if not square_uid:
                 square_item = self._find_matching_square_line_item(sale_line, square_items)
                 square_uid = square_item.get("uid") if square_item else None
+            item_ids[line] = square_uid
+
+        if legacy_lines and prepared:
+            known_ids = set(self.sale_order_id.order_line.mapped("square_line_id")) | set(item_ids.values())
+            if not set(self.refunded_line_ids).issubset(known_ids):
+                # An existing explicit return may have been staged using a successful lookup.
+                if self.env.context.get("square_refund_details_changed"):
+                    raise UserError("Impossible d'identifier les articles du remboursement Square mis à jour")
+                return False
+
+        if return_lines == legacy_lines and not square_items:
+            self._configure_proportional_return_lines(return_lines, available)
+            return True
+
+        for line, square_uid in item_ids.items():
             if square_uid and square_uid in self.refunded_line_ids and available[line]:
                 line.write({"quantity": available[line], "to_refund": True})
+        return True
+
+    def _get_legacy_refund_items(self):
+        order_details = self._fetch_order_details_from_square() or {}
+        items = [item for item in order_details.get("line_items", []) if item.get("uid")]
+        if items:
+            return items
+
+        snapshot = self.sale_order_id._square_order_snapshot()
+        if (snapshot.get("id") or snapshot.get("order_id")) != self.square_order_id:
+            return []
+        items = snapshot.get("line_items")
+        if not isinstance(items, list):
+            return []
+        return [
+            item for item in items
+            if isinstance(item, dict) and item.get("uid")
+        ]
 
     def _configure_proportional_return_lines(self, return_lines, available):
         refundable_total = 0.0
@@ -664,15 +702,15 @@ class SquareRefund(models.Model):
                 if (
                     square_item.get("catalog_object_id")
                     == odoo_line.product_id.default_code
-                    or odoo_line.product_id.default_code in square_item.get("name", "")
+                    or odoo_line.product_id.default_code in (square_item.get("name") or "")
                 ):
                     return square_item
 
         # Fallback: match by product name similarity
         odoo_name = odoo_line.product_id.name.lower()
         for square_item in square_line_items:
-            square_name = square_item.get("name", "").lower()
-            if odoo_name in square_name or square_name in odoo_name:
+            square_name = (square_item.get("name") or "").lower()
+            if square_name and (odoo_name in square_name or square_name in odoo_name):
                 return square_item
 
         return None
