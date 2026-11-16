@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 from decimal import Decimal
-from odoo import models, fields
+from odoo import fields, models
+from odoo.exceptions import UserError
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
+from odoo.tools.float_utils import float_is_zero
 import logging
 
 _logger = logging.getLogger(__name__)
@@ -72,6 +75,48 @@ class SquareOrderProcessor(models.Model):
 
         return None
 
+    def _get_webhook_replay_result(self, order_id, order_state, event_type, event_id):
+        """Identify replayed order states and previously successful event IDs."""
+        logs = self.env["square.integration.log"].sudo()
+        # Open orders can receive several distinct updates before changing state.
+        # Deduplicate those updates by event ID so each change can be applied.
+        if event_type != "updated" or order_state not in ("OPEN", "DRAFT"):
+            state_domain = [("description", "ilike", f"state: {order_state}")]
+            if event_type == "updated" and str(order_state).upper() in (
+                "CANCELED",
+                "CANCELLED",
+            ):
+                # Match historical success logs for either spelling.
+                state_domain = [
+                    ("event_type", "=", "order_updated"),
+                    "|",
+                    ("description", "ilike", "state: CANCELED"),
+                    ("description", "ilike", "state: CANCELLED"),
+                ]
+            existing_log = logs.search(
+                [
+                    ("square_order_id", "=", order_id),
+                    ("status", "=", "success"),
+                ] + state_domain,
+                limit=1,
+            )
+
+            if existing_log:
+                _logger.info(
+                    f"Order {order_id} with state {order_state} already processed successfully, skipping event {event_id}"
+                )
+                return {
+                    "status": "already_processed",
+                    "order_id": order_id,
+                    "state": order_state,
+                }
+
+        if event_id and logs.search(
+            [("webhook_event_id", "=", event_id), ("status", "=", "success")], limit=1
+        ):
+            _logger.info(f"Event {event_id} already processed successfully, skipping")
+            return {"status": "already_processed", "event_id": event_id}
+
     def process_square_order(self, square_order_data):
         """
         Main entry point for processing Square order data from webhooks
@@ -83,48 +128,6 @@ class SquareOrderProcessor(models.Model):
 
         square_order_id = square_order_data.get("order_id")
         _logger.info(f"Processing Square order: {square_order_id}")
-
-        # EXCHANGE ORDER CHECK: Detect if this is an exchange order (has returns with source_order_id)
-        # Exchange orders should NOT create new Odoo orders - they modify the source order
-        returns = square_order_data.get("returns", [])
-        if returns:
-            source_order_id = None
-            for return_obj in returns:
-                if isinstance(return_obj, dict):
-                    source_order_id = return_obj.get("source_order_id")
-                    if source_order_id:
-                        break
-            
-            if source_order_id:
-                _logger.info(
-                    f"Order {square_order_id} is an exchange order (source: {source_order_id}), skipping creation. "
-                    f"Exchange should be processed via payment.updated webhook."
-                )
-                
-                # Log to integration dashboard
-                self.env["square.integration.log"].log_square_event(
-                    event_type="order_created",
-                    title=f"Exchange order detected - {square_order_id}",
-                    description=f"""
-                        <p><strong>Square Exchange Order Detected</strong></p>
-                        <ul>
-                            <li>Square Exchange Order ID: <strong>{square_order_id}</strong></li>
-                            <li>Source Order ID: <strong>{source_order_id}</strong></li>
-                            <li>Action: Creation ignored (exchange is processed via payment.updated)</li>
-                            <li>Note: Cet ordre représente la transaction d'échange et ne doit pas créer de nouveau devis</li>
-                        </ul>
-                    """,
-                    status="info",
-                    square_order_id=square_order_id,
-                )
-                
-                return {
-                    "status": "success",
-                    "message": f"Exchange order {square_order_id} detected, skipping creation (processed via payment webhook)",
-                    "square_order_id": square_order_id,
-                    "source_order_id": source_order_id,
-                    "is_exchange": True,
-                }
 
         # IDEMPOTENCY CHECK: Ensure we don't create duplicate orders
         # This is the single point of duplicate detection to prevent race conditions
@@ -153,14 +156,54 @@ class SquareOrderProcessor(models.Model):
                 "square_order_id": square_order_id,
             }
 
+        bot_user = self._get_square_bot_user()
+        sale_orders = self.env["sale.order"].with_user(bot_user)
+        order_payload = sale_orders._fetch_square_order_payload(square_order_data)
+        # Exchange notifications may contain only metadata. The retrieved order
+        # lets us defer the exchange to payment.updated before creating a sale.
+        returns = square_order_data.get("returns") or order_payload.get("returns", [])
+        if returns:
+            source_order_id = None
+            for return_obj in returns:
+                if isinstance(return_obj, dict):
+                    source_order_id = return_obj.get("source_order_id")
+                    if source_order_id:
+                        break
+
+            if source_order_id:
+                _logger.info(
+                    f"Order {square_order_id} is an exchange order (source: {source_order_id}), skipping creation. "
+                    f"Exchange should be processed via payment.updated webhook."
+                )
+
+                # Log to integration dashboard
+                self.env["square.integration.log"].log_square_event(
+                    event_type="order_created",
+                    title=f"Exchange order detected - {square_order_id}",
+                    description=f"""
+                        <p><strong>Square Exchange Order Detected</strong></p>
+                        <ul>
+                            <li>Square Exchange Order ID: <strong>{square_order_id}</strong></li>
+                            <li>Source Order ID: <strong>{source_order_id}</strong></li>
+                            <li>Action: Creation ignored (exchange is processed via payment.updated)</li>
+                            <li>Note: Cet ordre représente la transaction d'échange et ne doit pas créer de nouveau devis</li>
+                        </ul>
+                    """,
+                    status="info",
+                    square_order_id=square_order_id,
+                )
+
+                return {
+                    "status": "success",
+                    "message": f"Exchange order {square_order_id} detected, skipping creation (processed via payment webhook)",
+                    "square_order_id": square_order_id,
+                    "source_order_id": source_order_id,
+                    "is_exchange": True,
+                }
+
+
         try:
-            # Get bot user for order creation
-            bot_user = self._get_square_bot_user()
-            sale_order = (
-                self.env["sale.order"]
-                .with_user(bot_user)
-                .create_from_square(square_order_data)
-            )
+            sale_order = sale_orders.create_from_square(order_payload, order_data_fetched=True)
 
             if not sale_order:
                 raise ValueError("Failed to create sale order")
@@ -246,6 +289,22 @@ class SquareOrderProcessor(models.Model):
                 self._process_order_completion(sale_order, square_order_data)
 
             elif square_order_state in ["OPEN", "DRAFT"]:
+                # A delayed update can arrive after the quote is closed.
+                if sale_order.state not in ("draft", "sent"):
+                    return result
+
+                snapshot_version = sale_order._square_snapshot_version(square_order_data)
+                # Square's order.updated notification contains order metadata.
+                if not any(
+                    key in square_order_data
+                    for key in ("line_items", "returns", "return_line_items")
+                ):
+                    fetched_order = self.env["square.api.client"].get_order(square_order_id)
+                    if not fetched_order:
+                        raise ValueError(f"Could not retrieve Square order {square_order_id}")
+                    snapshot_version = sale_order._square_snapshot_version(fetched_order)
+                    square_order_data = {**fetched_order, **square_order_data}
+
                 # Skip line sync when the payload carries return/exchange data;
                 # these must go through the dedicated refund/exchange flows only.
                 returns = square_order_data.get("returns") or square_order_data.get("return_line_items")
@@ -254,11 +313,26 @@ class SquareOrderProcessor(models.Model):
                         f"Order {square_order_id} contains return data in OPEN/DRAFT state, "
                         f"skipping line sync (will be handled by refund/exchange flow)"
                     )
-                else:
+                elif "line_items" in square_order_data:
+                    # Serialize version checks and line writes on the same order.
+                    self.env.cr.execute(
+                        "SELECT id FROM sale_order WHERE id = %s FOR UPDATE", (sale_order.id,)
+                    )
+                    if (
+                        snapshot_version
+                        and snapshot_version <= sale_order._square_applied_order_version()
+                    ):
+                        _logger.info(
+                            "Skipping Square order %s snapshot at version %s as already processed",
+                            square_order_id,
+                            snapshot_version,
+                        )
+                        return {**result, "status": "already_processed"}
                     self._sync_order_line_changes(sale_order, square_order_data)
+                    if snapshot_version:
+                        sale_order.square_order_version = snapshot_version
 
-            elif square_order_state in ("CANCELED", "CANCELLED"):
-                # Handle order cancellation (Square uses both spellings)
+            elif str(square_order_state).upper() in ("CANCELED", "CANCELLED"):
                 self._process_order_cancellation(sale_order, square_order_data)
 
             else:
@@ -328,16 +402,12 @@ class SquareOrderProcessor(models.Model):
                 f"Order {sale_order.name} already confirmed (state: {sale_order.state}), skipping confirmation"
             )
 
-        # Step 2: Generate and validate invoice
-        if not sale_order.invoice_ids.filtered(lambda inv: inv.state == "posted"):
-            invoice = self._create_and_validate_invoice(sale_order)
-            if invoice:
-                # Store invoice info for return
-                result = {"invoice_id": invoice.id, "invoice_name": invoice.name}
-
-        # Step 3: Create stock movements
+        # Complete the delivery before invoicing products billed on delivered quantities.
         square_location_id = square_order_data.get("location_id")
         self._create_stock_movements(sale_order, square_location_id)
+
+        if not sale_order.invoice_ids.filtered(lambda inv: inv.state == "posted"):
+            self._create_and_validate_invoice(sale_order)
 
         # TODO: fix TTC ammout
         # Step 4: Recalculate totals
@@ -401,10 +471,10 @@ class SquareOrderProcessor(models.Model):
                 # Update existing line
                 odoo_line = odoo_lines[square_line_id]
                 if odoo_line.product_uom_qty != quantity:
-                    odoo_line.write({"product_uom_qty": quantity})
                     updated_lines.append(
-                        f"{odoo_line.product_id.name}: {odoo_line.product_uom_qty} -> {quantity}"
+                        f"{odoo_line.product_id.name}: {odoo_line.product_uom_qty:g} -> {quantity}"
                     )
+                    odoo_line.write({"product_uom_qty": quantity})
                 odoo_lines.pop(square_line_id)
             else:
                 # This is a new line - for now, just log it
@@ -694,60 +764,44 @@ class SquareOrderProcessor(models.Model):
             raise
 
     def process_product_exchange(self, sale_order, order_data, payment_data):
-        """
-        Process product exchange from Square.
-
-        New flow (Return + Credit Note + New Sale + Reconcile):
-        1. Parse exchange data (returned and new products)
-        2. Idempotency check (skip if exchange SO already exists)
-        3. Create return pickings for returned products
-        4. Create credit note for returned items
-        5. Create new independent SO for replacement products
-        6. Confirm, deliver, and invoice the new SO
-        7. Reconcile credit note against new invoice + handle delta
-        """
-        square_order_id = order_data.get("order_id")
-        exchange_order_id = order_data.get("id") or square_order_id
+        """Complete the return, replacement, and accounting for a Square exchange."""
+        exchange_order_id = order_data.get("id") or order_data.get("order_id")
 
         _logger.info(
             f"Processing product exchange for order {sale_order.name} "
             f"(Square exchange ID: {exchange_order_id})"
         )
 
+        logs = self.env["square.integration.log"]
         try:
-            # Idempotency: check if exchange was FULLY processed (not just SO exists)
-            # Exchange is fully processed only if return pickings exist for original order
-            existing_exchange_so = None
-            if exchange_order_id:
-                existing_exchange_so = self.env["sale.order"].search(
-                    [("square_order_id", "=", exchange_order_id)], limit=1
-                )
-                if existing_exchange_so:
-                    # Check if return pickings exist for original order (from exchange)
-                    # Return pickings have incoming type and come from Customers location
-                    customer_location = self.env.ref("stock.stock_location_customers")
-                    return_pickings = self.env["stock.picking"].search([
-                        ("origin", "=", sale_order.name),
-                        ("picking_type_id.code", "=", "incoming"),
-                        ("location_id", "=", customer_location.id),
-                        ("state", "=", "done"),
-                    ])
-                    if return_pickings:
-                        _logger.info(
-                            f"Exchange fully processed: SO {existing_exchange_so.name} exists "
-                            f"and return pickings {return_pickings.mapped('name')} exist, skipping"
-                        )
-                        return {
-                            "status": "skipped",
-                            "message": f"Exchange already processed as {existing_exchange_so.name}",
-                            "sale_order_id": existing_exchange_so.id,
-                            "sale_order_name": existing_exchange_so.name,
-                        }
-                    else:
-                        _logger.info(
-                            f"Exchange SO {existing_exchange_so.name} exists but no return pickings "
-                            f"found - continuing with exchange flow to create return pickings"
-                        )
+            existing_exchange_so = self.env["sale.order"].search(
+                [("square_order_id", "=", exchange_order_id)], limit=1
+            )
+            processed = logs.search(
+                [
+                    ("event_type", "=", "exchange_processed"),
+                    ("status", "=", "success"),
+                    ("square_order_id", "=", exchange_order_id),
+                    ("sale_order_id", "=", sale_order.id),
+                ],
+                limit=1,
+            )
+            if processed:
+                return {
+                    "status": "skipped",
+                    "message": f"Exchange {exchange_order_id} already processed",
+                    "sale_order_id": existing_exchange_so.id,
+                    "sale_order_name": existing_exchange_so.name,
+                }
+
+            # Previously imported replacements may already have a reconciled credit.
+            replacement_receivables = existing_exchange_so.invoice_ids.line_ids.filtered(
+                lambda line: line.account_type == "asset_receivable"
+            )
+            original_credit = replacement_receivables.full_reconcile_id.reconciled_line_ids.move_id.filtered(
+                lambda move: move.move_type == "out_refund"
+                and move.reversed_entry_id in sale_order.invoice_ids
+            )[:1]
 
             # Parse return line items and current line items
             returns = order_data.get("returns", [])
@@ -766,7 +820,7 @@ class SquareOrderProcessor(models.Model):
                 return_line_items = order_data.get("return_line_items", [])
 
             if not return_line_items:
-                _logger.error(f"No return line items found in order {square_order_id}")
+                _logger.error(f"No return line items found in order {exchange_order_id}")
                 return {
                     "status": "error",
                     "message": "No return line items found in order data",
@@ -831,73 +885,74 @@ class SquareOrderProcessor(models.Model):
             if not returned_products and not new_products:
                 _logger.warning(
                     f"No exchange detected - no returned or new products "
-                    f"found for order {square_order_id}"
+                    f"found for order {exchange_order_id}"
                 )
                 return {"status": "ignored", "message": "No exchange detected"}
 
-            # Step 1: Create return pickings for returned products
-            self._create_return_pickings_for_exchange(sale_order, returned_products)
+            with self.env.cr.savepoint():
+                credit_note = original_credit
+                if returned_products:
+                    completed_returns = sale_order.picking_ids.return_ids.filtered(
+                        lambda picking: picking.state == "done"
+                    )
+                    if not (credit_note and completed_returns):
+                        self._create_return_pickings_for_exchange(sale_order, returned_products)
+                    if not credit_note:
+                        credit_note = self._create_exchange_credit_note(
+                            sale_order, returned_products, order_data
+                        )
 
-            # Step 2: Create credit note for returned items
-            credit_note = self._create_exchange_credit_note(
-                sale_order, returned_products, order_data
-            )
-
-            # Step 3: Get or create new independent SO for replacement products
-            # If existing_exchange_so was found earlier, use it instead of creating new
-            new_sale_order = existing_exchange_so
-            _logger.info(
-                f"Step 3: existing_exchange_so={existing_exchange_so.name if existing_exchange_so else None}, "
-                f"new_products count={len(new_products)}"
-            )
-            if not new_sale_order and new_products:
-                new_sale_order = self._create_exchange_sale_order(
-                    sale_order, new_products, order_data, exchange_order_id
+                new_sale_order = existing_exchange_so
+                if not new_sale_order and new_products:
+                    new_sale_order = self._create_exchange_sale_order(
+                        sale_order, new_products, order_data, exchange_order_id
+                    )
+                new_invoice = (
+                    self._complete_exchange_sale_order(new_sale_order) if new_sale_order else None
                 )
 
-            # Step 4: Confirm, deliver, and invoice the new SO
-            new_invoice = None
-            if new_sale_order:
-                new_invoice = self._complete_exchange_sale_order(new_sale_order)
+                bot_user = self._get_square_bot_user()
+                if credit_note and new_invoice:
+                    self._reconcile_exchange_documents(
+                        credit_note, new_invoice, new_sale_order, sale_order
+                    )
+                elif credit_note:
+                    self._create_payment_for_credit_note(credit_note, sale_order, bot_user)
+                elif new_invoice:
+                    self._create_payment_for_invoice(new_invoice, new_sale_order, bot_user)
 
-            # Step 5: Reconcile credit note + new invoice + handle delta
-            bot_user = self._get_square_bot_user()
-            if credit_note and new_invoice:
-                self._reconcile_exchange_documents(
-                    credit_note, new_invoice, new_sale_order, sale_order
+                for document in (credit_note, new_invoice):
+                    if document and not document.currency_id.is_zero(document.amount_residual):
+                        raise UserError(f"Exchange document {document.name} could not be settled.")
+
+                # Log successful exchange processing
+                new_so_name = new_sale_order.name if new_sale_order else "N/A"
+                credit_note_name = credit_note.name if credit_note else "N/A"
+                new_invoice_name = new_invoice.name if new_invoice else "N/A"
+
+                log = logs.log_square_event(
+                    event_type="exchange_processed",
+                    title=f"Échange traité: {sale_order.name} → {new_so_name}",
+                    description=f"""
+                        <p><strong>Échange Square Traité avec Succès</strong></p>
+                        <ul>
+                            <li>ID Commande Square: <strong>{exchange_order_id}</strong></li>
+                            <li>Commande Originale: <strong>{sale_order.name}</strong></li>
+                            <li>Nouvelle Commande: <strong>{new_so_name}</strong></li>
+                            <li>Avoir: <strong>{credit_note_name}</strong></li>
+                            <li>Nouvelle Facture: <strong>{new_invoice_name}</strong></li>
+                            <li>Produits Retournés: {len(returned_products)}</li>
+                            <li>Nouveaux Produits: {len(new_products)}</li>
+                            <li>Date Échange: {fields.Datetime.now()}</li>
+                        </ul>
+                    """,
+                    status="success",
+                    square_order_id=exchange_order_id,
+                    sale_order_id=sale_order.id,
                 )
-            elif credit_note and not new_invoice:
-                # Only returns, no new products — refund the credit note
-                self._create_payment_for_credit_note(credit_note, sale_order, bot_user)
-            elif new_invoice and not credit_note:
-                # Only new products, no returns — register payment for new invoice
-                self._create_payment_for_invoice(new_invoice, new_sale_order, bot_user)
 
-            # Log successful exchange processing
-            new_so_name = new_sale_order.name if new_sale_order else "N/A"
-            credit_note_name = credit_note.name if credit_note else "N/A"
-            new_invoice_name = new_invoice.name if new_invoice else "N/A"
-
-            self.env["square.integration.log"].log_square_event(
-                event_type="order_updated",
-                title=f"Échange traité: {sale_order.name} → {new_so_name}",
-                description=f"""
-                    <p><strong>Échange Square Traité avec Succès</strong></p>
-                    <ul>
-                        <li>ID Commande Square: <strong>{square_order_id}</strong></li>
-                        <li>Commande Originale: <strong>{sale_order.name}</strong></li>
-                        <li>Nouvelle Commande: <strong>{new_so_name}</strong></li>
-                        <li>Avoir: <strong>{credit_note_name}</strong></li>
-                        <li>Nouvelle Facture: <strong>{new_invoice_name}</strong></li>
-                        <li>Produits Retournés: {len(returned_products)}</li>
-                        <li>Nouveaux Produits: {len(new_products)}</li>
-                        <li>Date Échange: {fields.Datetime.now()}</li>
-                    </ul>
-                """,
-                status="success",
-                square_order_id=square_order_id,
-                sale_order_id=sale_order.id,
-            )
+                if not log:
+                    raise UserError(f"Could not log completed exchange {exchange_order_id}.")
 
             return {
                 "status": "success",
@@ -911,6 +966,8 @@ class SquareOrderProcessor(models.Model):
                 "new_invoice": new_invoice_name,
             }
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error processing exchange for order {sale_order.name}: {str(e)}",
@@ -918,199 +975,103 @@ class SquareOrderProcessor(models.Model):
             )
 
             self.env["square.integration.log"].log_square_event(
-                event_type="order_updated",
+                event_type="exchange_processed",
                 title=f"Échec du traitement d'échange pour {sale_order.name}",
                 description=f"""
                     <p><strong>Erreur de Traitement d'Échange Square</strong></p>
                     <ul>
-                        <li>ID Commande Square: <strong>{square_order_id}</strong></li>
+                        <li>ID Commande Square: <strong>{exchange_order_id}</strong></li>
                         <li>Commande Odoo: <strong>{sale_order.name}</strong></li>
                         <li>Erreur: {str(e)}</li>
                         <li>Action: Traitement manuel nécessaire</li>
                     </ul>
                 """,
                 status="error",
-                square_order_id=square_order_id,
+                square_order_id=exchange_order_id,
                 sale_order_id=sale_order.id,
             )
 
             raise
-    
+
     def _create_return_pickings_for_exchange(self, sale_order, returned_products):
-        """Create return pickings for products returned in an exchange"""
-        try:
-            warehouse = self._get_configured_warehouse()
-            
-            if not warehouse:
-                _logger.error("No warehouse configured for return pickings")
-                return []
-            
-            # Check if return pickings already exist for this order (idempotency)
-            customer_location = self.env.ref("stock.stock_location_customers")
-            existing_returns = self.env["stock.picking"].search([
-                ("picking_type_id.code", "=", "incoming"),
-                ("location_id", "=", customer_location.id),
-                ("state", "=", "done"),
-                "|",
-                ("origin", "=", sale_order.name),
-                ("origin", "ilike", f"Retour de {sale_order.name.split('/')[0]}"),
-            ])
-            
-            # Also check returns linked via the original delivery pickings
-            delivery_pickings = sale_order.picking_ids.filtered(
-                lambda p: p.picking_type_id.code == "outgoing" and p.state == "done"
-            )
-            for dp in delivery_pickings:
-                linked_returns = self.env["stock.picking"].search([
-                    ("origin", "ilike", f"Retour de {dp.name}"),
-                    ("state", "=", "done"),
-                ])
-                existing_returns |= linked_returns
-            
-            if existing_returns:
-                _logger.info(
-                    f"Return pickings already exist for order {sale_order.name}: "
-                    f"{existing_returns.mapped('name')}, skipping creation"
-                )
-                return existing_returns
-            
-            return_pickings = self.env["stock.picking"]
-            
-            if not delivery_pickings:
-                _logger.warning(f"No validated delivery pickings found for order {sale_order.name}")
-                # Create manual return picking
-                return_picking = self._create_manual_return_picking(
-                    sale_order, returned_products, warehouse
-                )
-                if return_picking:
-                    return_pickings |= return_picking
-            else:
-                # Create return for each delivery picking
-                for delivery_picking in delivery_pickings:
-                    return_picking = self._create_return_from_picking(
-                        delivery_picking, returned_products
-                    )
-                    if return_picking:
-                        return_pickings |= return_picking
-            
-            return return_pickings
-            
-        except Exception as e:
-            _logger.error(f"Error creating return pickings for exchange: {str(e)}", exc_info=True)
-            return self.env["stock.picking"]
-    
+        """Return the requested quantities across the original deliveries."""
+        delivery_pickings = sale_order.picking_ids.filtered(
+            lambda picking: picking.picking_type_code == "outgoing" and picking.state == "done"
+        )
+        if not delivery_pickings:
+            warehouse = sale_order.warehouse_id or self._get_configured_warehouse()
+            self._create_manual_return_picking(sale_order, returned_products, warehouse)
+            return
+
+        remaining = returned_products.copy()
+        for delivery in delivery_pickings:
+            self._create_return_from_picking(delivery, remaining)
+
+        if any(remaining.values()):
+            raise UserError(f"Could not return all exchange items for {sale_order.name}.")
+
     def _create_manual_return_picking(self, sale_order, returned_products, warehouse):
-        """Create a manual return picking when no validated delivery exists"""
-        try:
-            # Create return picking
-            return_picking_vals = {
+        """Create a manual return picking when no validated delivery exists."""
+        customer_location = self.env.ref("stock.stock_location_customers")
+        return_picking = self.env["stock.picking"].create(
+            {
                 "picking_type_id": warehouse.in_type_id.id,
-                "location_id": self.env.ref("stock.stock_location_customers").id,
+                "location_id": customer_location.id,
                 "location_dest_id": warehouse.lot_stock_id.id,
                 "origin": sale_order.name,
                 "partner_id": sale_order.partner_id.id,
             }
-            
-            return_picking = self.env["stock.picking"].create(return_picking_vals)
-            
-            # Add move lines for returned products
-            for catalog_id, quantity in returned_products.items():
-                order_line = sale_order.order_line.filtered(
-                    lambda l: l.square_catalog_id == catalog_id
-                ).sorted(key=lambda l: l.id, reverse=True)
-                
-                if not order_line:
-                    continue
-                    
-                order_line = order_line[0]
-                
-                move_vals = {
+        )
+        for catalog_id, quantity in returned_products.items():
+            order_line = sale_order.order_line.filtered(
+                lambda line: line.square_catalog_id == catalog_id
+            ).sorted(key=lambda line: line.id, reverse=True)[:1]
+            if not order_line:
+                raise UserError(f"Could not find exchange item {catalog_id} on {sale_order.name}.")
+
+            self.env["stock.move"].create(
+                {
                     "name": f"Return: {order_line.product_id.name}",
                     "product_id": order_line.product_id.id,
                     "product_uom_qty": quantity,
                     "product_uom": order_line.product_uom.id,
                     "picking_id": return_picking.id,
-                    "location_id": self.env.ref("stock.stock_location_customers").id,
+                    "location_id": customer_location.id,
                     "location_dest_id": warehouse.lot_stock_id.id,
                 }
-                
-                self.env["stock.move"].create(move_vals)
-            
-            # Check if any moves were created
-            if not return_picking.move_ids:
-                _logger.warning(f"No moves created for return picking, skipping validation")
-                return None
-            
-            # Confirm and assign
-            return_picking.action_confirm()
-            return_picking.action_assign()
-            
-            # Use _force_quantity_for_square to create move lines properly
-            return_picking._force_quantity_for_square()
-            
-            # Validate with force_validate context
-            return_picking.with_context(force_validate=True).button_validate()
-            
-            _logger.info(f"Created and validated manual return picking {return_picking.name}, state={return_picking.state}")
-            return return_picking
-            
-        except Exception as e:
-            _logger.error(f"Error creating manual return picking: {str(e)}", exc_info=True)
-            return None
-    
-    def _create_return_from_picking(self, delivery_picking, returned_products):
-        """Create return picking from original delivery picking"""
-        try:
-            # Use Odoo's return picking wizard
-            return_wizard = self.env["stock.return.picking"].create({
-                "picking_id": delivery_picking.id,
-            })
-            
-            # Filter return lines to only include returned products
-            lines_to_keep = []
-            for line in return_wizard.product_return_moves:
-                # Check if this product is in returned_products
-                catalog_id = line.move_id.sale_line_id.square_catalog_id if line.move_id.sale_line_id else None
-                
-                if catalog_id in returned_products:
-                    line.quantity = min(line.quantity, returned_products[catalog_id])
-                    lines_to_keep.append(line.id)
-                else:
-                    # Remove this line
-                    line.unlink()
-            
-            if not return_wizard.product_return_moves:
-                _logger.warning(f"No matching products to return from picking {delivery_picking.name}")
-                return None
-            
-            # Create the return
-            result = return_wizard.create_returns()
-            return_picking_id = result.get("res_id")
-            
-            if not return_picking_id:
-                _logger.error(f"Failed to create return picking from {delivery_picking.name}")
-                return None
-            
-            return_picking = self.env["stock.picking"].browse(return_picking_id)
-            
-            # Confirm and assign to ensure proper state
-            if return_picking.state == 'draft':
-                return_picking.action_confirm()
-            if return_picking.state == 'confirmed':
-                return_picking.action_assign()
-            
-            # Use _force_quantity_for_square to create move lines properly
-            return_picking._force_quantity_for_square()
-            
-            # Validate with force_validate context
-            return_picking.with_context(force_validate=True).button_validate()
-            
-            _logger.info(f"Created and validated return picking {return_picking.name}, state={return_picking.state}")
-            return return_picking
-            
-        except Exception as e:
-            _logger.error(f"Error creating return from picking: {str(e)}", exc_info=True)
-            return None
+            )
+
+        return_picking.action_confirm()
+        return_picking.action_assign()
+        return_picking.with_context(force_validate=True).button_validate()
+        if return_picking.state != "done":
+            raise UserError(f"Exchange return {return_picking.name} could not be completed.")
+        return return_picking
+
+    def _create_return_from_picking(self, delivery_picking, remaining):
+        """Return matching delivered quantities using the Odoo 18 return action."""
+        wizard = self.env["stock.return.picking"].create({"picking_id": delivery_picking.id})
+        for line in wizard.product_return_moves:
+            move = line.move_id
+            catalog_id = move.sale_line_id.square_catalog_id
+            if not remaining.get(catalog_id):
+                continue
+
+            available = move._get_square_returnable_quantity(line.uom_id)
+            line.quantity = min(available, remaining[catalog_id])
+            remaining[catalog_id] -= line.quantity
+            if float_is_zero(remaining[catalog_id], precision_rounding=line.uom_id.rounding):
+                remaining[catalog_id] = 0
+
+        if not any(wizard.product_return_moves.mapped("quantity")):
+            return
+
+        action = wizard.action_create_returns()
+        return_picking = self.env["stock.picking"].browse(action["res_id"])
+        return_picking.with_context(force_validate=True).button_validate()
+        if return_picking.state != "done":
+            raise UserError(f"Exchange return {return_picking.name} could not be completed.")
+        return return_picking
 
     def _create_exchange_credit_note(self, sale_order, returned_products, order_data):
         """
@@ -1126,7 +1087,7 @@ class SquareOrderProcessor(models.Model):
                 _logger.error(
                     f"No posted invoice found for order {sale_order.name} to create credit note"
                 )
-                return None
+                raise UserError(f"Could not create an exchange credit note for {sale_order.name}.")
 
             original_invoice = posted_invoices[0]
             bot_user = self._get_square_bot_user()
@@ -1156,7 +1117,7 @@ class SquareOrderProcessor(models.Model):
 
             if not returned_product_info:
                 _logger.error(f"No returned products found for credit note of {sale_order.name}")
-                return None
+                raise UserError(f"Could not create an exchange credit note for {sale_order.name}.")
 
             # Create credit note manually with proper reversed_entry_id link
             credit_note_vals = {
@@ -1196,7 +1157,7 @@ class SquareOrderProcessor(models.Model):
                 f"Error creating exchange credit note for {sale_order.name}: {str(e)}",
                 exc_info=True,
             )
-            return None
+            raise
 
     def _create_exchange_sale_order(
         self, original_so, new_products, order_data, exchange_order_id
@@ -1208,17 +1169,6 @@ class SquareOrderProcessor(models.Model):
         try:
             bot_user = self._get_square_bot_user()
             api_client = self.env["square.api.client"]
-
-            # Re-check if SO was created by another process (race condition)
-            existing_so = self.env["sale.order"].search(
-                [("square_order_id", "=", exchange_order_id)], limit=1
-            )
-            if existing_so:
-                _logger.info(
-                    f"Exchange SO {existing_so.name} was created by another process, "
-                    f"using existing instead of creating new"
-                )
-                return existing_so
 
             # Look up 20% VAT tax (same pattern as sale_order.py)
             vat_tax = self.env["account.tax"].search(
@@ -1233,7 +1183,12 @@ class SquareOrderProcessor(models.Model):
             if not vat_tax:
                 raise ValueError("20% VAT tax not found in Odoo configuration")
 
-            warehouse = self._get_configured_warehouse()
+            location_id = order_data.get("location_id")
+            warehouse = (
+                self._get_warehouse_for_location(location_id)
+                if location_id
+                else original_so.warehouse_id
+            )
             so_vals = {
                 "partner_id": original_so.partner_id.id,
                 "square_order_id": exchange_order_id,
@@ -1265,12 +1220,12 @@ class SquareOrderProcessor(models.Model):
                     _logger.error(
                         f"Failed to fetch catalog object {catalog_id} from Square"
                     )
-                    continue
+                    raise UserError(f"Could not match Square exchange item {catalog_id}.")
 
                 sku = catalog_result.get("sku")
                 if not sku:
                     _logger.warning(f"No SKU found for catalog object {catalog_id}")
-                    continue
+                    raise UserError(f"Could not match Square exchange item {catalog_id}.")
 
                 product = self.env["product.product"].search(
                     [("default_code", "=", sku)], limit=1
@@ -1293,7 +1248,7 @@ class SquareOrderProcessor(models.Model):
                         square_order_id=exchange_order_id,
                         sale_order_id=original_so.id,
                     )
-                    continue
+                    raise UserError(f"Could not match Square exchange item {catalog_id}.")
 
                 # TTC → HT conversion using Decimal (same pattern as sale_order.py)
                 quantity = product_info["quantity"]
@@ -1321,29 +1276,15 @@ class SquareOrderProcessor(models.Model):
                 _logger.warning(
                     f"No order lines created for exchange SO {new_so.name}, deleting"
                 )
-                new_so.unlink()
-                return None
+                raise UserError(f"Could not create replacement lines for exchange {exchange_order_id}.")
 
             return new_so
 
         except Exception as e:
-            # Handle duplicate key constraint - SO was created by another process
-            if "sale_order_square_order_id_unique" in str(e):
-                _logger.info(
-                    f"Duplicate key constraint hit - exchange SO was created by another process, "
-                    f"fetching existing SO for {exchange_order_id}"
-                )
-                # Need to rollback and fetch existing
-                self.env.cr.rollback()
-                existing_so = self.env["sale.order"].search(
-                    [("square_order_id", "=", exchange_order_id)], limit=1
-                )
-                if existing_so:
-                    return existing_so
             _logger.error(
                 f"Error creating exchange sale order: {str(e)}", exc_info=True
             )
-            return None
+            raise
 
     def _complete_exchange_sale_order(self, new_sale_order):
         """Confirm, deliver, and invoice the new exchange SO. Returns the posted invoice."""
@@ -1371,7 +1312,9 @@ class SquareOrderProcessor(models.Model):
                             mail_auto_subscribe_no_notify=True,
                             mail_create_nosubscribe=True,
                         ).button_validate()
-                        _logger.info(f"Validated exchange picking {picking.name}")
+                    if picking.state != "done":
+                        raise UserError(f"Exchange delivery {picking.name} could not be completed.")
+                    _logger.info(f"Validated exchange picking {picking.name}")
 
             # Check if invoice already exists
             existing_invoices = new_sale_order.invoice_ids.filtered(
@@ -1387,7 +1330,7 @@ class SquareOrderProcessor(models.Model):
                 _logger.error(
                     f"Failed to create invoice for exchange SO {new_sale_order.name}"
                 )
-                return None
+                raise UserError(f"Could not invoice replacement order {new_sale_order.name}.")
 
             invoice = invoices[0] if len(invoices) > 1 else invoices
             invoice.with_user(bot_user).action_post()
@@ -1403,96 +1346,23 @@ class SquareOrderProcessor(models.Model):
                 f"Error completing exchange sale order {new_sale_order.name}: {str(e)}",
                 exc_info=True,
             )
-            return None
+            raise
 
     def _reconcile_exchange_documents(
         self, credit_note, new_invoice, new_sale_order, original_sale_order
     ):
-        """
-        Reconcile credit note against new invoice and handle any remaining delta.
-        After reconciliation:
-        - If new invoice has residual > 0: customer paid extra → register payment
-        - If credit note has residual > 0: customer gets refund → register refund
-        - If both residual = 0: equal exchange, done
-        """
-        try:
-            bot_user = self._get_square_bot_user()
+        """Offset the credit and replacement invoice, then record any difference."""
+        receivable_lines = (credit_note | new_invoice).line_ids.filtered(
+            lambda line: line.account_type == "asset_receivable" and not line.reconciled
+        )
+        if receivable_lines:
+            receivable_lines.reconcile()
 
-            # Get receivable account
-            receivable_account = credit_note.partner_id.property_account_receivable_id
-
-            # Get unreconciled receivable lines from both documents
-            credit_receivable_lines = credit_note.line_ids.filtered(
-                lambda line: line.account_id == receivable_account and not line.reconciled
-            )
-            invoice_receivable_lines = new_invoice.line_ids.filtered(
-                lambda line: line.account_id == receivable_account and not line.reconciled
-            )
-
-            if credit_receivable_lines and invoice_receivable_lines:
-                (credit_receivable_lines | invoice_receivable_lines).reconcile()
-                _logger.info(
-                    f"Reconciled credit note {credit_note.name} against invoice {new_invoice.name}"
-                )
-            else:
-                _logger.warning(
-                    f"Could not find receivable lines to reconcile: "
-                    f"credit={len(credit_receivable_lines)}, invoice={len(invoice_receivable_lines)}"
-                )
-
-            # Refresh residuals
-            credit_note.invalidate_recordset(["amount_residual", "payment_state"])
-            new_invoice.invalidate_recordset(["amount_residual", "payment_state"])
-
-            # Handle remaining residual
-            if new_invoice.amount_residual > 0.01:
-                # Customer paid extra → register payment for the remaining amount
-                _logger.info(
-                    f"Invoice {new_invoice.name} has residual {new_invoice.amount_residual}, "
-                    f"registering payment"
-                )
-                payment_journal = self._get_square_payment_journal()
-                payment_method_line = self._get_payment_method_line(payment_journal)
-                if payment_journal and payment_method_line:
-                    payment_register = (
-                        self.env["account.payment.register"]
-                        .with_context(
-                            active_model="account.move",
-                            active_ids=new_invoice.ids,
-                        )
-                        .with_user(bot_user)
-                        .create(
-                            {
-                                "journal_id": payment_journal.id,
-                                "payment_method_line_id": payment_method_line.id,
-                                "amount": new_invoice.amount_residual,
-                                "payment_date": new_invoice.invoice_date
-                                or fields.Date.today(),
-                            }
-                        )
-                    )
-                    payment_register.action_create_payments()
-                    _logger.info(
-                        f"Registered payment of {new_invoice.amount_residual} "
-                        f"for invoice {new_invoice.name}"
-                    )
-
-            elif credit_note.amount_residual > 0.01:
-                # Customer gets refund → register refund payment
-                _logger.info(
-                    f"Credit note {credit_note.name} has residual {credit_note.amount_residual}, "
-                    f"registering refund"
-                )
-                self._create_payment_for_credit_note(
-                    credit_note, original_sale_order, bot_user
-                )
-            else:
-                _logger.info("Equal exchange: credit note and invoice fully reconciled")
-
-        except Exception as e:
-            _logger.error(
-                f"Error reconciling exchange documents: {str(e)}", exc_info=True
-            )
+        bot_user = self._get_square_bot_user()
+        if not new_invoice.currency_id.is_zero(new_invoice.amount_residual):
+            self._create_payment_for_invoice(new_invoice, new_sale_order, bot_user)
+        elif not credit_note.currency_id.is_zero(credit_note.amount_residual):
+            self._create_payment_for_credit_note(credit_note, original_sale_order, bot_user)
 
     def _create_and_validate_invoice(self, sale_order):
         """Create and validate invoice for the sale order"""
@@ -1626,7 +1496,7 @@ class SquareOrderProcessor(models.Model):
                     {
                         "journal_id": payment_journal.id,
                         "payment_method_line_id": payment_method_line.id,
-                        "amount": invoice.amount_total,
+                        "amount": invoice.amount_residual,
                         "payment_date": invoice.invoice_date or fields.Date.today(),
                     }
                 )
@@ -1638,6 +1508,8 @@ class SquareOrderProcessor(models.Model):
             _logger.info(f"Successfully created payment for invoice {invoice.name}")
             return True
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Failed to create payment for invoice {invoice.name}: {str(e)}")
             return False
@@ -1682,6 +1554,8 @@ class SquareOrderProcessor(models.Model):
             _logger.info(f"Successfully created refund payment for credit note {credit_note.name}")
             return True
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Failed to create refund payment for credit note {credit_note.name}: {str(e)}")
             return False
@@ -1772,6 +1646,8 @@ class SquareOrderProcessor(models.Model):
             )
             return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error finding outbound payment method line: {str(e)}")
             return None
@@ -1812,6 +1688,8 @@ class SquareOrderProcessor(models.Model):
 
             return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error finding payment journal: {str(e)}")
             return None

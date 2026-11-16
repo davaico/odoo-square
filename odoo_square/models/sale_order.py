@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from ast import literal_eval
 from datetime import datetime, timezone
 from decimal import Decimal
 import logging
@@ -40,6 +41,13 @@ class SaleOrder(models.Model):
         copy=False,
     )
 
+    square_order_version = fields.Integer(
+        string="Square Order Version",
+        help="Version of the most recent Square order snapshot applied by line synchronization",
+        copy=False,
+        readonly=True,
+    )
+
     is_square_order = fields.Boolean(
         string="Is Square Order",
         compute="_compute_is_square_order",
@@ -74,6 +82,33 @@ class SaleOrder(models.Model):
         help="Current refund status of the order",
     )
 
+    @staticmethod
+    def _square_snapshot_version(order_data):
+        version = order_data.get("version")
+        return version if type(version) is int and 0 < version <= 2**31 - 1 else 0
+
+    def _square_order_snapshot(self):
+        """Read the original Square order stored as a Python dictionary literal."""
+        self.ensure_one()
+        if not self.square_order_data:
+            return {}
+        try:
+            order_data = literal_eval(self.square_order_data)
+        except (SyntaxError, ValueError):
+            return {}
+        return order_data if isinstance(order_data, dict) else {}
+
+    def _square_applied_order_version(self):
+        self.ensure_one()
+        if self.square_order_version:
+            return self.square_order_version
+
+        # Imported quotes already retain the original Square snapshot as str(dict).
+        order_data = self._square_order_snapshot()
+        if "line_items" in order_data:
+            return self._square_snapshot_version(order_data)
+        return 0
+
     @api.depends("square_order_id")
     def _compute_is_square_order(self):
         for order in self:
@@ -92,8 +127,17 @@ class SaleOrder(models.Model):
             total_refunded = sum(completed_refunds.mapped("refund_amount"))
             order.total_refunded_amount = total_refunded
 
+    def _square_refund_base_amount(self):
+        self.ensure_one()
+        invoices = self.invoice_ids.filtered(
+            lambda invoice: invoice.move_type == "out_invoice" and invoice.state == "posted"
+        )
+        # Return adjustment lines reduce the order total after each refund.
+        return sum(invoices.mapped("amount_total")) if invoices else self.amount_total
+
     @api.depends(
-        "square_refund_ids.refund_amount", "square_refund_ids.status", "amount_total"
+        "square_refund_ids.refund_amount", "square_refund_ids.status", "amount_total",
+        "invoice_ids.amount_total", "invoice_ids.state", "invoice_ids.move_type",
     )
     def _compute_refund_status(self):
         """Compute refund status"""
@@ -109,7 +153,9 @@ class SaleOrder(models.Model):
             # Determine refund status
             if total_refunded == 0:
                 order.refund_status = "not_refunded"
-            elif total_refunded >= order.amount_total:
+            elif order.currency_id.compare_amounts(
+                total_refunded, order._square_refund_base_amount()
+            ) >= 0:
                 order.refund_status = "fully_refunded"
             else:
                 order.refund_status = "partially_refunded"
@@ -256,7 +302,7 @@ class SaleOrder(models.Model):
         sale_order.invalidate_recordset(["create_date"])
 
     @api.model
-    def create_from_square(self, square_data):
+    def create_from_square(self, square_data, *, order_data_fetched=False):
         """
         Create a sale order from Square webhook data.
 
@@ -270,7 +316,9 @@ class SaleOrder(models.Model):
         try:
             # Note: Duplicate check is handled at the processor level for better idempotency
             # Get or create customer (returns API-enriched payload so created_at / line_items apply)
-            customer, square_data = self._get_or_create_customer_from_square(square_data)
+            customer, square_data = self._get_or_create_customer_from_square(
+                square_data, order_data_fetched=order_data_fetched
+            )
             if square_data.get("id") and not square_data.get("order_id"):
                 square_data["order_id"] = square_data["id"]
             square_order_id = square_data.get("order_id")
@@ -395,15 +443,8 @@ class SaleOrder(models.Model):
 
             raise
 
-    def _get_or_create_customer_from_square(self, square_data):
-        """
-        Get or create customer from Square order data.
-        Matching strategy: email -> phone -> name -> create new.
-
-        Returns:
-            tuple: (res.partner, order dict) — order dict is Retrieve Order payload when
-            the API call succeeds, otherwise the input payload (so ``created_at`` is not lost).
-        """
+    @api.model
+    def _fetch_square_order_payload(self, square_data):
         payload = dict(square_data or {})
         square_order_id = payload.get("order_id") or payload.get("id")
         if square_order_id:
@@ -424,7 +465,20 @@ class SaleOrder(models.Model):
                 _logger.error(
                     "Error fetching full order data for customer info: %s", str(e)
                 )
+        return payload
 
+    def _get_or_create_customer_from_square(self, square_data, *, order_data_fetched=False):
+        """
+        Get or create customer from Square order data.
+        Matching strategy: email -> phone -> name -> create new.
+
+        Returns:
+            tuple: (res.partner, order dict) — order dict is Retrieve Order payload when
+            the API call succeeds, otherwise the input payload (so ``created_at`` is not lost).
+        """
+        payload = (
+            dict(square_data) if order_data_fetched else self._fetch_square_order_payload(square_data)
+        )
         customer_info = self._extract_customer_info_from_square(payload)
 
         if not customer_info:

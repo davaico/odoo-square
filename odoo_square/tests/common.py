@@ -22,3 +22,10 @@ class SquareHttpCase(HttpCase):
         )
         self.env.invalidate_all()
         return res
+
+    def pay_invoice(self, invoice, journal=None):
+        values = {"journal_id": journal.id} if journal else {}
+        self.env["account.payment.register"].with_context(
+            active_model="account.move", active_ids=invoice.ids
+        ).create(values).action_create_payments()
+        self.assertAlmostEqual(invoice.amount_residual, 0, places=2)

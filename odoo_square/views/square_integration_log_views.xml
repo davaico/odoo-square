@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <odoo>
-    <!-- Square Integration Log Tree View -->
+    <!-- Square Integration Log List View -->
     <record id="view_square_integration_log_tree" model="ir.ui.view">
         <field name="name">square.integration.log.tree</field>
         <field name="model">square.integration.log</field>
         <field name="arch" type="xml">
-            <tree string="Square Integration Activity" 
+            <list string="Square Integration Activity"
                   decoration-success="status == 'success'" 
                   decoration-warning="status == 'warning'" 
                   decoration-danger="status == 'error'"
@@ -17,7 +17,7 @@
                 <field name="square_order_id" string="Square Order" optional="hide"/>
                 <field name="sale_order_id" string="Odoo Order" optional="hide"/>
                 <field name="processing_time" string="Time (s)" optional="hide" widget="float_time"/>
-            </tree>
+            </list>
         </field>
     </record>
 
@@ -114,8 +114,8 @@
                 <field name="sale_order_id"/>
                 
                 <templates>
-                    <t t-name="kanban-box">
-                        <div class="oe_kanban_card oe_kanban_global_click">
+                    <t t-name="card">
+                        <div>
                             <div class="o_kanban_record_top">
                                 <div class="o_kanban_record_headings">
                                     <strong class="o_kanban_record_title">
@@ -157,7 +157,7 @@
     <record id="action_square_integration_log" model="ir.actions.act_window">
         <field name="name">Activité de l'Intégration Square</field>
         <field name="res_model">square.integration.log</field>
-        <field name="view_mode">tree,form</field>
+        <field name="view_mode">list,form</field>
         <field name="context">{
             'search_default_filter_today': 1,
         }</field>

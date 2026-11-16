@@ -1,10 +1,17 @@
+name: odoo-square-v18-test
+
 services:
   db:
-    image: postgres:17.4
+    image: postgres:17.4@sha256:304ab813518754228f9f792f79d6da36359b82d8ecf418096c636725f8c930ad
     environment:
-      POSTGRES_DB: ${DB_NAME:-odoo}
+      POSTGRES_DB: ${DB_NAME:-odoo_square_v18_test}
       POSTGRES_USER: ${DB_USER:-odoo}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -h 127.0.0.1 -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 1s
+      timeout: 3s
+      retries: 30
     volumes:
       - odoo_square_test_pg:/var/lib/postgresql/data
     networks:
@@ -13,15 +20,24 @@ services:
   odoo:
     build: .
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     environment:
       - HOST=${DB_HOST:-db}
       - USER=${DB_USER:-odoo}
       - PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required}
     volumes:
       - odoo_square_test_data:/var/lib/odoo
-      - ./config:/etc/odoo
-      - .:/mnt/extra-addons
+      - ./config:/etc/odoo:ro
+      - .:/mnt/extra-addons:ro
+    command:
+      - odoo
+      - --database=${DB_NAME:-odoo_square_v18_test}
+      - --init=odoo_square
+      - --test-tags=${ODOO_TEST_TAGS:-/odoo_square}
+      - --workers=0
+      - --stop-after-init
+      - --log-level=test
     networks:
       - odoo-test-net
 

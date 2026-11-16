@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 # Copyright 2024 Davai
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
+import json
 import logging
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
-from odoo.tests import TransactionCase
+from odoo.tests import Form, TransactionCase
 from odoo.tests.common import tagged
 from odoo.exceptions import UserError, ValidationError
+from odoo.tools import mute_logger
+
+from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
+
+from .common import SquareHttpCase
 
 _logger = logging.getLogger(__name__)
 
@@ -345,3 +351,296 @@ class TestSquareManualResync(TransactionCase):
         # Check computed fields
         self.assertEqual(wizard.selected_total, 2)
         self.assertEqual(wizard.missing_total, 3)
+
+
+@tagged("post_install", "-at_install")
+class TestManualResyncRecovery(SquareHttpCase):
+    def _call_button(self, record, button):
+        response = self.url_open(
+            "/web/dataset/call_button",
+            data=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "call",
+                    "params": {
+                        "model": record._name,
+                        "method": button,
+                        "args": [record.ids],
+                        "kwargs": {},
+                    },
+                }
+            ),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertNotIn("error", response.json(), response.text)
+        return response.json()["result"]
+
+    def _scan_resync(self, config):
+        action = self._call_button(config, "action_open_manual_resync_wizard")
+        self.assertEqual(action["res_model"], "square.manual.resync.wizard")
+        self.assertEqual(action["target"], "new")
+        admin = self.env.ref("base.user_admin")
+        wizard = self.env[action["res_model"]].with_user(admin).browse(action["res_id"])
+        with Form(wizard, view="odoo_square.view_square_manual_resync_wizard_form") as form:
+            form.start_at = "2025-10-05 00:00:00"
+            form.end_at = "2025-10-08 23:59:59"
+        action = self._call_button(wizard, "action_scan_missing_orders")
+        self.assertEqual(action["res_id"], wizard.id)
+        self.assertEqual(action["target"], "new")
+        self.assertEqual(wizard.state, "results")
+        return wizard
+
+    def _unselect_order(self, wizard, order_id):
+        line_index = wizard.line_ids.mapped("square_order_id").index(order_id)
+        with Form(wizard, view="odoo_square.view_square_manual_resync_wizard_form") as form:
+            with form.line_ids.edit(line_index) as line:
+                line.selected = False
+
+    @mute_logger(
+        "odoo.addons.odoo_square.controllers.square_webhook",
+        "odoo.addons.odoo_square.models.square_api_client",
+        "odoo.addons.odoo_square.models.square_manual_resync",
+    )
+    def test_admin_recovers_only_selected_orders_and_can_repeat_scan(self):
+        self.authenticate("admin", "admin")
+        self.env.company.currency_id = self.env.ref("base.EUR")
+        partner = self.env["res.partner"].create(
+            {"name": "Resync Customer", "email": "resync@example.com"}
+        )
+        journal = self.env["account.journal"].create(
+            {"name": "Resync Receipts", "type": "bank", "code": "SQRS"}
+        )
+        tax = self.env["account.tax"].create(
+            {"name": "Square VAT 20%", "type_tax_use": "sale", "amount": 20}
+        )
+        other_warehouse = self.env["stock.warehouse"].search(
+            [("company_id", "=", self.env.company.id)], limit=1
+        )
+        warehouse = self.env["stock.warehouse"].create(
+            {"name": "Resync Warehouse", "code": "SQRS"}
+        )
+        product = self.env["product.product"].create(
+            {
+                "name": "Resync Item",
+                "default_code": "RESYNC-ITEM",
+                "type": "consu",
+                "is_storable": True,
+                "invoice_policy": "delivery",
+                "taxes_id": [(6, 0, tax.ids)],
+            }
+        )
+        for stock_warehouse, quantity in ((warehouse, 5), (other_warehouse, 9)):
+            self.env["stock.quant"].create(
+                {
+                    "product_id": product.id,
+                    "location_id": stock_warehouse.lot_stock_id.id,
+                    "quantity": quantity,
+                }
+            )
+        config = self.env["square.config"].create(
+            {
+                "name": "Resync Integration",
+                "square_application_id": "test_app_id",
+                "square_access_token": "test_access_token",
+                "payment_journal_id": journal.id,
+                "location_mapping_ids": [
+                    (
+                        0,
+                        0,
+                        {
+                            "square_location_id": "resync-location",
+                            "square_location_name": "Resync Location",
+                            "warehouse_id": warehouse.id,
+                        },
+                    )
+                ],
+            }
+        )
+        unavailable_id = "resync-01-unavailable"
+        paid_id = "resync-02-paid"
+        unselected_id = "resync-03-unselected"
+        existing_id = "resync-04-existing"
+        order_ids = [unavailable_id, paid_id, unselected_id, existing_id]
+        existing_order = self.env["sale.order"].create(
+            {"partner_id": partner.id, "square_order_id": existing_id}
+        )
+        square_order = {
+            "id": paid_id,
+            "location_id": "resync-location",
+            "state": "COMPLETED",
+            "created_at": "2025-10-06T12:00:00+02:00",
+            "line_items": [
+                {
+                    "uid": "resync-line",
+                    "name": "Resync Item",
+                    "catalog_object_id": "RESYNC-ITEM",
+                    "quantity": "2",
+                    "base_price_money": {"amount": 1250, "currency": "EUR"},
+                    "total_money": {"amount": 3000, "currency": "EUR"},
+                    "total_tax_money": {"amount": 500, "currency": "EUR"},
+                }
+            ],
+            "total_money": {"amount": 3000, "currency": "EUR"},
+            "total_tax_money": {"amount": 500, "currency": "EUR"},
+            "fulfillments": [
+                {"pickup_details": {"recipient": {"email_address": partner.email}}}
+            ],
+            "tenders": [
+                {
+                    "id": "resync-payment",
+                    "amount_money": {"amount": 3000, "currency": "EUR"},
+                }
+            ],
+        }
+        orders = {order_id: dict(square_order, id=order_id) for order_id in order_ids}
+        search_requests = []
+
+        def square_request(endpoint, method="GET", data=None, square_config=None):
+            if endpoint == "/v2/orders/search":
+                search_requests.append(data)
+                return {"orders": list(orders.values())}
+            if endpoint == f"/v2/orders/{unavailable_id}" and order_unavailable:
+                return {}
+            return {"order": orders[endpoint.removeprefix("/v2/orders/")].copy()}
+
+        mapped_stock = product.with_context(warehouse_id=warehouse.id)
+        other_stock = product.with_context(warehouse_id=other_warehouse.id)
+        self.assertEqual(mapped_stock.qty_available, 5)
+        self.assertEqual(other_stock.qty_available, 9)
+        invoice_domain = [("partner_id", "=", partner.id), ("move_type", "=", "out_invoice")]
+        payment_domain = [("partner_id", "=", partner.id)]
+        order_domain = [("square_order_id", "in", order_ids)]
+        log_domain = [("event_type", "=", "manual_resync")]
+        log_model = self.env["square.integration.log"]
+        order_unavailable = False
+        with patch.object(SquareApiClient, "_make_api_request", side_effect=square_request):
+            wizard = self._scan_resync(config)
+            self.assertEqual(
+                (wizard.square_total, wizard.odoo_total, wizard.missing_total), (4, 1, 3)
+            )
+            self.assertCountEqual(wizard.line_ids.mapped("square_order_id"), order_ids[:3])
+            self.assertEqual(wizard.selected_total, 3)
+            paid_line = wizard.line_ids.filtered(lambda line: line.square_order_id == paid_id)
+            self.assertEqual(paid_line.created_at, datetime(2025, 10, 6, 10))
+            self.assertEqual(paid_line.total_amount, 30)
+            self._unselect_order(wizard, unselected_id)
+            self.assertEqual(wizard.selected_total, 2)
+
+            # Another preview can still show the order after the first import.
+            stale_wizard = self._scan_resync(config)
+            self._unselect_order(stale_wizard, unselected_id)
+            self._unselect_order(stale_wizard, unavailable_id)
+            self.assertEqual(stale_wizard.selected_total, 1)
+
+            order_unavailable = True
+            action = self._call_button(wizard, "action_validate_resync")
+            self.assertEqual(action["res_id"], wizard.id)
+            self.assertEqual(action["target"], "new")
+            self.assertEqual(wizard.state, "done")
+            self.assertEqual((wizard.processed_count, wizard.error_count), (1, 1))
+            self.assertIn(
+                f"Could not fetch order {unavailable_id} from Square", wizard.error_details
+            )
+            warning_log = log_model.search(log_domain + [("status", "=", "warning")])
+            self.assertEqual(len(warning_log), 1)
+            self.assertIn(unavailable_id, warning_log.description)
+            self.assertIn("Successfully Processed: 1", warning_log.description)
+
+        orders_in_odoo = self.env["sale.order"].search(order_domain)
+        self.assertEqual(len(orders_in_odoo), 2)
+        self.assertEqual(existing_order.state, "draft")
+        self.assertFalse(existing_order.invoice_ids)
+        self.assertFalse(existing_order.picking_ids)
+        order = orders_in_odoo - existing_order
+        self.assertEqual(order.square_order_id, paid_id)
+        self.assertEqual(order.square_payment_id, "resync-payment")
+        self.assertEqual(order.state, "sale")
+        self.assertEqual(order.partner_id, partner)
+        self.assertEqual(order.warehouse_id, warehouse)
+        self.assertAlmostEqual(order.amount_total, 30, places=2)
+        self.assertEqual(order.order_line.product_id, product)
+        self.assertEqual(order.order_line.product_uom_qty, 2)
+        self.assertEqual(order.order_line.qty_delivered, 2)
+        delivery = order.picking_ids
+        self.assertEqual(len(delivery), 1)
+        self.assertEqual(delivery.picking_type_code, "outgoing")
+        self.assertEqual(delivery.state, "done")
+        self.assertEqual(delivery.location_id, warehouse.lot_stock_id)
+        self.assertEqual(delivery.move_ids.product_id, product)
+        self.assertEqual(sum(delivery.move_ids.mapped("quantity")), 2)
+        self.assertEqual(mapped_stock.qty_available, 3)
+        self.assertEqual(other_stock.qty_available, 9)
+
+        invoice = self.env["account.move"].search(invoice_domain)
+        self.assertEqual(len(invoice), 1)
+        self.assertEqual(order.invoice_ids, invoice)
+        self.assertEqual(invoice.state, "posted")
+        self.assertEqual(invoice.currency_id.name, "EUR")
+        self.assertAlmostEqual(invoice.amount_total, 30, places=2)
+        self.assertAlmostEqual(invoice.amount_residual, 0, places=2)
+        self.assertIn(invoice.payment_state, ("paid", "in_payment"))
+        payment = self.env["account.payment"].search(payment_domain)
+        self.assertEqual(len(payment), 1)
+        self.assertAlmostEqual(payment.amount, 30, places=2)
+        self.assertEqual(payment.currency_id, invoice.currency_id)
+        self.assertEqual(payment.payment_type, "inbound")
+        self.assertEqual(payment.journal_id, journal)
+        self.assertEqual(payment.move_id.state, "posted")
+        invoice_receivable = invoice.line_ids.filtered(
+            lambda line: line.account_type == "asset_receivable"
+        )
+        payment_receivable = payment.move_id.line_ids.filtered(
+            lambda line: line.account_type == "asset_receivable"
+        )
+        self.assertTrue(invoice_receivable.full_reconcile_id)
+        self.assertEqual(payment_receivable.full_reconcile_id, invoice_receivable.full_reconcile_id)
+
+        with patch.object(SquareApiClient, "_make_api_request", side_effect=square_request):
+            self._call_button(stale_wizard, "action_validate_resync")
+            self.assertEqual(stale_wizard.state, "done")
+            self.assertEqual((stale_wizard.processed_count, stale_wizard.error_count), (1, 0))
+            self.assertEqual(
+                log_model.search_count(log_domain + [("status", "=", "success")]), 1
+            )
+
+            order_unavailable = False
+            repeated_scan = self._scan_resync(config)
+            self.assertEqual(
+                (repeated_scan.square_total, repeated_scan.odoo_total, repeated_scan.missing_total),
+                (4, 2, 2),
+            )
+            self.assertCountEqual(
+                repeated_scan.line_ids.mapped("square_order_id"), [unavailable_id, unselected_id]
+            )
+            self.assertEqual(
+                self._call_button(repeated_scan, "action_close_wizard")["type"],
+                "ir.actions.act_window_close",
+            )
+
+        self.assertEqual(self.env["sale.order"].search(order_domain), orders_in_odoo)
+        self.assertEqual(order.picking_ids, delivery)
+        self.assertEqual(self.env["account.move"].search(invoice_domain), invoice)
+        self.assertEqual(self.env["account.payment"].search(payment_domain), payment)
+        self.assertAlmostEqual(invoice.amount_total, 30, places=2)
+        self.assertAlmostEqual(invoice.amount_residual, 0, places=2)
+        self.assertAlmostEqual(payment.amount, 30, places=2)
+        self.assertEqual(sum(delivery.move_ids.mapped("quantity")), 2)
+        self.assertEqual(mapped_stock.qty_available, 3)
+        self.assertEqual(other_stock.qty_available, 9)
+
+        self.assertEqual(len(search_requests), 3)
+        for request in search_requests:
+            self.assertEqual(request["location_ids"], ["resync-location"])
+            self.assertEqual(
+                request["query"]["filter"],
+                {
+                    "date_time_filter": {
+                        "created_at": {
+                            "start_at": "2025-10-05T00:00:00Z",
+                            "end_at": "2025-10-08T23:59:59Z",
+                        }
+                    },
+                    "state_filter": {"states": ["OPEN", "COMPLETED"]},
+                },
+            )

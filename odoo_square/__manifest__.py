@@ -3,7 +3,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 {
     "name": "Square POS Integration",
-    "version": "17.0.1.4.0",
+    "version": "18.0.1.4.0",
     "category": "Sales",
     "summary": "Complete Square POS integration for orders, refunds, exchanges and inventory sync",
     "description": """
@@ -20,7 +20,7 @@ Features:
     """,
     "author": "Davai",
     "website": "https://github.com/davaico/odoo-square",
-    "depends": ["base", "web", "sale", "sales_team", "account", "stock", "payment"],
+    "depends": ["base", "web", "sale", "sales_team", "account", "stock", "sale_stock", "payment"],
     "external_dependencies": {
         "python": ["requests"],
     },
