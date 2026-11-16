@@ -1607,6 +1607,41 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
             self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 50)
 
+    def test_pending_partial_refund_can_complete_as_full_refund(self):
+        self._import_paid_square_sale()
+        delivery = self.created_sale_order.picking_ids
+        refund_id = "REFUND_PARTIAL_TO_FULL"
+        self._send_square_refund_event(
+            "refund.created", "evt_partial_to_full_pending", refund_id, "PENDING", 240,
+        )
+        refund = self._assert_refund_links(refund_id, 2.40)
+        credit = refund.credit_note_id
+        provisional = refund.return_picking_ids
+        self.assertEqual(credit.state, "draft")
+        for event_id, expected_status in (
+            ("evt_partial_to_full_completed", "success"),
+            ("evt_partial_to_full_replayed", "already_processed"),
+        ):
+            result = self._send_square_refund_event(
+                "refund.updated", event_id, refund_id, "COMPLETED", 360,
+            )
+            self.assertEqual(result["status"], expected_status, result)
+            self.assertEqual(self._assert_refund_links(refund_id, 3.60), refund)
+            self.assertEqual(refund.credit_note_id, credit)
+            self._assert_refund_payment(refund)
+            self.assertEqual(self.created_invoice.reversal_move_ids, credit)
+            self.assertEqual(provisional.state, "cancel")
+            self.assertIn(provisional, refund.return_picking_ids)
+            active_returns = refund.return_picking_ids - provisional
+            self.assertEqual(active_returns.state, "done")
+            for product, quantity in ((self.product_p1, 1), (self.product_p2, 2)):
+                self.assertEqual(
+                    active_returns.move_ids.filtered(lambda move: move.product_id == product).quantity,
+                    quantity,
+                )
+                self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), 50)
+            self.assertEqual(delivery.return_ids, refund.return_picking_ids)
+
     def test_full_refund_retries_after_delayed_failure(self):
         self._assert_full_refund_retries_after_release("FAILED", prepare_later=True)
 

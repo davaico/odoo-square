@@ -752,12 +752,16 @@ class SquareRefund(models.Model):
             with self.env.cr.savepoint():
                 self._create_pending_refund_actions()
                 credit_note = self.credit_note_id
+                currency = credit_note.currency_id
                 if credit_note.state == "draft":
-                    if self._is_partial_refund():
+                    # A provisional partial refund can become a full refund.
+                    # Keep rejecting full amounts above the original invoice.
+                    if self._is_partial_refund() or currency.compare_amounts(
+                        self.refund_amount, credit_note.reversed_entry_id.amount_total
+                    ) == 0:
                         self._adjust_credit_note_for_partial_refund(credit_note)
                     credit_note.with_user(bot_user).action_post()
 
-                currency = credit_note.currency_id
                 if currency.compare_amounts(credit_note.amount_total, self.refund_amount) != 0:
                     raise UserError("Le montant de l'avoir ne correspond pas au remboursement Square")
 
