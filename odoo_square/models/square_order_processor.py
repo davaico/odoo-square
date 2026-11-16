@@ -328,16 +328,12 @@ class SquareOrderProcessor(models.Model):
                 f"Order {sale_order.name} already confirmed (state: {sale_order.state}), skipping confirmation"
             )
 
-        # Step 2: Generate and validate invoice
-        if not sale_order.invoice_ids.filtered(lambda inv: inv.state == "posted"):
-            invoice = self._create_and_validate_invoice(sale_order)
-            if invoice:
-                # Store invoice info for return
-                result = {"invoice_id": invoice.id, "invoice_name": invoice.name}
-
-        # Step 3: Create stock movements
+        # Complete the delivery before invoicing products billed on delivered quantities.
         square_location_id = square_order_data.get("location_id")
         self._create_stock_movements(sale_order, square_location_id)
+
+        if not sale_order.invoice_ids.filtered(lambda inv: inv.state == "posted"):
+            self._create_and_validate_invoice(sale_order)
 
         # TODO: fix TTC ammout
         # Step 4: Recalculate totals
