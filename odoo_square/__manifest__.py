@@ -35,7 +35,7 @@ Features:
         "views/square_webhook_queue_views.xml",
         "views/square_manual_resync_views.xml",
     ],
-    "images": ["static/description/icon.png"],
+    "images": ["static/description/square-terminal.png"],
     "installable": True,
     "auto_install": False,
     "application": True,
