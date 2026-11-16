@@ -55,15 +55,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             }
         )
 
-        # Create location mappings
-        self.env["square.location.mapping"].create(
-            {
-                "config_id": self.square_config.id,
-                "square_location_id": "L1",
-                "square_location_name": "Location L1",
-                "warehouse_id": self.warehouse_w1.id,
-            }
-        )
+        # Create the unrelated mapping first so fallback cannot pass the warehouse check.
         self.env["square.location.mapping"].create(
             {
                 "config_id": self.square_config.id,
@@ -72,11 +64,19 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                 "warehouse_id": self.warehouse_w2.id,
             }
         )
+        self.env["square.location.mapping"].create(
+            {
+                "config_id": self.square_config.id,
+                "square_location_id": "L1",
+                "square_location_name": "Location L1",
+                "warehouse_id": self.warehouse_w1.id,
+            }
+        )
 
         # Create payment journal for Square
         self.payment_journal = self.env["account.journal"].create(
             {
-                "name": "Square Payments",
+                "name": "Card Receipts",
                 "type": "bank",
                 "code": "SQ",
             }
