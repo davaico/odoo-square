@@ -1572,6 +1572,48 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 50)
         self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
 
+    def test_pending_refund_rejects_conflicting_order_details(self):
+        self._import_paid_square_sale()
+        order = self.created_sale_order
+        refund_id = "REFUND_ORDER_IDENTITY"
+        self._send_square_refund_event(
+            "refund.created", "evt_refund_identity_pending", refund_id, "PENDING", 120,
+            ("line_1",),
+        )
+        refund = self._assert_refund_links(refund_id, 1.20)
+        credit = refund.credit_note_id
+        prepared = refund.return_picking_ids
+        prepared_state = prepared.state
+        other_order = self.env["sale.order"].create({
+            "partner_id": self.customer.id,
+            "warehouse_id": self.warehouse_w1.id,
+            "pricelist_id": order.pricelist_id.id,
+            "square_order_id": "ORDER_CONFLICTING_REFUND",
+        })
+        self.created_sale_order = other_order
+        try:
+            result = self._send_square_refund_event(
+                "refund.updated", "evt_refund_identity_conflict", refund_id, "COMPLETED", 240,
+                ("line_2",),
+            )
+        finally:
+            self.created_sale_order = order
+        self.assertEqual(result["status"], "error", result)
+        self.assertEqual(refund.sale_order_id, order)
+        self.assertEqual(refund.square_order_id, order.square_order_id)
+        self.assertEqual(refund.status, "pending")
+        self.assertFalse(refund.processed_at)
+        self.assertEqual(refund.refund_amount, 1.20)
+        self.assertEqual(refund.refunded_line_ids, ["line_1"])
+        self.assertEqual(refund.credit_note_id, credit)
+        self.assertEqual(credit.state, "draft")
+        self.assertFalse(credit.reconciled_payment_ids)
+        self.assertEqual(refund.return_picking_ids, prepared)
+        self.assertEqual(prepared.state, prepared_state)
+        self.assertFalse(other_order.square_refund_ids)
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
+
     def test_completed_refund_replaces_provisional_return_selection(self):
         self._import_paid_square_sale()
         order = self.created_sale_order

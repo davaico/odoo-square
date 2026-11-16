@@ -476,6 +476,8 @@ class SquareRefund(models.Model):
         """
         Update an existing refund record with new Square webhook data
         """
+        if existing_refund.sale_order_id != sale_order:
+            raise ValidationError("Square refund is already linked to a different sale order")
         # Extract updated data
         amount_money = refund_data.get("amount_money", {})
         refund_amount = float(amount_money.get("amount", 0)) / 100.0
