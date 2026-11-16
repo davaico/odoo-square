@@ -257,31 +257,32 @@ class SquareWebhookController(http.Controller):
         # 2. Deduplication check based on order_id + state combination
         order_state = order_data.get("state")
 
-        # Check if we already processed this order in this state
-        existing_log = (
-            request.env["square.integration.log"]
-            .sudo()
-            .search(
-                [
-                    ("square_order_id", "=", order_id),
-                    ("status", "=", "success"),
-                    ("description", "ilike", f"state: {order_state}"),
-                ],
-                limit=1,
+        # An editable order can have several distinct updates in the same state.
+        if event_type != "updated" or order_state not in ("OPEN", "DRAFT"):
+            existing_log = (
+                request.env["square.integration.log"]
+                .sudo()
+                .search(
+                    [
+                        ("square_order_id", "=", order_id),
+                        ("status", "=", "success"),
+                        ("description", "ilike", f"state: {order_state}"),
+                    ],
+                    limit=1,
+                )
             )
-        )
 
-        if existing_log:
-            _logger.info(
-                f"Order {order_id} with state {order_state} already processed successfully, skipping event {event_id}"
-            )
-            return {
-                "status": "already_processed",
-                "order_id": order_id,
-                "state": order_state,
-            }
+            if existing_log:
+                _logger.info(
+                    f"Order {order_id} with state {order_state} already processed successfully, skipping event {event_id}"
+                )
+                return {
+                    "status": "already_processed",
+                    "order_id": order_id,
+                    "state": order_state,
+                }
 
-        # Also check for specific event_id deduplication as backup
+        # Check event identity for all states when an event ID is available.
         if event_id:
             existing_event_log = (
                 request.env["square.integration.log"]
