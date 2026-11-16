@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-from odoo import models, fields, api
+from odoo import Command, models, fields, api
 from odoo.exceptions import ValidationError, UserError, AccessError
+from odoo.tools.float_utils import float_round
 from datetime import timedelta
 import logging
 from psycopg2 import errorcodes, errors
@@ -348,6 +349,7 @@ class SquareRefund(models.Model):
                 if not self.invoice_id:
                     self.invoice_id = credit_note.reversed_entry_id
                 if credit_note.state == "draft":
+                    self._adjust_credit_note_for_partial_refund(credit_note)
                     credit_note.with_user(bot_user).action_post()
 
                 # Refunds previously posted and paid during preparation can still
@@ -377,9 +379,19 @@ class SquareRefund(models.Model):
                     if picking.state != "done":
                         raise UserError(f"Le retour {picking.name} n'a pas été validé")
 
-                self._update_order_line_quantities_from_square(
-                    self._fetch_order_details_from_square()
-                )
+                if self.return_picking_ids:
+                    for move in self.return_picking_ids.move_ids:
+                        line = move.origin_returned_move_id.sale_line_id
+                        if line and move.state == "done":
+                            qty = move.product_uom._compute_quantity(
+                                move.quantity, line.product_uom
+                            )
+                            returned_qty = line.update_returned_quantity(qty)
+                            self._add_adjustment_line(line, returned_qty, bot_user)
+                elif not self._get_completed_deliveries():
+                    self._update_order_line_quantities_from_square(
+                        self._fetch_order_details_from_square()
+                    )
                 self.write({"processed_at": fields.Datetime.now(), "processing_errors": False})
 
                 self.sale_order_id.with_user(bot_user).with_context(
@@ -398,7 +410,7 @@ class SquareRefund(models.Model):
                     "id": self.square_refund_id,
                     "order_id": self.square_order_id,
                     "amount_money": {
-                        "amount": int(self.refund_amount * 100),  # Convert to cents
+                        "amount": round(self.refund_amount * 100),
                         "currency": self.currency_id.name,
                     },
                 }
@@ -438,176 +450,90 @@ class SquareRefund(models.Model):
                 )
 
     def _is_partial_refund(self):
-        """
-        Determine if this is a partial refund based on amount and line items
-        """
-        # Check if refund amount is less than order total (with small tolerance for rounding)
-        amount_tolerance = 0.01  # 1 cent tolerance
-        if self.refund_amount < (self.sale_order_id.amount_total - amount_tolerance):
-            return True
+        """Compare against the original invoice total before any refund adjustments."""
+        return bool(self.refunded_line_ids) or self.currency_id.compare_amounts(
+            self.refund_amount, self.sale_order_id._square_refund_base_amount()
+        ) < 0
 
-        # If specific line IDs are provided, it's definitely a partial refund
-        # (even if the amount matches, it might be for specific items)
-        if self.refunded_line_ids and len(self.refunded_line_ids) > 0:
-            return True
-
-        # Check if there are already other refunds for this order
-        existing_refunds = self.env["square.refund"].search(
-            [
-                ("sale_order_id", "=", self.sale_order_id.id),
-                ("id", "!=", self.id),  # Exclude current refund
-                ("status", "in", ["completed", "pending"]),
-            ]
+    def _get_completed_deliveries(self):
+        return self.sale_order_id.picking_ids.filtered(
+            lambda picking: picking.picking_type_code == "outgoing" and picking.state == "done"
         )
-
-        if existing_refunds:
-            # If there are other refunds, this could be additional partial refund
-            total_refunded = sum(existing_refunds.mapped("refund_amount"))
-            remaining_amount = self.sale_order_id.amount_total - total_refunded
-
-            # If this refund amount is less than remaining amount, it's partial
-            if self.refund_amount < (remaining_amount - amount_tolerance):
-                return True
-
-        return False
 
     def _create_partial_return_picking(self):
-        """
-        Create return picking for specific line items based on Square refund data
-        """
-        sale_order = self.sale_order_id
-
-        # Get bot user for all operations
-        bot_user = (
-            self.env["res.users"].sudo().search([("login", "=", "square_bot")], limit=1)
-        )
-
-        if not bot_user:
-            _logger.warning(
-                "Square bot user not found, using current user for return picking creation"
-            )
-            bot_user = self.env.user
-
-        # Find the original delivery picking
-        delivery_picking = sale_order.picking_ids.filtered(
-            lambda p: p.picking_type_code == "outgoing" and p.state == "done"
-        )
-
-        if not delivery_picking:
-            # For physical store orders where items are handed directly to customers,
-            # there are no delivery pickings. Skip return picking creation.
-            _logger.info(
-                f"No delivery picking found for sale order {sale_order.name}. "
-                f"This appears to be a physical store order where items are handed directly to customers. "
-                f"Skipping partial return picking creation for refund {self.square_refund_id}."
-            )
+        """Prepare partial returns against the quantities left on each delivery."""
+        deliveries = self._get_completed_deliveries()
+        if not deliveries:
             return
 
-        # Create return picking wizard
-        return_wizard = (
-            self.env["stock.return.picking"]
-            .with_user(bot_user)
-            .with_context(active_id=delivery_picking.id, active_model="stock.picking")
-            .create({})
-        )
-
-        # Configure return lines based on Square refund data
+        wizard_model = self.env["stock.return.picking"].with_user(self._get_bot_user())
+        wizards = wizard_model.create([{"picking_id": delivery.id} for delivery in deliveries])
+        return_lines = wizards.product_return_moves.filtered(lambda line: line.move_id.sale_line_id)
+        available = {line: self._get_unreturned_quantity(line) for line in return_lines}
         if self.refunded_line_ids:
-            self._configure_partial_return_lines(return_wizard, delivery_picking)
+            self._configure_partial_return_lines(return_lines, available)
         else:
-            # If no specific line IDs, calculate proportionally based on refund amount
-            self._configure_proportional_return_lines(return_wizard, delivery_picking)
+            self._configure_proportional_return_lines(return_lines, available)
 
-        if any(return_wizard.product_return_moves.mapped("quantity")):
-            result = return_wizard.action_create_returns()
-            self.return_picking_ids = [(4, result["res_id"])]
+        for wizard in wizards:
+            if any(wizard.product_return_moves.mapped("quantity")):
+                result = wizard.action_create_returns()
+                self.return_picking_ids = [Command.link(result["res_id"])]
 
-    def _configure_partial_return_lines(self, return_wizard, delivery_picking):
-        """
-        Configure return lines based on specific refunded line IDs from Square
-        """
-        # Get order details from Square to match line items
-        order_details = self._fetch_order_details_from_square()
-
-        if not order_details or not order_details.get("line_items"):
-            _logger.warning(
-                f"No order details available from Square for refund {self.square_refund_id}, "
-                "falling back to proportional distribution"
+    def _get_unreturned_quantity(self, return_line):
+        move = return_line.move_id
+        uom = return_line.uom_id
+        delivered = move.product_uom._compute_quantity(move.quantity, uom, round=False)
+        reserved_for_returns = sum(
+            returned.product_uom._compute_quantity(
+                returned.quantity if returned.state == "done" else returned.product_uom_qty,
+                uom,
+                round=False,
             )
-            self._configure_proportional_return_lines(return_wizard, delivery_picking)
-            return
-
-        # Match Square line items with Odoo order lines and configure return quantities
-        square_line_items = order_details["line_items"]
-
-        for return_line in return_wizard.product_return_moves:
-            odoo_line = return_line.move_id.sale_line_id
-            if not odoo_line:
-                continue
-
-            # Find matching Square line item
-            matching_square_item = self._find_matching_square_line_item(
-                odoo_line, square_line_items
-            )
-
-            if matching_square_item and self._should_return_line_item(
-                matching_square_item
-            ):
-                # Calculate return quantity based on Square data
-                return_quantity = self._calculate_return_quantity_for_line(
-                    odoo_line, matching_square_item
-                )
-
-                if return_quantity > 0:
-                    return_line.to_refund = True
-                    return_line.quantity = return_quantity
-                    _logger.info(
-                        f"Configured return for line {odoo_line.product_id.name}: "
-                        f"quantity {return_quantity}"
-                    )
-                else:
-                    return_line.to_refund = False
-            else:
-                return_line.to_refund = False
-
-    def _configure_proportional_return_lines(self, return_wizard, delivery_picking):
-        """
-        Configure return lines proportionally based on refund amount when no specific line data
-        """
-        # Calculate proportional distribution based on refund amount
-        total_order_amount = sum(
-            line.price_subtotal for line in self.sale_order_id.order_line
+            for returned in move.returned_move_ids
+            if returned.state != "cancel"
+        )
+        return float_round(
+            max(0, delivered - reserved_for_returns),
+            precision_rounding=uom.rounding,
+            rounding_method="DOWN",
         )
 
-        if total_order_amount <= 0:
-            _logger.warning(
-                f"Total order amount is zero for refund {self.square_refund_id}"
-            )
+    def _configure_partial_return_lines(self, return_lines, available):
+        legacy_lines = return_lines.filtered(lambda line: not line.move_id.sale_line_id.square_line_id)
+        square_items = []
+        if legacy_lines:
+            square_items = (self._fetch_order_details_from_square() or {}).get("line_items", [])
+        if return_lines == legacy_lines and not square_items:
+            self._configure_proportional_return_lines(return_lines, available)
             return
 
-        refund_ratio = self.refund_amount / total_order_amount
+        for line in return_lines:
+            sale_line = line.move_id.sale_line_id
+            square_uid = sale_line.square_line_id
+            if not square_uid:
+                square_item = self._find_matching_square_line_item(sale_line, square_items)
+                square_uid = square_item.get("uid") if square_item else None
+            if square_uid and square_uid in self.refunded_line_ids and available[line]:
+                line.write({"quantity": available[line], "to_refund": True})
 
-        for return_line in return_wizard.product_return_moves:
-            odoo_line = return_line.move_id.sale_line_id
-            if not odoo_line:
-                continue
-
-            # Calculate return quantity proportionally
-            proportional_quantity = odoo_line.product_uom_qty * refund_ratio
-
-            # Ensure we don't return more than was originally delivered
-            max_returnable = odoo_line.product_uom_qty - odoo_line.returned_qty
-            return_quantity = min(proportional_quantity, max_returnable)
-
-            if return_quantity > 0:
-                return_line.to_refund = True
-                return_line.quantity = return_quantity
-                _logger.info(
-                    f"Configured proportional return for line {odoo_line.product_id.name}: "
-                    f"quantity {return_quantity} (ratio: {refund_ratio:.2%})"
+    def _configure_proportional_return_lines(self, return_lines, available):
+        refundable_total = 0.0
+        for line in return_lines:
+            sale_line = line.move_id.sale_line_id
+            if sale_line.product_uom_qty > 0:
+                qty = line.uom_id._compute_quantity(
+                    available[line], sale_line.product_uom, round=False
                 )
-            else:
-                return_line.to_refund = False
+                refundable_total += sale_line.price_total * qty / sale_line.product_uom_qty
+        if refundable_total <= 0:
+            return
+
+        ratio = min(self.refund_amount / refundable_total, 1)
+        for line in return_lines:
+            qty = float_round(available[line] * ratio, precision_rounding=line.uom_id.rounding)
+            if qty > 0:
+                line.write({"quantity": qty, "to_refund": True})
 
     def _find_matching_square_line_item(self, odoo_line, square_line_items):
         """
@@ -633,50 +559,13 @@ class SquareRefund(models.Model):
 
         return None
 
-    def _should_return_line_item(self, square_item):
-        """
-        Determine if a line item should be returned based on refund data
-        """
-        if not self.refunded_line_ids:
-            return True  # Return all items if no specific line data
-
-        # Check if this line item is in the refunded lines
-        square_line_uid = square_item.get("uid")
-        if square_line_uid and square_line_uid in self.refunded_line_ids:
-            return True
-
-        return False
-
-    def _calculate_return_quantity_for_line(self, odoo_line, square_item):
-        """
-        Calculate the return quantity for a specific line item
-        """
-        # Get the original quantity from Square data
-        original_quantity = float(square_item.get("quantity", "0"))
-
-        # Square webhook line data does not provide already-refunded quantity; assume original as baseline.
-
-        # For partial refunds, we need to determine how much of this line was refunded
-        # This is a simplified approach - in practice, Square refund data should specify quantities
-        if self.refunded_line_ids and square_item.get("uid") in self.refunded_line_ids:
-            # If this line is specifically mentioned in refund, return the full remaining quantity
-            remaining_quantity = odoo_line.product_uom_qty - odoo_line.returned_qty
-            return min(remaining_quantity, original_quantity)
-
-        return 0
-
     def _create_full_return_picking(self):
-        """
-        Create full return picking for complete refund
-        """
-        deliveries = self.sale_order_id.picking_ids.filtered(
-            lambda picking: picking.picking_type_code == "outgoing" and picking.state == "done"
-        )
+        """Return the full delivery for an initial full refund."""
         wizard_model = self.env["stock.return.picking"].with_user(self._get_bot_user())
-        for delivery in deliveries:
+        for delivery in self._get_completed_deliveries():
             wizard = wizard_model.create({"picking_id": delivery.id})
             result = wizard.action_create_returns_all()
-            self.return_picking_ids = [(4, result["res_id"])]
+            self.return_picking_ids = [Command.link(result["res_id"])]
 
     def _create_credit_note(self):
         """
@@ -737,6 +626,7 @@ class SquareRefund(models.Model):
             _logger.error(f"Credit note with ID {credit_note_id} does not exist")
             raise UserError("L'avoir créé n'existe pas")
 
+        self._adjust_credit_note_for_partial_refund(credit_note)
         return credit_note
 
     def _update_order_line_quantities(self):
@@ -1232,96 +1122,38 @@ class SquareRefund(models.Model):
         _logger.debug(f"No matching order line found for Square item: {item_name}")
         return None
 
-    def _adjust_credit_note_for_partial_refund(
-        self, credit_note, invoice, order_details=None
-    ):
-        """
-        Adjust the credit note lines to match the partial refund amount
-        Since Square doesn't provide line-level refund details, we adjust proportionally
-        """
-        if credit_note.amount_total == 0:
-            _logger.warning(
-                f"Credit note {credit_note.name} has zero amount, skipping adjustment"
-            )
+    def _adjust_credit_note_for_partial_refund(self, credit_note):
+        """Prorate the reversal lines to the Square refund amount."""
+        credit_note = credit_note.with_user(self._get_bot_user())
+        currency = credit_note.currency_id
+        if not currency.compare_amounts(credit_note.amount_total, self.refund_amount):
             return
+        if currency.is_zero(credit_note.amount_total):
+            raise UserError("Impossible de calculer le montant de l'avoir Square")
 
-        # Get bot user for operations to ensure proper tracking messages
-        bot_user = self._get_bot_user()
+        ratio = self.refund_amount / credit_note.amount_total
+        lines = credit_note.invoice_line_ids.filtered(lambda line: line.display_type == "product")
+        credit_note.write({
+            "invoice_line_ids": [
+                Command.update(line.id, {"price_unit": line.price_unit * ratio})
+                for line in lines
+            ],
+        })
 
-        # Calculate the adjustment ratio
-        adjustment_ratio = self.refund_amount / credit_note.amount_total
+        # Use Odoo's invoice rounding for differences from rounding taxes per line.
+        credit_note._check_total_amount(self.refund_amount)
+        rounding_delta = currency.round(self.refund_amount - credit_note.amount_total)
+        if rounding_delta:
+            # There is no tax line to hold the difference on an untaxed credit.
+            line = lines.filtered(
+                lambda line: not line.tax_ids and line.quantity and line.discount != 100
+            )[:1]
+            if line:
+                discounted_qty = line.quantity * (1 - line.discount / 100)
+                line.price_unit = (line.price_subtotal + rounding_delta) / discounted_qty
 
-        _logger.info(
-            f"Adjusting credit note {credit_note.name} for partial refund: "
-            f"Original amount: {credit_note.amount_total}, Target amount: {self.refund_amount}, "
-            f"Adjustment ratio: {adjustment_ratio:.4f}"
-        )
-
-        # Calculate total credit note amount before adjustment
-        total_credit_amount = abs(credit_note.amount_total)
-
-        # For partial refunds, adjust line amounts proportionally by modifying price_unit
-        # This preserves quantities but adjusts the amounts to match the refund
-        if total_credit_amount > 0 and credit_note.invoice_line_ids:
-            adjustment_ratio = self.refund_amount / total_credit_amount
-
-            _logger.info(
-                f"Applying adjustment ratio {adjustment_ratio:.4f} to all credit note lines "
-                f"to achieve refund amount {self.refund_amount}"
-            )
-
-            lines_adjusted = 0
-            for line in credit_note.invoice_line_ids:
-                # Debug: Log line information to understand structure
-                _logger.debug(
-                    f"Credit note line '{line.name}': price_unit={line.price_unit}, "
-                    f"quantity={line.quantity}, amount={line.price_subtotal}"
-                )
-
-                # Adjust lines with non-zero amounts (both positive and negative)
-                if line.price_unit != 0:
-                    original_price = line.price_unit
-                    # Keep quantity the same, adjust price proportionally
-                    new_price = original_price * adjustment_ratio
-
-                    # Use write with bot user context to ensure proper tracking messages
-                    line.with_user(bot_user).with_context(
-                        check_move_validity=False
-                    ).write(
-                        {
-                            "price_unit": new_price,
-                        }
-                    )
-
-                    lines_adjusted += 1
-                    _logger.info(
-                        f"Adjusted credit note line '{line.name}': "
-                        f"Price {original_price:.2f} -> {new_price:.2f} "
-                        f"(quantity remains {line.quantity:.2f})"
-                    )
-                else:
-                    _logger.debug(
-                        f"Skipping credit note line '{line.name}' with zero price_unit"
-                    )
-
-            if lines_adjusted == 0:
-                _logger.warning(
-                    f"No credit note lines were adjusted for refund {self.square_refund_id}. "
-                    f"Credit note may have unexpected structure."
-                )
-        else:
-            _logger.warning(
-                f"Cannot adjust credit note {credit_note.name}: total_credit_amount={total_credit_amount}, "
-                f"line_count={len(credit_note.invoice_line_ids)}"
-            )
-
-        # The credit note amounts will be recomputed when posted
-        # No need to manually recompute here as it will happen automatically
-
-        _logger.info(
-            f"Credit note {credit_note.name} lines adjusted for partial refund amount {self.refund_amount}. "
-            f"Amount before posting: {credit_note.amount_total} (will be recalculated after posting)"
-        )
+        if currency.compare_amounts(credit_note.amount_total, self.refund_amount):
+            raise UserError("Le montant de l'avoir ne correspond pas au remboursement Square")
 
     def _find_and_process_credit_note(self, invoice):
         """
