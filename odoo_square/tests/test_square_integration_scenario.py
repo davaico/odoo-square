@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 import json
 import logging
-from unittest.mock import patch
+from datetime import datetime
+from unittest.mock import call, patch
+
+from odoo.tests import Form
 from odoo.tests.common import tagged
 from odoo.tools import mute_logger
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
@@ -528,6 +531,179 @@ class TestSquareIntegrationScenario(SquareHttpCase):
 
         self.created_invoice = invoice
 
+    def _call_admin_button(self, record, method):
+        response = self.url_open(
+            f"/web/dataset/call_button/{record._name}/{method}",
+            json={
+                "jsonrpc": "2.0",
+                "method": "call",
+                "params": {
+                    "model": record._name,
+                    "method": method,
+                    "args": [record.ids],
+                    "kwargs": {},
+                },
+                "id": 1,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertNotIn("error", payload, payload)
+        return payload["result"]
+
+    def _scan_manual_resync(self, admin, start_at, end_at):
+        action = self._call_admin_button(
+            self.square_config, "action_open_manual_resync_wizard"
+        )
+        registered_action = self.env.ref("odoo_square.action_square_manual_resync_wizard")
+        self.assertEqual(action["res_model"], registered_action.res_model)
+        self.assertEqual(action["views"][0][1], "form")
+        self.assertEqual(action["target"], "new")
+        wizard = self.env[action["res_model"]].with_user(admin).browse(action["res_id"])
+        self.assertEqual(wizard.config_id, self.square_config)
+        self.assertEqual(wizard.state, "preview")
+        with Form(wizard) as form:
+            form.start_at = start_at
+            form.end_at = end_at
+
+        scanned = self._call_admin_button(wizard, "action_scan_missing_orders")
+        self.assertEqual(scanned["res_id"], wizard.id)
+        self.assertEqual(wizard.state, "results")
+        return wizard
+
+    def _deselect_resync_order(self, wizard, order_id):
+        line_index = wizard.line_ids.mapped("square_order_id").index(order_id)
+        with Form(wizard) as form:
+            with form.line_ids.edit(line_index) as line:
+                line.selected = False
+        self.assertEqual(wizard.selected_total, 1)
+
+    def test_manual_resync_recovers_only_selected_paid_orders(self):
+        sale_orders = self.env["sale.order"]
+        existing_id = "ORDER_ALREADY_IMPORTED"
+        existing = sale_orders.create(
+            {"square_order_id": existing_id, "partner_id": self.customer.id}
+        )
+        result = self._send_square_order_event(
+            "order.updated", "evt_resync_pending", "OPEN"
+        )
+        self.assertEqual(result["status"], "queued", result)
+        queue = self.env["square.webhook.queue"]
+        queued = queue.search([("webhook_event_id", "=", "evt_resync_pending")])
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued.state, "pending")
+
+        paid = self._mock_get_order("ORDER_L1_001")
+        paid["created_at"] = "2026-09-08T11:00:00+01:00"
+        deferred_id = "ORDER_L1_DEFERRED"
+        deferred = dict(
+            paid,
+            id=deferred_id,
+            tenders=[dict(paid["tenders"][0], id="payment_deferred")],
+        )
+        orders = {paid["id"]: paid, deferred_id: deferred}
+        orders_by_location = {"L1": [paid, deferred, {"id": existing_id}], "L2": []}
+
+        admin = self.env.ref("base.user_admin")
+        self.authenticate(admin.login, admin.login)
+        start_at = datetime(2026, 9, 8, 9, 0)
+        end_at = datetime(2026, 9, 8, 12, 0)
+
+        with (
+            patch.object(
+                SquareApiClient,
+                "get_location_orders",
+                side_effect=lambda *, location_id, **kwargs: orders_by_location[location_id],
+            ) as search_orders,
+            patch.object(
+                SquareApiClient,
+                "get_order",
+                side_effect=lambda order_id, **kwargs: dict(orders[order_id]),
+            ),
+        ):
+            wizard = self._scan_manual_resync(admin, start_at, end_at)
+            self.assertCountEqual(
+                search_orders.call_args_list,
+                [
+                    call(
+                        location_id=location,
+                        limit=500,
+                        start_at=start_at,
+                        end_at=end_at,
+                        states=["OPEN", "COMPLETED"],
+                        square_config=self.square_config,
+                    )
+                    for location in ("L1", "L2")
+                ],
+            )
+            self.assertEqual((wizard.square_total, wizard.odoo_total), (3, 1))
+            self.assertEqual((wizard.missing_total, wizard.selected_total), (2, 2))
+            self.assertCountEqual(wizard.line_ids.mapped("square_order_id"), orders)
+            paid_line = wizard.line_ids.filtered(
+                lambda line: line.square_order_id == paid["id"]
+            )
+            self.assertEqual(paid_line.created_at, datetime(2026, 9, 8, 10, 0))
+            self.assertAlmostEqual(paid_line.total_amount, 3.60, places=2)
+            self._deselect_resync_order(wizard, deferred_id)
+
+            overlapping_scan = self._scan_manual_resync(admin, start_at, end_at)
+            self._deselect_resync_order(overlapping_scan, deferred_id)
+
+            validated = self._call_admin_button(wizard, "action_validate_resync")
+            self.assertEqual(validated["res_id"], wizard.id)
+            self.assertEqual(wizard.state, "done")
+            self.assertEqual((wizard.processed_count, wizard.error_count), (1, 0))
+            self._assert_paid_square_sale()
+            recovered_order = self.created_sale_order
+            invoice = self.created_invoice
+            payment = invoice.reconciled_payment_ids
+            delivery = recovered_order.picking_ids
+
+            # The other dialog still lists the order it found before the recovery.
+            self._call_admin_button(overlapping_scan, "action_validate_resync")
+            self.assertEqual(overlapping_scan.state, "done")
+            self.assertEqual(
+                (overlapping_scan.processed_count, overlapping_scan.error_count), (1, 0)
+            )
+            self._assert_paid_square_sale()
+            self.assertEqual(self.created_sale_order, recovered_order)
+            self.assertEqual(self.created_invoice, invoice)
+            self.assertEqual(invoice.reconciled_payment_ids, payment)
+            self.assertEqual(recovered_order.picking_ids, delivery)
+
+            # A fresh scan recognizes the recovered sale and still offers the deferred one.
+            fresh_scan = self._scan_manual_resync(admin, start_at, end_at)
+            self.assertEqual((fresh_scan.square_total, fresh_scan.odoo_total), (3, 2))
+            self.assertEqual((fresh_scan.missing_total, fresh_scan.selected_total), (1, 1))
+            self.assertEqual(fresh_scan.line_ids.square_order_id, deferred_id)
+
+        self.assertFalse(sale_orders.search([("square_order_id", "=", deferred_id)]))
+        self.assertEqual(sale_orders.search([("square_order_id", "=", existing_id)]), existing)
+        self.assertEqual(existing.state, "draft")
+        self.assertFalse(existing.invoice_ids)
+        self.assertFalse(existing.picking_ids)
+        self.assertEqual(queue.search([("square_order_id", "=", paid["id"])]), queued)
+        self.assertEqual(queued.state, "completed")
+        self.assertEqual(queued.retry_count, 1)
+        self.assertTrue(queued.processed_at)
+
+        logs = self.env["square.integration.log"].with_user(admin)
+        batches = logs.search([("event_type", "=", "manual_resync")])
+        self.assertEqual(len(batches), 2)
+        self.assertEqual(set(batches.mapped("status")), {"success"})
+        for batch in batches:
+            self.assertIn("Successfully Processed: 1", batch.description)
+            self.assertIn("Errors: 0", batch.description)
+        recovered_logs = logs.search(
+            [
+                ("sale_order_id", "=", recovered_order.id),
+                ("square_order_id", "=", paid["id"]),
+                ("status", "=", "success"),
+            ]
+        )
+        self.assertIn("order_updated", recovered_logs.mapped("event_type"))
+        self.assertIn("stock_sync", recovered_logs.mapped("event_type"))
+
     def test_paid_sale_import_and_replay(self):
         self._import_paid_square_sale()
 
@@ -546,6 +722,199 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         )
         self.assertEqual(result["status"], "already_processed", result)
         self._assert_paid_square_sale()
+
+    def _send_square_refund_event(
+        self, event_type, event_id, refund_id, status, amount_cents, refunded_line_ids=()
+    ):
+        refund = {
+            "id": refund_id,
+            "order_id": self.created_sale_order.square_order_id,
+            "payment_id": self.created_sale_order.square_payment_id,
+            "status": status,
+            "amount_money": {"amount": amount_cents, "currency": "EUR"},
+            "reason": "Returned goods",
+        }
+        if refunded_line_ids:
+            refund["refunded_line_ids"] = list(refunded_line_ids)
+        response = self.url_open(
+            "/square/webhook",
+            data=json.dumps({
+                "type": event_type,
+                "event_id": event_id,
+                "data": {"object": {"refund": refund}},
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def _assert_refund_links(self, refund_id, amount):
+        refund = self.env["square.refund"].search([("square_refund_id", "=", refund_id)])
+        self.assertEqual(len(refund), 1)
+        self.assertEqual(refund.sale_order_id, self.created_sale_order)
+        self.assertEqual(refund.invoice_id, self.created_invoice)
+        self.assertEqual(refund.square_order_id, self.created_sale_order.square_order_id)
+        self.assertAlmostEqual(refund.refund_amount, amount, places=2)
+        self.assertEqual(refund.currency_id, self.created_invoice.currency_id)
+        credit_note = refund.credit_note_id
+        self.assertTrue(credit_note)
+        self.assertEqual(credit_note.move_type, "out_refund")
+        self.assertEqual(credit_note.reversed_entry_id, self.created_invoice)
+        self.assertEqual(credit_note.currency_id, refund.currency_id)
+        self.assertAlmostEqual(credit_note.amount_total, amount, places=2)
+        return refund
+
+    def _assert_refund_payment(self, refund):
+        credit_note = refund.credit_note_id
+        self.assertEqual(credit_note.state, "posted")
+        self.assertEqual(credit_note.payment_state, "paid")
+        self.assertAlmostEqual(credit_note.amount_residual, 0.0, places=2)
+        payment = credit_note.reconciled_payment_ids
+        self.assertEqual(len(payment), 1)
+        self.assertEqual(payment.journal_id, self.payment_journal)
+        self.assertEqual(payment.payment_type, "outbound")
+        self.assertEqual(payment.currency_id, refund.currency_id)
+        self.assertAlmostEqual(payment.amount, refund.refund_amount, places=2)
+        self.assertEqual(payment.move_id.state, "posted")
+        note_receivable = credit_note.line_ids.filtered(
+            lambda line: line.account_id.account_type == "asset_receivable"
+        )
+        payment_receivable = payment.move_id.line_ids.filtered(
+            lambda line: line.account_id.account_type == "asset_receivable"
+        )
+        self.assertEqual(len(note_receivable), 1)
+        self.assertEqual(len(payment_receivable), 1)
+        self.assertTrue(note_receivable.full_reconcile_id)
+        self.assertEqual(
+            note_receivable.full_reconcile_id, payment_receivable.full_reconcile_id
+        )
+        return payment
+
+    def _assert_completed_return(self, refund, delivery, quantities):
+        picking = refund.return_picking_ids
+        self.assertEqual(len(picking), 1)
+        self.assertEqual(picking.return_id, delivery)
+        self.assertEqual(picking.picking_type_code, "incoming")
+        self.assertEqual(picking.location_dest_id, self.warehouse_w1.lot_stock_id)
+        self.assertEqual(picking.state, "done")
+        self.assertEqual(len(picking.move_ids), len(quantities))
+        self.assertEqual(set(picking.move_ids.mapped("state")), {"done"})
+        self.assertEqual(
+            {move.product_id: move.quantity for move in picking.move_ids}, quantities
+        )
+        self.assertEqual(
+            picking.move_ids.origin_returned_move_id,
+            delivery.move_ids.filtered(lambda move: move.product_id in quantities),
+        )
+
+    def test_full_refund_lifecycle_and_replay(self):
+        self._import_paid_square_sale()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        delivery = order.picking_ids
+        sale_payment = invoice.reconciled_payment_ids
+        refund_id = "REFUND_L1_FULL"
+
+        result = self._send_square_refund_event(
+            "refund.created", "evt_full_refund_created", refund_id, "PENDING", 360
+        )
+        self.assertEqual(result["status"], "success", result)
+        refund = self._assert_refund_links(refund_id, 3.60)
+        self.assertEqual(refund.status, "pending")
+        self.assertFalse(refund.processed_at)
+        credit_note = refund.credit_note_id
+        self.assertEqual(credit_note.state, "draft")
+        self.assertEqual(
+            self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+            sale_payment,
+        )
+        return_picking = refund.return_picking_ids
+        self.assertEqual(len(return_picking), 1)
+        self.assertEqual(return_picking.return_id, delivery)
+        self.assertNotIn(return_picking.state, ("done", "cancel"))
+        self.assertEqual(order.order_line.mapped("returned_qty"), [0, 0])
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
+
+        for event_id, expected_status in (
+            ("evt_full_refund_completed", "success"),
+            ("evt_full_refund_completed", "already_processed"),
+            ("evt_full_refund_completed_retry", "already_processed"),
+        ):
+            result = self._send_square_refund_event(
+                "refund.updated", event_id, refund_id, "COMPLETED", 360
+            )
+            self.assertEqual(result["status"], expected_status, result)
+            self.assertEqual(self._assert_refund_links(refund_id, 3.60), refund)
+            self.assertEqual(refund.status, "completed")
+            self.assertTrue(refund.processed_at)
+            self.assertEqual(refund.credit_note_id, credit_note)
+            self.assertEqual(refund.return_picking_ids, return_picking)
+            payment = self._assert_refund_payment(refund)
+            self.assertEqual(order.square_refund_ids, refund)
+            self.assertEqual(invoice.reversal_move_ids, credit_note)
+            self.assertEqual(invoice.reconciled_payment_ids, sale_payment)
+            self.assertEqual(invoice.payment_state, "paid")
+            self.assertAlmostEqual(invoice.amount_residual, 0.0, places=2)
+            self.assertEqual(
+                self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+                sale_payment | payment,
+            )
+            self.assertEqual(delivery.return_ids, return_picking)
+            self.assertEqual(order.refund_status, "fully_refunded")
+            self.assertAlmostEqual(order.total_refunded_amount, 3.60, places=2)
+            self._assert_completed_return(
+                refund, delivery, {self.product_p1: 1, self.product_p2: 2}
+            )
+            for product, quantity in ((self.product_p1, 1), (self.product_p2, 2)):
+                line = order.order_line.filtered(
+                    lambda line: line.product_id == product and line.product_uom_qty > 0
+                )
+                self.assertEqual(line.returned_qty, quantity)
+                self.assertEqual(line.effective_qty, 0)
+                for warehouse in (self.warehouse_w1, self.warehouse_w2):
+                    self.assertEqual(self._get_stock_quantity(product, warehouse), 50)
+
+        completion_log = self.env["square.integration.log"].search([
+            ("webhook_event_id", "=", "evt_full_refund_completed"),
+            ("square_refund_id", "=", refund_id),
+            ("sale_order_id", "=", order.id),
+            ("status", "=", "success"),
+        ])
+        self.assertEqual(len(completion_log), 1)
+
+    def test_unsuccessful_full_refunds_cancel_prepared_actions(self):
+        self._import_paid_square_sale()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        for final_status, expected_status in (("FAILED", "failed"), ("CANCELED", "cancelled")):
+            refund_id = f"REFUND_{final_status}"
+            result = self._send_square_refund_event(
+                "refund.created", f"{refund_id}_pending", refund_id, "PENDING", 360
+            )
+            self.assertEqual(result["status"], "success", result)
+            refund = self._assert_refund_links(refund_id, 3.60)
+            self.assertEqual(refund.credit_note_id.state, "draft")
+            self.assertEqual(len(refund.return_picking_ids), 1)
+
+            result = self._send_square_refund_event(
+                "refund.updated", f"{refund_id}_final", refund_id, final_status, 360
+            )
+            self.assertEqual(result["status"], "success", result)
+            self.assertEqual(refund.status, expected_status)
+            self.assertFalse(refund.processed_at)
+            self.assertEqual(refund.credit_note_id.state, "cancel")
+            self.assertEqual(refund.return_picking_ids.state, "cancel")
+
+        self.assertEqual(
+            self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+            invoice.reconciled_payment_ids,
+        )
+        self.assertEqual(order.refund_status, "not_refunded")
+        self.assertEqual(order.total_refunded_amount, 0)
+        self.assertEqual(order.order_line.mapped("returned_qty"), [0, 0])
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+        self.assertEqual(self._get_stock_quantity(self.product_p2, self.warehouse_w1), 48)
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_complete_square_integration_scenario(self):

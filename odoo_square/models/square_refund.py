@@ -176,7 +176,7 @@ class SquareRefund(models.Model):
 
         # Update the existing record
         vals = {
-            "status": refund_data.get("status", "PENDING").lower(),
+            "status": self._get_square_refund_status(refund_data),
             "refund_amount": refund_amount,
             "currency_id": currency.id,
             "sale_order_id": sale_order.id,
@@ -188,6 +188,11 @@ class SquareRefund(models.Model):
         existing_refund.write(vals)
         _logger.info(f"Updated existing refund record: {existing_refund.display_name}")
         return existing_refund
+
+    @api.model
+    def _get_square_refund_status(self, refund_data):
+        status = (refund_data.get("status") or "PENDING").strip().lower()
+        return "cancelled" if status == "canceled" else status
 
     def create_from_square_data(self, refund_data, sale_order):
         """
@@ -202,6 +207,13 @@ class SquareRefund(models.Model):
 
         if not sale_order:
             raise ValidationError("Sale order is required for refund processing")
+
+        amount_money = refund_data.get("amount_money", {})
+        currency_code = amount_money.get("currency", "EUR")
+        if currency_code != "EUR":
+            raise ValidationError(
+                f"Unsupported currency '{currency_code}'. This system only supports EUR refunds."
+            )
 
         # Robust idempotency check with database locking (similar to order processing)
         existing_refund = self._check_existing_refund(square_refund_id)
@@ -234,17 +246,7 @@ class SquareRefund(models.Model):
                 return existing_refund
 
         # Extract refund amount
-        amount_money = refund_data.get("amount_money", {})
         refund_amount = float(amount_money.get("amount", 0)) / 100.0
-
-        # Get currency - we only support EUR
-        currency_code = amount_money.get("currency", "EUR")
-
-        # Validate that it's EUR (since we only support euros)
-        if currency_code != "EUR":
-            raise ValidationError(
-                f"Unsupported currency '{currency_code}'. This system only supports EUR refunds."
-            )
 
         currency = self._get_eur_currency()
 
@@ -256,7 +258,7 @@ class SquareRefund(models.Model):
         vals = {
             "square_refund_id": square_refund_id,
             "square_order_id": refund_data.get("order_id"),
-            "status": refund_data.get("status", "PENDING").lower(),
+            "status": self._get_square_refund_status(refund_data),
             "refund_amount": refund_amount,
             "currency_id": currency.id,
             "sale_order_id": sale_order.id,
@@ -346,7 +348,7 @@ class SquareRefund(models.Model):
             "order_id": original_line.order_id.id,
             "product_id": original_line.product_id.id,
             "product_uom_qty": -qty,
-            "product_uom": original_line.product_uom.id,
+            "product_uom_id": original_line.product_uom_id.id,
             "price_unit": original_line.price_unit,
             "name": name,
             "sequence": original_line.sequence + 1,
@@ -380,39 +382,26 @@ class SquareRefund(models.Model):
             return self._handle_cancelled_refund()
 
     def _create_pending_refund_actions(self):
-        """
-        Create return pickings and credit note for pending refund
-        """
-        with self.env.cr.savepoint():
-            try:
+        """Prepare the return pickings and draft credit note."""
+        if self.credit_note_id and self.credit_note_id.state != "cancel":
+            return True
+
+        try:
+            with self.env.cr.savepoint():
                 sale_order = self.sale_order_id
-
-                # IDEMPOTENCY CHECK: Only create return pickings if they don't already exist
-                # This prevents duplicate returns when webhook processing happens multiple times
-                if self.return_picking_ids:
-                    _logger.info(
-                        f"Return pickings already exist for refund {self.square_refund_id}. "
-                        f"Skipping duplicate creation. Existing pickings: {self.return_picking_ids.mapped('name')}"
-                    )
-                else:
-                    # Check if refund is partial or full
-                    is_partial = self._is_partial_refund()
-
+                is_partial = self._is_partial_refund()
+                self.return_picking_ids = self.return_picking_ids.filtered(
+                    lambda picking: picking.state != "cancel"
+                )
+                if not self.return_picking_ids:
                     if is_partial:
-                        # Create partial return picking for specific lines
                         self._create_partial_return_picking()
                     else:
-                        # Create full return picking
                         self._create_full_return_picking()
 
-                # Create credit note (but don't validate yet)
-                credit_note = self._create_credit_note()
-                self.credit_note_id = credit_note.id
+                self.credit_note_id = self._create_credit_note()
+                self.invoice_id = self.credit_note_id.reversed_entry_id
 
-                # Update sale order quantities immediately for full refunds
-                # This ensures the order reflects the refund even if COMPLETED webhook is delayed
-
-                # Log the pending refund actions
                 self.env["square.integration.log"].log_square_event(
                     event_type="refund_processed",
                     title=f"Actions de remboursement en attente créées pour {sale_order.name}",
@@ -433,65 +422,73 @@ class SquareRefund(models.Model):
                     square_refund_id=self.square_refund_id,
                     sale_order_id=sale_order.id,
                 )
-
-                return True
-
-            except Exception as e:
-                _logger.error(f"Error creating pending refund actions: {str(e)}")
-                self.processing_errors = str(e)
-                raise UserError(
-                    f"Erreur lors de la création des actions de remboursement : {str(e)}"
-                )
+        except Exception as e:
+            _logger.error("Error creating pending refund actions: %s", e)
+            self.processing_errors = str(e)
+            raise UserError(
+                f"Erreur lors de la création des actions de remboursement : {e}"
+            ) from e
+        return True
 
     def _complete_refund(self):
-        """
-        Complete the refund process
-        """
-        # Get bot user for all operations
-        bot_user = (
-            self.env["res.users"].sudo().search([("login", "=", "square_bot")], limit=1)
-        )
+        """Post and settle the credit note, then complete the stock return."""
+        if self.processed_at:
+            return True
 
-        if not bot_user:
-            _logger.warning(
-                "Square bot user not found, using current user for refund completion"
-            )
-            bot_user = self.env.user
+        bot_user = self._get_bot_user()
+        try:
+            with self.env.cr.savepoint():
+                self._create_pending_refund_actions()
+                credit_note = self.credit_note_id
+                if credit_note.state == "draft":
+                    credit_note.with_user(bot_user).action_post()
 
-        with self.env.cr.savepoint():
-            try:
-                # Validate credit note
-                if self.credit_note_id and self.credit_note_id.state == "draft":
-                    self.credit_note_id.with_user(bot_user).action_post()
+                processor = self.env["square.order.processor"]
+                if not credit_note.currency_id.is_zero(credit_note.amount_residual):
+                    if not processor._create_payment_for_credit_note(
+                        credit_note, self.sale_order_id, bot_user, refund_amount=self.refund_amount
+                    ):
+                        raise UserError("Impossible de comptabiliser le paiement du remboursement Square")
 
-                # Process return pickings using standard methods
-                for picking in self.return_picking_ids:
-                    if picking.state not in ["done", "cancel"]:
-                        if picking.state == "draft":
-                            picking.with_user(bot_user).action_confirm()
-                        if picking.state in ["confirmed", "waiting"]:
-                            picking.with_user(bot_user).action_assign()
-                        # Validate even if stock is insufficient for returns
-                        if picking.state in ["assigned", "confirmed", "waiting"]:
-                            picking.with_user(bot_user).with_context(
-                                force_validate=True,
-                                mail_auto_subscribe_no_notify=True,
-                                mail_create_nosubscribe=True,
-                            ).button_validate()
+                for picking in self.return_picking_ids.filtered(lambda picking: picking.state != "done"):
+                    picking.with_user(bot_user).with_context(
+                        force_validate=True,
+                        mail_auto_subscribe_no_notify=True,
+                        mail_create_nosubscribe=True,
+                    ).button_validate()
+                    if picking.state != "done":
+                        raise UserError(f"Impossible de valider le retour {picking.name}")
 
-                # Quantities are already updated when the credit note is created
-                # (_update_order_line_quantities_from_square / proportional paths).
-                # Running _update_sale_order_quantities_after_refund again double-counts.
+                if self._is_partial_refund():
+                    self._update_sale_order_quantities_after_refund()
+                else:
+                    lines = self.sale_order_id.order_line.filtered(
+                        lambda line: line.product_uom_qty > line.returned_qty
+                    )
+                    for line in lines:
+                        quantity = line.update_returned_quantity(
+                            line.product_uom_qty - line.returned_qty
+                        )
+                        self._add_adjustment_line(line, quantity, bot_user)
 
-                # Update refund status
-                self.processed_at = fields.Datetime.now()
+                self.write({"processed_at": fields.Datetime.now(), "processing_errors": False})
 
-                # Log completion with specialized refund logging
+                self.sale_order_id.with_user(bot_user).with_context(
+                    mail_auto_subscribe_no_notify=True, mail_create_nosubscribe=True
+                ).message_post(
+                    body=(
+                        f"Avoir Square {credit_note.name} : "
+                        f"{self.refund_amount} {self.currency_id.name}"
+                    ),
+                    subject="Intégration Square : Remboursement finalisé",
+                    message_type="comment",
+                )
+
                 refund_data = {
                     "id": self.square_refund_id,
                     "order_id": self.square_order_id,
                     "amount_money": {
-                        "amount": int(self.refund_amount * 100),  # Convert to cents
+                        "amount": round(self.refund_amount * 100),
                         "currency": self.currency_id.name,
                     },
                 }
@@ -500,7 +497,6 @@ class SquareRefund(models.Model):
                     sale_order=self.sale_order_id, refund_data=refund_data
                 )
 
-                # Log completion
                 self.env["square.integration.log"].log_square_event(
                     event_type="refund_processed",
                     title=f"Remboursement finalisé pour {self.sale_order_id.name}",
@@ -520,15 +516,11 @@ class SquareRefund(models.Model):
                     square_refund_id=self.square_refund_id,
                     sale_order_id=self.sale_order_id.id,
                 )
-
-                return True
-
-            except Exception as e:
-                _logger.error(f"Error completing refund: {str(e)}")
-                self.processing_errors = str(e)
-                raise UserError(
-                    f"Erreur lors de la finalisation du remboursement : {str(e)}"
-                )
+        except Exception as e:
+            _logger.error("Error completing refund: %s", e)
+            self.processing_errors = str(e)
+            raise UserError(f"Erreur lors de la finalisation du remboursement : {e}") from e
+        return True
 
     def _is_partial_refund(self):
         """
@@ -632,23 +624,9 @@ class SquareRefund(models.Model):
             # If no specific line IDs, calculate proportionally based on refund amount
             self._configure_proportional_return_lines(return_wizard, delivery_picking)
 
-        # Create the return picking
-        return_wizard.with_user(bot_user).create_returns()
-
-        # Store the created return picking
-        return_pickings = self.env["stock.picking"].search(
-            [("origin", "=", f"Return of {delivery_picking.name}")], limit=1
-        )
-
-        if return_pickings:
-            self.return_picking_ids = [(4, return_pickings.id)]
-            _logger.info(
-                f"Created partial return picking {return_pickings.name} for refund {self.square_refund_id}"
-            )
-        else:
-            _logger.warning(
-                f"No partial return pickings found after creation for refund {self.square_refund_id}"
-            )
+        if any(return_wizard.product_return_moves.mapped("quantity")):
+            action = return_wizard.action_create_returns()
+            self.return_picking_ids = [(4, action["res_id"])]
 
     def _configure_partial_return_lines(self, return_wizard, delivery_picking):
         """
@@ -794,123 +772,32 @@ class SquareRefund(models.Model):
         return 0
 
     def _create_full_return_picking(self):
-        """
-        Create full return picking for complete refund
-        """
-        sale_order = self.sale_order_id
-
-        # Get bot user for all operations
-        bot_user = (
-            self.env["res.users"].sudo().search([("login", "=", "square_bot")], limit=1)
+        """Return the delivered goods from the original delivery pickings."""
+        delivery_pickings = self.sale_order_id.picking_ids.filtered(
+            lambda picking: picking.picking_type_code == "outgoing" and picking.state == "done"
         )
-
-        if not bot_user:
-            _logger.warning(
-                "Square bot user not found, using current user for return picking creation"
+        bot_user = self._get_bot_user()
+        for delivery in delivery_pickings:
+            return_wizard = (
+                self.env["stock.return.picking"]
+                .with_user(bot_user)
+                .with_context(active_id=delivery.id, active_model="stock.picking")
+                .create({})
             )
-            bot_user = self.env.user
-
-        # Find the original delivery picking
-        delivery_picking = sale_order.picking_ids.filtered(
-            lambda p: p.picking_type_code == "outgoing" and p.state == "done"
-        )
-
-        if not delivery_picking:
-            # For physical store orders where items are handed directly to customers,
-            # there are no delivery pickings. Skip return picking creation.
-            _logger.info(
-                f"No delivery picking found for sale order {sale_order.name}. "
-                f"This appears to be a physical store order where items are handed directly to customers. "
-                f"Skipping return picking creation for refund {self.square_refund_id}."
-            )
-            return
-
-        # IDEMPOTENCY CHECK: Check if a return picking already exists for this delivery
-        # This prevents duplicate returns when both refund.created and refund.updated webhooks arrive
-        existing_return = self.env["stock.picking"].search(
-            [
-                ("origin", "=", f"Return of {delivery_picking.name}"),
-                ("picking_type_code", "=", "incoming"),
-            ],
-            limit=1,
-        )
-
-        if existing_return:
-            _logger.info(
-                f"Return picking {existing_return.name} already exists for delivery {delivery_picking.name}. "
-                f"Skipping duplicate return creation for refund {self.square_refund_id}. "
-                f"Linking existing return to this refund record."
-            )
-            # Link the existing return to this refund if not already linked
-            if existing_return.id not in self.return_picking_ids.ids:
-                self.return_picking_ids = [(6, 0, [existing_return.id])]
-            return
-
-        # Create return picking for all lines
-        return_wizard = (
-            self.env["stock.return.picking"]
-            .with_user(bot_user)
-            .with_context(active_id=delivery_picking.id, active_model="stock.picking")
-            .create({})
-        )
-
-        return_wizard.with_user(bot_user).create_returns()
-
-        # Store the created return picking
-        return_pickings = self.env["stock.picking"].search(
-            [("origin", "=", f"Return of {delivery_picking.name}")]
-        )
-
-        if return_pickings:
-            self.return_picking_ids = [(6, 0, return_pickings.ids)]
-            _logger.info(
-                f"Created return picking {return_pickings.name} for refund {self.square_refund_id}"
-            )
-        else:
-            _logger.warning(
-                f"No return pickings found after creation for refund {self.square_refund_id}"
-            )
+            action = return_wizard.action_create_returns_all()
+            self.return_picking_ids = [(4, action["res_id"])]
 
     def _create_credit_note(self):
-        """
-        Create credit note for the refund - supports both full and partial refunds
-        """
-        sale_order = self.sale_order_id
-
-        # Find the original invoice
-        invoice = sale_order.invoice_ids.filtered(
-            lambda inv: inv.move_type == "out_invoice" and inv.state == "posted"
+        """Prepare a draft reversal of the original posted invoice."""
+        invoice = self.sale_order_id.invoice_ids.filtered(
+            lambda move: move.move_type == "out_invoice" and move.state == "posted"
         )
-
         if not invoice:
             raise UserError("Aucune facture validée trouvée pour créer l'avoir")
 
-        _logger.info(
-            f"Creating credit note for invoice {invoice.name} and refund {self.square_refund_id} - Amount: {self.refund_amount}"
-        )
-
-        # Create partial credit note for specific refund amount
-        return self._create_partial_credit_note(invoice)
-
-    def _create_partial_credit_note(self, invoice):
-        """
-        Create a partial credit note for the specific refund amount
-        """
-        # Get bot user for operations to ensure proper tracking messages
-        bot_user = self._get_bot_user()
-
-        # Fetch order details from Square to get accurate quantities
-        order_details = self._fetch_order_details_from_square()
-
-        # Use the reversal wizard to create the credit note with bot user context
-        _logger.info(
-            f"Creating credit note reversal for invoice {invoice.name} "
-            f"with refund ID {self.square_refund_id}"
-        )
-
         credit_note_wizard = (
             self.env["account.move.reversal"]
-            .with_user(bot_user)
+            .with_user(self._get_bot_user())
             .with_context(active_model="account.move", active_ids=invoice.ids)
             .create(
                 {
@@ -919,55 +806,10 @@ class SquareRefund(models.Model):
                 }
             )
         )
-
-        # Create the reversal and get the credit note directly from the result
         result = credit_note_wizard.reverse_moves()
-        credit_note_id = result.get("res_id")
-
-        if not credit_note_id:
-            _logger.error("Reversal wizard did not return a credit note ID")
-            raise UserError("Échec de création de l'avoir - aucun ID retourné")
-
-        # Get the credit note directly by ID
-        credit_note = self.env["account.move"].browse(credit_note_id)
+        credit_note = self.env["account.move"].browse(result.get("res_id"))
         if not credit_note.exists():
-            _logger.error(f"Credit note with ID {credit_note_id} does not exist")
             raise UserError("L'avoir créé n'existe pas")
-
-        _logger.info(f"Found credit note: {credit_note.name} (ID: {credit_note.id})")
-
-        # Post the credit note FIRST (required for payment creation)
-        credit_note.with_user(bot_user).action_post()
-
-        # Update order line quantities based on Square order details
-        self._update_order_line_quantities_from_square(order_details)
-
-        # Create payment for the posted credit note
-        processor = self.env["square.order.processor"]
-        payment_created = processor._create_payment_for_credit_note(
-            credit_note, self.sale_order_id, bot_user, refund_amount=self.refund_amount
-        )
-
-        # Add chatter message
-        try:
-            self.sale_order_id.with_user(bot_user).with_context(
-                mail_auto_subscribe_no_notify=True, mail_create_nosubscribe=True
-            ).message_post(
-                body=f"Avoir Square partiel créé - {credit_note.name}, Montant: {credit_note.amount_total} {credit_note.currency_id.name}, Paiement: {'Créé' if payment_created else 'En attente'}",
-                subject="Intégration Square : Avoir Partiel Créé et Traité",
-                message_type="comment",
-            )
-            _logger.info(
-                f"Posted chatter message for partial credit note {credit_note.name}"
-            )
-        except Exception as e:
-            _logger.warning(
-                f"Could not post chatter message for credit note {credit_note.name}: {str(e)}"
-            )
-
-        _logger.info(
-            f"Created and processed partial credit note {credit_note.name} for refund {self.square_refund_id}"
-        )
         return credit_note
 
     def _update_order_line_quantities(self):

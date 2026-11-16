@@ -1,30 +1,12 @@
-from odoo import models, api
+from odoo import models
 
 
 class StockPicking(models.Model):
     _inherit = "stock.picking"
 
-    @api.model
     def _force_quantity_for_square(self):
-        for move in self.move_ids:
-            if move.state not in ["done", "cancel"]:
-                required_qty = move.product_uom_qty
-
-                # set all move lines to required qty
-                if move.move_line_ids:
-                    move.move_line_ids.write({"quantity": required_qty})
-                else:
-                    self.env["stock.move.line"].create(
-                        {
-                            "move_id": move.id,
-                            "product_id": move.product_id.id,
-                            "product_uom_id": move.product_uom.id,
-                            "location_id": move.location_id.id,
-                            "location_dest_id": move.location_dest_id.id,
-                            "quantity": required_qty,
-                            "picking_id": self.id,
-                        }
-                    )
+        for move in self.move_ids.filtered(lambda move: move.state not in ("done", "cancel")):
+            move.quantity = move.product_uom_qty
 
     def button_validate(self):
         """
@@ -34,7 +16,9 @@ class StockPicking(models.Model):
         """
         force_validate = self.env.context.get("force_validate", False)
 
-        if force_validate and self.picking_type_code in ("outgoing", "incoming"):
-            self._force_quantity_for_square()
+        if force_validate:
+            self.filtered(
+                lambda picking: picking.picking_type_code in ("outgoing", "incoming")
+            )._force_quantity_for_square()
 
         return super().button_validate()
