@@ -1,7 +1,30 @@
 <section class="oe_container">
     <div class="oe_row oe_spaced">
         <h2 class="oe_slogan" style="margin-top: 32px;">Square POS Integration</h2>
-        <h3 class="oe_slogan">Connect your Square point of sale with Odoo. Real-time sync of orders, refunds, exchanges, and inventory.</h3>
+        <h3 class="oe_slogan">Connect your Square point of sale with Odoo 17. Sync orders, refunds, exchanges, and inventory.</h3>
+    </div>
+</section>
+
+<section class="oe_container">
+    <h2 class="oe_slogan">Choose Your Odoo Version</h2>
+    <div class="oe_row oe_spaced">
+        <div class="oe_span12">
+            <p class="oe_mt32">
+                Square POS Integration is the same application, <code>odoo_square</code>,
+                with a separate release for each Odoo version. Use the Versions selector
+                on this page to download the release that matches your Odoo server.
+            </p>
+            <ul>
+                <li><a href="https://apps.odoo.com/apps/modules/17.0/odoo_square">Odoo 17.0</a> &mdash; this release</li>
+                <li><a href="https://apps.odoo.com/apps/modules/18.0/odoo_square">Odoo 18.0 Community</a></li>
+                <li><a href="https://apps.odoo.com/apps/modules/19.0/odoo_square">Odoo 19.0 Community</a></li>
+            </ul>
+            <p>
+                Read the requirements and setup instructions on the selected version's
+                page before installing. Moving an existing Odoo database to another major
+                version requires a separate database migration.
+            </p>
+        </div>
     </div>
 </section>
 
@@ -176,10 +199,10 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span12">
             <p class="oe_mt32">
-                This module communicates only with the Square API endpoints configured
-                by the administrator. No data is sent to third parties. All customer
-                data remains in your Odoo database. Webhook signatures are verified
-                using HMAC-SHA256 against the signing key you provide.
+                The addon retrieves order, customer, and catalog data from the selected
+                Square environment and sends inventory counts to Square. Imported records
+                and integration logs are stored in Odoo. Configure the webhook signing key
+                before exposing the endpoint publicly to enable HMAC-SHA256 verification.
             </p>
         </div>
     </div>
