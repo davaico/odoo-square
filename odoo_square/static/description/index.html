@@ -1,7 +1,7 @@
 <section class="oe_container">
     <div class="oe_row oe_spaced">
         <h2 class="oe_slogan" style="margin-top: 32px;">Square POS Integration</h2>
-        <h3 class="oe_slogan">Connect your Square point of sale with Odoo. Real-time sync of orders, refunds, exchanges, and inventory.</h3>
+        <h3 class="oe_slogan">Bring Square POS sales, payments, refunds, and exchanges into Odoo 18 Community.</h3>
     </div>
 </section>
 
@@ -11,22 +11,20 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span6">
             <div class="oe_mt32">
-                <h3 class="oe_slogan">Real-Time Webhook Processing</h3>
+                <h3 class="oe_slogan">Square Sales in Odoo</h3>
                 <p class="oe_mt32">
-                    Secure HMAC-SHA256 endpoint receives every Square event:
-                    <code>order.created</code>, <code>order.updated</code>,
-                    <code>refund.created</code>, <code>refund.updated</code>.
-                    Orders, exchanges and refunds appear in Odoo within seconds.
+                    Complete checkout and collect payment in Square POS. The addon imports
+                    the sale and records the invoice, payment, and delivery in Odoo.
                 </p>
             </div>
         </div>
         <div class="oe_span6">
             <div class="oe_mt32">
-                <h3 class="oe_slogan">Smart Customer Matching</h3>
+                <h3 class="oe_slogan">Customer and Product Matching</h3>
                 <p class="oe_mt32">
                     New Square orders are matched to existing Odoo contacts by email,
-                    then phone, then name. If no match is found, a new contact is created
-                    automatically. No duplicates, no manual cleanup.
+                    then phone, then name. The addon can create a contact when no match
+                    is found. Square SKUs match Odoo product internal references.
                 </p>
             </div>
         </div>
@@ -37,20 +35,22 @@
             <div class="oe_mt32">
                 <h3 class="oe_slogan">Refunds and Exchanges</h3>
                 <p class="oe_mt32">
-                    Full refunds generate credit notes and stock returns. Equivalent
-                    exchanges update lines and trigger simultaneous stock moves.
-                    Price-difference exchanges create the appropriate invoice or
-                    credit note based on the price delta.
+                    Initiate refunds and exchanges in Square. The addon records full and
+                    partial EUR refunds in Odoo with credit notes, refund payments, and
+                    stock returns where applicable. Supported exchanges record returned
+                    and replacement items, including any payment or refund for a price
+                    difference.
                 </p>
             </div>
         </div>
         <div class="oe_span6">
             <div class="oe_mt32">
-                <h3 class="oe_slogan">Bidirectional Inventory Sync</h3>
+                <h3 class="oe_slogan">Inventory by Location</h3>
                 <p class="oe_mt32">
-                    Odoo stock moves push updates to Square through the Square
-                    Inventory API. Loop prevention excludes Square-originated moves
-                    to avoid conflicts. Scoped to a configurable shop warehouse.
+                    Square sales and returns update stock in the mapped Odoo warehouse.
+                    Eligible Odoo stock movements and quantity adjustments send warehouse
+                    quantities to the mapped Square location. The addon avoids sending
+                    Square-originated stock movements back to Square.
                 </p>
             </div>
         </div>
@@ -62,16 +62,14 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span12">
             <p class="oe_mt32">
-                Every webhook, every API call, every refund and every stock adjustment
-                is recorded in a centralized Integration Log. Chatter messages are also
-                added to the source sales order, so the full history is one click away
-                from the order itself.
+                Open <strong>Square &rarr; Activity</strong> to review webhook processing,
+                stock synchronization, and errors. Related sales orders can also show
+                integration messages in the chatter.
             </p>
             <ul>
-                <li>Centralized Integration Log with filterable status, level, and operation type</li>
-                <li>Automatic chatter messages on each related sales order</li>
-                <li>Webhook queue with retry control and replay</li>
-                <li>Manual resync wizard for orders, refunds, and stock</li>
+                <li>Integration logs with filters for status, level, and operation type</li>
+                <li>Webhook Queue for inspecting out-of-order events and retry status</li>
+                <li>Manual Resync Orders for recovering selected Square orders missing from Odoo</li>
             </ul>
         </div>
     </div>
@@ -82,12 +80,11 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span12">
             <ol class="oe_mt32">
-                <li>Install the module from the Apps menu.</li>
-                <li>Open <strong>Settings &rarr; Square Configuration</strong>.</li>
-                <li>Enter your Square Application ID, Access Token, Location ID, and Webhook Signature Key.</li>
-                <li>Select the warehouse used for inventory synchronization.</li>
-                <li>In the Square Developer Dashboard, create a webhook subscription pointing to <code>https://your-odoo-domain/square/webhook</code>.</li>
-                <li>Subscribe to the events: <code>order.created</code>, <code>order.updated</code>, <code>refund.created</code>, <code>refund.updated</code>.</li>
+                <li>Install <strong>Square POS Integration</strong> from Apps. For a source installation, use the <a href="https://github.com/davaico/odoo-square/tree/18.0"><code>18.0</code> branch</a>.</li>
+                <li>In the Square Developer Dashboard, create a webhook subscription at <code>https://your-odoo-domain.example/square/webhook</code> for the events listed below.</li>
+                <li>Open <strong>Square &rarr; Configuration</strong>. Select Sandbox or Production and enter the Square Application ID, Access Token, and Webhook Signature Key from that environment.</li>
+                <li>Set up the company chart of accounts and select the bank journal to use as the <strong>Payment Journal</strong>.</li>
+                <li>Save and use <strong>Test Connection</strong>. Map each Square location to its Odoo warehouse. You can use <strong>Synchronize Locations</strong> to populate the list, then review the suggested warehouses. Sales teams are optional.</li>
             </ol>
         </div>
     </div>
@@ -99,7 +96,7 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span12">
             <h3 class="oe_slogan">Square Configuration</h3>
-            <p class="oe_mt32">Configure API credentials, signing key, and the shop warehouse used for inventory sync.</p>
+            <p class="oe_mt32">Configure Square credentials, the signing key, payment journal, and warehouse mappings.</p>
             <img class="oe_picture oe_screenshot" src="screen_config.png" alt="Square Configuration screen"/>
         </div>
     </div>
@@ -107,7 +104,7 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span12">
             <h3 class="oe_slogan">Webhook Queue</h3>
-            <p class="oe_mt32">Inspect, retry, and replay incoming Square events with full payload visibility.</p>
+            <p class="oe_mt32">Inspect queued order events, retry status, and error details.</p>
             <img class="oe_picture oe_screenshot" src="screen_webhook_queue.png" alt="Webhook Queue screen"/>
         </div>
     </div>
@@ -115,7 +112,7 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span12">
             <h3 class="oe_slogan">Integration Logs</h3>
-            <p class="oe_mt32">Centralized log of every API call, signature check, order processing step, and stock adjustment.</p>
+            <p class="oe_mt32">Review integration activity and processing errors.</p>
             <img class="oe_picture oe_screenshot" src="screen_integration_logs.png" alt="Integration Logs screen"/>
         </div>
     </div>
@@ -123,7 +120,7 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span12">
             <h3 class="oe_slogan">Stock Synchronization</h3>
-            <p class="oe_mt32">Monitor bidirectional inventory sync between Odoo and Square in real time.</p>
+            <p class="oe_mt32">Open <strong>Square &rarr; Actions</strong> to view stock synchronization settings and statistics.</p>
             <img class="oe_picture oe_screenshot" src="screen_stock_sync.png" alt="Stock Sync screen"/>
         </div>
     </div>
@@ -131,7 +128,7 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span12">
             <h3 class="oe_slogan">Manual Resync</h3>
-            <p class="oe_mt32">Wizard to replay a specific order, refund, or stock state on demand.</p>
+            <p class="oe_mt32">Use <strong>Manual Resync Orders</strong> in the configuration to scan a date range and import selected missing orders.</p>
             <img class="oe_picture oe_screenshot" src="screen_manual_resync.png" alt="Manual Resync wizard"/>
         </div>
     </div>
@@ -142,10 +139,11 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span12">
             <ul class="oe_mt32">
-                <li>Odoo 17.0 (Community or Enterprise)</li>
-                <li>Python package: <code>requests</code></li>
-                <li>Active Square Developer account with API credentials</li>
-                <li>Publicly reachable Odoo URL for the webhook endpoint</li>
+                <li>Odoo 18.0 Community and PostgreSQL</li>
+                <li>Odoo addons <code>base</code>, <code>web</code>, <code>sale</code>, <code>sales_team</code>, <code>account</code>, <code>stock</code>, <code>sale_stock</code>, and <code>payment</code></li>
+                <li>Python package <code>requests</code> in the Odoo environment</li>
+                <li>Square Developer application with API credentials and a webhook signing key</li>
+                <li>Public HTTPS URL for the Odoo webhook endpoint</li>
             </ul>
         </div>
     </div>
@@ -155,16 +153,17 @@
     <h2 class="oe_slogan">Supported Square Events</h2>
     <div class="oe_row oe_spaced">
         <div class="oe_span6">
-            <h3 class="oe_slogan">Orders</h3>
+            <h3 class="oe_slogan">Orders and Payments</h3>
             <ul>
-                <li><code>order.created</code> &rarr; new sales order</li>
-                <li><code>order.updated</code> &rarr; line changes, exchanges</li>
+                <li><code>order.created</code> &rarr; completed order import</li>
+                <li><code>order.updated</code> &rarr; order import, supported changes and cancellations</li>
+                <li><code>payment.updated</code> &rarr; exchange detection from completed payments</li>
             </ul>
         </div>
         <div class="oe_span6">
             <h3 class="oe_slogan">Refunds</h3>
             <ul>
-                <li><code>refund.created</code> &rarr; credit note and stock return</li>
+                <li><code>refund.created</code> &rarr; refund intake</li>
                 <li><code>refund.updated</code> &rarr; refund state changes</li>
             </ul>
         </div>
@@ -176,10 +175,10 @@
     <div class="oe_row oe_spaced">
         <div class="oe_span12">
             <p class="oe_mt32">
-                This module communicates only with the Square API endpoints configured
-                by the administrator. No data is sent to third parties. All customer
-                data remains in your Odoo database. Webhook signatures are verified
-                using HMAC-SHA256 against the signing key you provide.
+                The addon uses the Square API to retrieve order and catalog data and
+                send inventory updates. Odoo stores imported records and integration
+                logs. Configure the webhook signing key to enable HMAC-SHA256 signature
+                verification.
             </p>
         </div>
     </div>
