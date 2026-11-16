@@ -450,6 +450,95 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                 self.assert_reconciled_payment(self.created_invoice, "inbound", 3.00)
                 self._assert_warehouse_stock(49)
 
+    def test_full_refund_retries_after_failed_refund_releases_stock(self):
+        self._assert_full_refund_retries_after_release("FAILED", prepare_credit=False)
+
+    def test_full_refund_retries_after_cancelled_refund_releases_stock(self):
+        self._assert_full_refund_retries_after_release("CANCELED", prepare_credit=True)
+
+    def _assert_full_refund_retries_after_release(self, terminal_status, prepare_credit):
+        self._test_sale_processing()
+        self._test_stock_updates()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        delivery = order.picking_ids
+        reserved_data = {
+            "id": "reserved-full-refund",
+            "order_id": order.square_order_id,
+            "amount_money": {"amount": 300, "currency": "EUR"},
+        }
+        replacement_data = {**reserved_data, "id": "replacement-full-refund"}
+        self._send_refund_webhook(reserved_data, "created", "PENDING", "evt-reserve-full-return")
+        reserved = order.square_refund_ids
+        reserved_returns = reserved.return_picking_ids
+        self.assertTrue(reserved_returns)
+        self.assertNotIn(reserved_returns.state, ("done", "cancel"))
+        credit = self.env["account.move"]
+        if prepare_credit:
+            self._send_refund_webhook(
+                replacement_data, "created", "PENDING", "evt-prepare-replacement"
+            )
+            credit = (order.square_refund_ids - reserved).credit_note_id
+            self.assertEqual(credit.state, "draft")
+
+        # Square already rejected the first refund, but its terminal event is
+        # delayed. The completion must request redelivery, without posting money.
+        self._send_refund_webhook(
+            replacement_data, "updated", "COMPLETED", "evt-complete-replacement", "retry"
+        )
+        replacement = order.square_refund_ids - reserved
+        self.assertFalse(replacement.processed_at)
+        self.assertFalse(replacement.return_picking_ids)
+        if prepare_credit:
+            self.assertEqual(replacement.status, "pending")
+            self.assertEqual(replacement.credit_note_id, credit)
+            self.assertEqual(credit.state, "draft")
+        else:
+            self.assertFalse(replacement)
+        self.assertFalse(self.env["account.payment"].search([
+            ("partner_id", "=", order.partner_id.id), ("payment_type", "=", "outbound"),
+        ]))
+        self.assertFalse(self.env["square.integration.log"].search([
+            ("webhook_event_id", "=", "evt-complete-replacement"), ("status", "=", "success"),
+        ]))
+        self._assert_warehouse_stock(49)
+
+        self._send_refund_webhook(reserved_data, "updated", terminal_status, "evt-release-full-return")
+        self.assertEqual(reserved.return_picking_ids, reserved_returns)
+        self.assertEqual(reserved_returns.state, "cancel")
+        self.assertEqual(reserved.credit_note_id.state, "cancel")
+        self._send_refund_webhook(
+            replacement_data, "updated", "COMPLETED", "evt-complete-replacement"
+        )
+        replacement = order.square_refund_ids - reserved
+        self.assertEqual(len(replacement), 1)
+        self.assertTrue(replacement.processed_at)
+        if prepare_credit:
+            self.assertEqual(replacement.credit_note_id, credit)
+        credit = replacement.credit_note_id
+        self.assertEqual(credit.reversed_entry_id, invoice)
+        payment = self.assert_reconciled_payment(credit, "outbound", 3.00)
+        returned = replacement.return_picking_ids
+        self.assertEqual(len(returned), 1)
+        self.assertEqual(returned.return_id, delivery)
+        self.assertEqual(returned.state, "done")
+        self.assertEqual(returned.move_ids.mapped("quantity"), [1, 1])
+        self.assertEqual(order.total_refunded_amount, 3.00)
+        self._assert_warehouse_stock(50)
+
+        for event_id in ("evt-complete-replacement", "evt-replay-complete-replacement"):
+            self._send_refund_webhook(
+                replacement_data, "updated", "COMPLETED", event_id, "already_processed"
+            )
+        self.assertEqual(order.square_refund_ids, reserved | replacement)
+        self.assertEqual(order.picking_ids, delivery | reserved_returns | returned)
+        self.assertEqual(replacement.credit_note_id, credit)
+        self.assertEqual(self.assert_reconciled_payment(credit, "outbound", 3.00), payment)
+        self.assertEqual(self.env["account.payment"].search([
+            ("partner_id", "=", order.partner_id.id), ("payment_type", "=", "outbound"),
+        ]), payment)
+        self._assert_warehouse_stock(50)
+
     def test_completed_refund_can_prepare_a_return_after_its_credit_note(self):
         self._test_sale_processing()
         self._test_stock_updates()
@@ -904,7 +993,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             }),
             headers={"Content-Type": "application/json"},
         )
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 503 if expected == "retry" else 200, response.text)
         self.assertEqual(response.json()["status"], expected, response.text)
 
     def assert_reconciled_payment(self, invoice, direction, amount):

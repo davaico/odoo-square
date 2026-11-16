@@ -16,6 +16,10 @@ class _ConcurrentRefundCreation(errors.SerializationFailure):
     pgcode = errorcodes.SERIALIZATION_FAILURE
 
 
+class RefundProcessingDeferred(UserError):
+    """The refund can complete once another return releases its reservation."""
+
+
 class SquareRefund(models.Model):
     _name = "square.refund"
     _description = "Square Refund Tracking"
@@ -240,21 +244,25 @@ class SquareRefund(models.Model):
                 "message": f"Statut de remboursement inconnu: {refund_status}",
             }
 
-        with self.env.cr.savepoint():
-            refund_record, details_changed = self.with_user(self._get_bot_user())._upsert_from_square_data(
-                refund_data, sale_order
-            )
+        try:
+            with self.env.cr.savepoint():
+                refund_record, details_changed = self.with_user(self._get_bot_user())._upsert_from_square_data(
+                    refund_data, sale_order
+                )
 
-            if refund_record.processed_at:
-                return {
-                    "status": "already_processed",
-                    "message": f"Refund {refund_id} already fully processed",
-                    "refund_id": refund_id,
-                }
+                if refund_record.processed_at:
+                    return {
+                        "status": "already_processed",
+                        "message": f"Refund {refund_id} already fully processed",
+                        "refund_id": refund_id,
+                    }
 
-            if webhook_event_id:
-                refund_record.webhook_event_id = webhook_event_id
-            refund_record.with_context(square_refund_details_changed=details_changed).action_process_refund()
+                if webhook_event_id:
+                    refund_record.webhook_event_id = webhook_event_id
+                refund_record.with_context(square_refund_details_changed=details_changed).action_process_refund()
+        except RefundProcessingDeferred as error:
+            _logger.warning("Deferring Square refund %s: %s", refund_id, error)
+            return {"status": "retry", "message": str(error), "refund_id": refund_id}
 
         # Log webhook processing
         self.env["square.integration.log"].log_square_event(
@@ -396,6 +404,8 @@ class SquareRefund(models.Model):
 
                 return True
 
+            except RefundProcessingDeferred:
+                raise
             except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
                 raise
             except Exception as e:
@@ -520,6 +530,8 @@ class SquareRefund(models.Model):
 
                 return True
 
+            except RefundProcessingDeferred:
+                raise
             except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
                 raise
             except Exception as e:
@@ -572,6 +584,19 @@ class SquareRefund(models.Model):
         }
         if not is_partial:
             for line in return_lines:
+                if self.status == "completed":
+                    other_pending_returns = line.move_id.returned_move_ids.filtered(
+                        lambda move: move.state not in ("done", "cancel")
+                    ) - own_moves
+                    unreserved = line.move_id._get_square_returnable_quantity(
+                        line.uom_id, exclude_returns=own_moves | other_pending_returns
+                    )
+                    if float_compare(
+                        unreserved, available[line], precision_rounding=line.uom_id.rounding
+                    ) > 0:
+                        raise RefundProcessingDeferred(
+                            "Un autre retour réserve les articles de ce remboursement."
+                        )
                 line.quantity = available[line]
         elif self.refunded_line_ids:
             if not self._configure_partial_return_lines(return_lines, available, prepared):
