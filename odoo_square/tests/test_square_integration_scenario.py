@@ -796,6 +796,79 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), quantity)
             self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
 
+    def test_exchange_respects_an_unreserved_pending_return(self):
+        self._import_paid_square_sale()
+        order = self.created_sale_order
+        invoice = self.created_invoice
+        delivery = order.picking_ids
+        sale_payment = invoice.reconciled_payment_ids
+        refund_id = "REFUND_BEFORE_EXCHANGE"
+        result = self._send_square_refund_event(
+            "refund.created", "evt_before_exchange_pending", refund_id, "PENDING", 120,
+            ("line_1",),
+        )
+        self.assertEqual(result["status"], "success", result)
+        refund = self._assert_refund_links(refund_id, 1.20)
+        pending_return = refund.return_picking_ids
+        pending_return.do_unreserve()
+        self.assertEqual(pending_return.move_ids.quantity, 0)
+        self.assertEqual(pending_return.move_ids.product_uom_qty, 1)
+        self.assertNotIn(pending_return.state, ("done", "cancel"))
+
+        exchange = {
+            "id": "EXCHANGE_PENDING_RETURN",
+            "location_id": "L1",
+            "state": "COMPLETED",
+            "returns": [{
+                "source_order_id": order.square_order_id,
+                "return_line_items": [{"catalog_object_id": "P1-SKU", "quantity": "1"}],
+            }],
+        }
+        payment = {
+            "id": "payment_pending_return_exchange",
+            "order_id": exchange["id"],
+            "status": "COMPLETED",
+            "amount_money": {"amount": 120, "currency": "EUR"},
+        }
+        with patch.object(SquareApiClient, "get_order", return_value=exchange):
+            result = self._send_square_exchange_event(
+                "payment.updated", "evt_exchange_pending_return", "payment", payment
+            )
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("exceeds the quantity available", result["message"])
+        self.assertEqual(delivery.return_ids, pending_return)
+        self.assertEqual(invoice.reversal_move_ids, refund.credit_note_id)
+        self.assertEqual(refund.credit_note_id.state, "draft")
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 49)
+        self.assertEqual(
+            self.env["account.payment"].search([("partner_id", "=", self.customer.id)]),
+            sale_payment,
+        )
+
+        result = self._send_square_refund_event(
+            "refund.updated", "evt_before_exchange_cancelled", refund_id, "CANCELED", 120,
+            ("line_1",),
+        )
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(pending_return.state, "cancel")
+
+        with patch.object(SquareApiClient, "get_order", return_value=exchange):
+            result = self._send_square_exchange_event(
+                "payment.updated", "evt_exchange_pending_return", "payment", payment
+            )
+        self.assertEqual(result["status"], "success", result)
+        exchange_return = delivery.return_ids - pending_return
+        self.assertEqual(len(exchange_return), 1)
+        self.assertEqual(exchange_return.state, "done")
+        self.assertEqual(exchange_return.move_ids.product_id, self.product_p1)
+        self.assertEqual(exchange_return.move_ids.quantity, 1)
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 50)
+        exchange_credit = invoice.reversal_move_ids - refund.credit_note_id
+        self.assertEqual(len(exchange_credit), 1)
+        self.assertEqual(exchange_credit.state, "posted")
+        self.assertAlmostEqual(exchange_credit.amount_total, 1.20, places=2)
+        self.assertAlmostEqual(exchange_credit.amount_residual, 0, places=2)
+
     def test_equal_price_exchange_settles_without_another_payment(self):
         payment = self._run_square_exchange(replacement_cents=120, payment_cents=0)
         self._assert_settled_exchange(replacement_total=1.20, payment_delta=0.0)
@@ -1205,6 +1278,28 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             for product in (self.product_p1, self.product_p2):
                 self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), 50)
                 self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
+
+    def test_full_refund_leaves_an_exchange_return_on_its_own_transaction(self):
+        self._run_square_exchange(replacement_cents=120, payment_cents=0)
+        delivery = self.created_sale_order.picking_ids.filtered(
+            lambda picking: picking.picking_type_code == "outgoing"
+        )
+        exchange_return = delivery.return_ids
+        self.assertEqual(len(exchange_return), 1)
+        self.assertEqual(exchange_return.state, "done")
+        self.assertEqual(exchange_return.move_ids.product_id, self.product_p1)
+
+        refund_id = "REFUND_AFTER_EXCHANGE"
+        result = self._send_square_refund_event(
+            "refund.updated", "evt_refund_after_exchange", refund_id, "COMPLETED", 360
+        )
+        self.assertEqual(result["status"], "success", result)
+        refund = self._assert_refund_links(refund_id, 3.60)
+        self._assert_refund_payment(refund)
+        self._assert_completed_return(refund, delivery, {self.product_p2: 2})
+        self.assertEqual(delivery.return_ids, exchange_return | refund.return_picking_ids)
+        for product in (self.product_p1, self.product_p2):
+            self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), 50)
 
     def test_full_refund_returns_only_the_outstanding_shipment(self):
         first, backorder = self._import_paid_square_sale_with_split_delivery()

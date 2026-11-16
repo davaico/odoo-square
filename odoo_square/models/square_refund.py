@@ -701,9 +701,11 @@ class SquareRefund(models.Model):
             and move.picking_id.return_id == move.origin_returned_move_id.picking_id
             and move.picking_id.picking_type_code == "incoming"
         ).picking_id.filtered(lambda picking: picking.state == "done")
+        # Older Square exchange returns were created by the integration user.
         square_bot = self.env.ref("odoo_square.user_square_bot", raise_if_not_found=False)
         completed_returns = completed_returns.filtered(
-            lambda picking: picking.create_uid != square_bot
+            lambda picking: not picking.square_exchange_order_id
+            and picking.create_uid != square_bot
         )
         claimed_returns = self.search([
             ("id", "!=", self.id),

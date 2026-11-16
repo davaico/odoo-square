@@ -1078,7 +1078,9 @@ class SquareOrderProcessor(models.Model):
                 return {"status": "ignored", "message": "No exchange detected"}
 
             with self.env.cr.savepoint():
-                self._create_return_pickings_for_exchange(sale_order, returned_products)
+                self._create_return_pickings_for_exchange(
+                    sale_order, returned_products, exchange_order_id
+                )
 
                 credit_note = None
                 if returned_products:
@@ -1181,7 +1183,7 @@ class SquareOrderProcessor(models.Model):
 
             raise
     
-    def _create_return_pickings_for_exchange(self, sale_order, returned_products):
+    def _create_return_pickings_for_exchange(self, sale_order, returned_products, exchange_order_id):
         """Return the Square quantities against their original deliveries."""
         pending = {
             line.square_catalog_id: returned_products[line.square_catalog_id]
@@ -1201,10 +1203,13 @@ class SquareOrderProcessor(models.Model):
             )
             if not picking or picking.state != "done":
                 raise UserError("Could not complete the Square exchange return")
+            picking.square_exchange_order_id = exchange_order_id
             return
 
         for delivery in deliveries:
-            self._create_return_from_picking(delivery, pending)
+            picking = self._create_return_from_picking(delivery, pending)
+            if picking:
+                picking.square_exchange_order_id = exchange_order_id
 
         if any(quantity > 0 for quantity in pending.values()):
             raise UserError("The Square exchange exceeds the quantity available to return")
@@ -1275,17 +1280,15 @@ class SquareOrderProcessor(models.Model):
             if not pending.get(catalog_id):
                 continue
 
-            existing_returns = move.returned_move_ids.filtered(
-                lambda returned: returned.state != "cancel"
-            )
-            available = move.quantity - sum(
-                returned.product_uom._compute_quantity(returned.quantity, move.product_uom)
-                for returned in existing_returns
+            sale_uom = move.sale_line_id.product_uom_id
+            requested = sale_uom._compute_quantity(
+                pending[catalog_id], line.uom_id, round=False
             )
             line.quantity = min(
-                max(move.product_uom.round(available), 0), pending[catalog_id]
+                move._get_square_returnable_quantity(), line.uom_id.round(requested)
             )
-            pending[catalog_id] -= line.quantity
+            allocated = line.uom_id._compute_quantity(line.quantity, sale_uom, round=False)
+            pending[catalog_id] = max(sale_uom.round(pending[catalog_id] - allocated), 0.0)
 
         if not any(wizard.product_return_moves.mapped("quantity")):
             return
@@ -1295,6 +1298,7 @@ class SquareOrderProcessor(models.Model):
         picking.with_context(force_validate=True).button_validate()
         if picking.state != "done":
             raise UserError(f"Could not complete the Square exchange return {picking.name}")
+        return picking
 
     def _create_exchange_credit_note(self, sale_order, returned_products, order_data):
         """

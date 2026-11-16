@@ -1,8 +1,12 @@
-from odoo import models
+from odoo import fields, models
 
 
 class StockPicking(models.Model):
     _inherit = "stock.picking"
+
+    square_exchange_order_id = fields.Char(
+        string="Square Exchange Order ID", copy=False, readonly=True
+    )
 
     def _force_quantity_for_square(self):
         for move in self.move_ids.filtered(lambda move: move.state not in ("done", "cancel")):
