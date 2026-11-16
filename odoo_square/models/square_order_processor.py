@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from decimal import Decimal
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo import models, fields
 from odoo.exceptions import UserError
 import logging
@@ -466,6 +467,18 @@ class SquareOrderProcessor(models.Model):
                     )
                     return result
 
+                snapshot_version = sale_order._square_snapshot_version(square_order_data)
+                # Metadata notifications do not carry the line snapshot's version.
+                if not any(
+                    key in square_order_data
+                    for key in ("line_items", "returns", "return_line_items")
+                ):
+                    fetched_order = self.env["square.api.client"].get_order(square_order_id)
+                    if not fetched_order:
+                        raise ValueError(f"Could not retrieve Square order {square_order_id}")
+                    snapshot_version = sale_order._square_snapshot_version(fetched_order)
+                    square_order_data = {**fetched_order, **square_order_data}
+
                 # Skip line sync when the payload carries return/exchange data;
                 # these must go through the dedicated refund/exchange flows only.
                 returns = square_order_data.get("returns") or square_order_data.get("return_line_items")
@@ -474,8 +487,19 @@ class SquareOrderProcessor(models.Model):
                         f"Order {square_order_id} contains return data in OPEN/DRAFT state, "
                         f"skipping line sync (will be handled by refund/exchange flow)"
                     )
-                else:
+                elif "line_items" in square_order_data:
+                    # Serialize the version check and line writes on the same order.
+                    self.env.cr.execute(
+                        "SELECT id FROM sale_order WHERE id = %s FOR UPDATE", (sale_order.id,)
+                    )
+                    if (
+                        snapshot_version
+                        and snapshot_version <= sale_order._square_applied_order_version()
+                    ):
+                        return {**result, "status": "already_processed"}
                     self._sync_order_line_changes(sale_order, square_order_data)
+                    if snapshot_version:
+                        sale_order.square_order_version = snapshot_version
 
             elif (
                 isinstance(square_order_state, str)
@@ -1281,14 +1305,10 @@ class SquareOrderProcessor(models.Model):
                 continue
 
             sale_uom = move.sale_line_id.product_uom_id
-            requested = sale_uom._compute_quantity(
-                pending[catalog_id], line.uom_id, round=False
+            line.quantity, remaining = move._allocate_square_return_quantity(
+                pending[catalog_id], sale_uom, line.uom_id
             )
-            line.quantity = min(
-                move._get_square_returnable_quantity(), line.uom_id.round(requested)
-            )
-            allocated = line.uom_id._compute_quantity(line.quantity, sale_uom, round=False)
-            pending[catalog_id] = max(sale_uom.round(pending[catalog_id] - allocated), 0.0)
+            pending[catalog_id] = max(sale_uom.round(remaining), 0.0)
 
         if not any(wizard.product_return_moves.mapped("quantity")):
             return
@@ -1854,6 +1874,8 @@ class SquareOrderProcessor(models.Model):
             _logger.info(f"Successfully created refund payment for credit note {credit_note.name}")
             return True
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Failed to create refund payment for credit note {credit_note.name}: {str(e)}")
             return False
@@ -1944,6 +1966,8 @@ class SquareOrderProcessor(models.Model):
             )
             return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error finding outbound payment method line: {str(e)}")
             return None
@@ -1984,6 +2008,8 @@ class SquareOrderProcessor(models.Model):
 
             return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error finding payment journal: {str(e)}")
             return None

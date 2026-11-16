@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import logging
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo import models, api
 
 _logger = logging.getLogger(__name__)
@@ -52,6 +53,17 @@ class StockMove(models.Model):
         )
         return max(self.product_uom.round(self.quantity - committed), 0.0)
 
+    def _allocate_square_return_quantity(self, requested, requested_uom, return_uom):
+        """Cap a return to available stock and keep the remainder in the request unit."""
+        self.ensure_one()
+        quantity = requested_uom._compute_quantity(requested, return_uom, round=False)
+        available = self.product_uom._compute_quantity(
+            self._get_square_returnable_quantity(), return_uom, round=False
+        )
+        quantity = min(return_uom.round(quantity), available)
+        allocated = return_uom._compute_quantity(quantity, requested_uom, round=False)
+        return quantity, requested - allocated
+
     def _trigger_square_sync(self, move):
         """Trigger Square stock synchronization for a completed move"""
         try:
@@ -66,6 +78,8 @@ class StockMove(models.Model):
             # Trigger the sync
             stock_sync.sync_stock_changes(move)
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error triggering Square sync for move {move.display_name}: {str(e)}"

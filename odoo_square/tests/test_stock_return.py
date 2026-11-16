@@ -197,6 +197,41 @@ class TestStockReturn(SquareHttpCase):
             cid = args[1] if len(args) >= 2 else (args[0] if args and isinstance(args[0], str) else None)
         return self._mock_get_catalog(cid) if cid else {"success": False}
 
+    def test_return_allocation_converts_units_and_preserves_unallocated_quantity(self):
+        order = self._create_confirmed_so_with_delivery(quantity=3)
+        delivery = order.picking_ids
+        move = delivery.move_ids
+        unit = move.product_uom
+        dozen = self.env.ref("uom.product_uom_dozen")
+        wizard = self.env["stock.return.picking"].create({"picking_id": delivery.id})
+        wizard.product_return_moves.quantity = 1
+        result = wizard.action_create_returns()
+        reserved_return = self.env["stock.picking"].browse(result["res_id"])
+
+        # Three requested units, with one already reserved by another return.
+        quantity, remainder = move._allocate_square_return_quantity(0.25, dozen, unit)
+        self.assertEqual(quantity, 2)
+        self.assertAlmostEqual(remainder, 1 / 12)
+        allocation = self.env["stock.return.picking"].create({"picking_id": delivery.id})
+        allocation.product_return_moves.quantity = quantity
+        action = allocation.action_create_returns()
+        returned = self.env["stock.picking"].browse(action["res_id"])
+        returned.with_context(force_validate=True).button_validate()
+        self.assertEqual(returned.state, "done")
+        self.assertEqual(self._get_stock(self.product, self.warehouse), 4)
+        quantity, still_remaining = move._allocate_square_return_quantity(remainder, dozen, unit)
+        self.assertEqual(quantity, 0)
+        self.assertAlmostEqual(still_remaining, remainder)
+
+        reserved_return.action_cancel()
+        quantity, remainder = move._allocate_square_return_quantity(remainder, dozen, unit)
+        self.assertEqual(quantity, 1)
+        self.assertAlmostEqual(remainder, 0)
+        # Fractional requests retain their unrounded remainder for split allocations.
+        quantity, remainder = move._allocate_square_return_quantity(0.0104, dozen, unit)
+        self.assertEqual(quantity, 0.12)
+        self.assertAlmostEqual(remainder, 0.0004)
+
     @mute_logger(
         "odoo.addons.odoo_square.models.square_refund",
         "odoo.addons.odoo_square.models.square_order_processor",

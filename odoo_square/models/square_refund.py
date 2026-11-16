@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo import Command, models, fields, api
 from odoo.exceptions import ValidationError, UserError, AccessError
 from collections import defaultdict
@@ -225,6 +226,8 @@ class SquareRefund(models.Model):
                                     _logger.info(
                                         f"Found order {sale_order.name} by Square API order_id {api_order_id} for refund {refund_id}"
                                     )
+                except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                    raise
                 except Exception as e:
                     _logger.warning(
                         f"Failed to fetch refund details from Square API: {str(e)}"
@@ -344,6 +347,8 @@ class SquareRefund(models.Model):
             _logger.warning("Deferring Square refund %s: %s", refund_id, e)
             return {"status": "retry", "message": str(e), "refund_id": refund_id}
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error processing {event_type} refund: {str(e)}", exc_info=True
@@ -359,6 +364,8 @@ class SquareRefund(models.Model):
                     ),
                     technical_details=f"Refund data: {refund_data}\nError: {str(e)}",
                 )
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
             except Exception:
                 pass  # Keep the original processing error if logging fails.
 
@@ -399,6 +406,8 @@ class SquareRefund(models.Model):
             # In the future, we could add a direct refund endpoint if needed
             return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error fetching payment/refund details from Square API: {str(e)}"
@@ -443,6 +452,8 @@ class SquareRefund(models.Model):
                 )
                 return existing_refund
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             # If we can't acquire the lock immediately, another process is creating this refund
             # Fall back to regular search which might find the refund if it was just created
@@ -465,6 +476,8 @@ class SquareRefund(models.Model):
         """
         Update an existing refund record with new Square webhook data
         """
+        if existing_refund.sale_order_id != sale_order:
+            raise ValidationError("Square refund is already linked to a different sale order")
         # Extract updated data
         amount_money = refund_data.get("amount_money", {})
         refund_amount = float(amount_money.get("amount", 0)) / 100.0
@@ -480,11 +493,32 @@ class SquareRefund(models.Model):
             "currency_id": currency.id,
             "sale_order_id": sale_order.id,
             "refund_reason": refund_data.get("reason"),
-            "refunded_line_ids": refund_data.get("refunded_line_ids", []),
+            "refunded_line_ids": refund_data.get(
+                "refunded_line_ids", existing_refund.refunded_line_ids
+            ),
             "square_data": refund_data,
         }
 
+        details_changed = (
+            currency.compare_amounts(existing_refund.refund_amount, refund_amount) != 0
+            or set(existing_refund.refunded_line_ids or ()) != set(vals["refunded_line_ids"] or ())
+        )
         existing_refund.write(vals)
+        if details_changed:
+            # These are provisional reservations owned by this refund. Keep
+            # completed movements and canceled picking links as audit history.
+            square_bot = self._get_bot_user()
+            for picking in existing_refund.return_picking_ids.filtered(
+                lambda picking: picking.state not in ("done", "cancel")
+                and picking.create_uid == square_bot
+            ):
+                open_moves = picking.move_ids.filtered(
+                    lambda move: move.state not in ("done", "cancel")
+                )
+                if picking.move_ids.filtered(lambda move: move.state == "done"):
+                    open_moves._action_cancel()
+                else:
+                    picking.action_cancel()
         _logger.info(f"Updated existing refund record: {existing_refund.display_name}")
         return existing_refund
 
@@ -517,32 +551,9 @@ class SquareRefund(models.Model):
         # Robust idempotency check with database locking (similar to order processing)
         existing_refund = self._check_existing_refund(square_refund_id)
         if existing_refund:
-            _logger.info(
-                f"Found existing refund record: {existing_refund.display_name} (status: {existing_refund.status})"
-            )
-
-            # If already completed, don't reprocess
-            if existing_refund.status == "completed":
-                _logger.info(
-                    f"Refund {square_refund_id} already completed, skipping duplicate processing"
-                )
+            if existing_refund.processed_at:
                 return existing_refund
-
-            # If failed or cancelled, allow reprocessing by updating the existing record
-            if existing_refund.status in ["failed", "cancelled"]:
-                _logger.info(
-                    f"Refund {square_refund_id} was {existing_refund.status}, updating existing record"
-                )
-                # Update the existing record with new data
-                return self._update_existing_refund(
-                    existing_refund, refund_data, sale_order
-                )
-            else:
-                # For pending refunds, return the existing record to continue processing
-                _logger.info(
-                    f"Refund {square_refund_id} is {existing_refund.status}, returning existing record"
-                )
-                return existing_refund
+            return self._update_existing_refund(existing_refund, refund_data, sale_order)
 
         # Extract refund amount
         refund_amount = float(amount_money.get("amount", 0)) / 100.0
@@ -690,9 +701,6 @@ class SquareRefund(models.Model):
             with self.env.cr.savepoint():
                 sale_order = self.sale_order_id
                 is_partial = self._is_partial_refund()
-                self.return_picking_ids = self.return_picking_ids.filtered(
-                    lambda picking: picking.state != "cancel"
-                )
                 if is_partial:
                     self._create_partial_return_pickings()
                 else:
@@ -726,6 +734,8 @@ class SquareRefund(models.Model):
                 )
         except RefundProcessingDeferred:
             raise
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error("Error creating pending refund actions: %s", e)
             self.processing_errors = str(e)
@@ -744,12 +754,16 @@ class SquareRefund(models.Model):
             with self.env.cr.savepoint():
                 self._create_pending_refund_actions()
                 credit_note = self.credit_note_id
+                currency = credit_note.currency_id
                 if credit_note.state == "draft":
-                    if self._is_partial_refund():
+                    # A provisional partial refund can become a full refund.
+                    # Keep rejecting full amounts above the original invoice.
+                    if self._is_partial_refund() or currency.compare_amounts(
+                        self.refund_amount, credit_note.reversed_entry_id.amount_total
+                    ) == 0:
                         self._adjust_credit_note_for_partial_refund(credit_note)
                     credit_note.with_user(bot_user).action_post()
 
-                currency = credit_note.currency_id
                 if currency.compare_amounts(credit_note.amount_total, self.refund_amount) != 0:
                     raise UserError("Le montant de l'avoir ne correspond pas au remboursement Square")
 
@@ -760,7 +774,9 @@ class SquareRefund(models.Model):
                     ) or not currency.is_zero(credit_note.amount_residual):
                         raise UserError("Impossible de comptabiliser le paiement du remboursement Square")
 
-                for picking in self.return_picking_ids.filtered(lambda picking: picking.state != "done"):
+                for picking in self.return_picking_ids.filtered(
+                    lambda picking: picking.state not in ("done", "cancel")
+                ):
                     picking.with_user(bot_user).with_context(
                         force_validate=True,
                         mail_auto_subscribe_no_notify=True,
@@ -828,6 +844,8 @@ class SquareRefund(models.Model):
                 )
         except RefundProcessingDeferred:
             raise
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error("Error completing refund: %s", e)
             self.processing_errors = str(e)
@@ -873,18 +891,11 @@ class SquareRefund(models.Model):
                 if requested <= 0:
                     continue
 
-                requested = sale_line.product_uom_id._compute_quantity(
-                    requested, line.uom_id, round=False
-                )
-                line.quantity = min(
-                    line.uom_id.round(requested),
-                    line.move_id._get_square_returnable_quantity(),
+                line.quantity, remaining[sale_line] = line.move_id._allocate_square_return_quantity(
+                    requested, sale_line.product_uom_id, line.uom_id
                 )
                 if line.quantity:
                     line.to_refund = True
-                    remaining[sale_line] -= line.uom_id._compute_quantity(
-                        line.quantity, sale_line.product_uom_id, round=False
-                    )
                     _logger.info(
                         "Configured refund %s return for %s: %s on delivery %s",
                         self.square_refund_id, sale_line.product_id.name, line.quantity,
@@ -1050,6 +1061,17 @@ class SquareRefund(models.Model):
                     - return_moves
                 )
             )
+
+        if self.status == "completed":
+            blocked_returns = (
+                delivery_pickings.move_ids.returned_move_ids - self.return_picking_ids.move_ids
+            ).filtered(
+                lambda move: move.state not in ("done", "cancel") and move.product_uom_qty > 0
+            )
+            if blocked_returns:
+                raise RefundProcessingDeferred(
+                    "Un autre retour réserve les articles de ce remboursement."
+                )
 
         wizard_model = self.env["stock.return.picking"].with_user(self._get_bot_user())
         for delivery in delivery_pickings:
@@ -1392,6 +1414,8 @@ class SquareRefund(models.Model):
                 "refunds": order_data.get("refunds", []),
             }
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error fetching order details from Square: {str(e)}")
             return None
@@ -1747,6 +1771,8 @@ class SquareRefund(models.Model):
                 sale_order_id=self.sale_order_id.id,
             )
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error handling failed refund: {str(e)}")
 
@@ -1783,5 +1809,7 @@ class SquareRefund(models.Model):
                 sale_order_id=self.sale_order_id.id,
             )
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error handling cancelled refund: {str(e)}")

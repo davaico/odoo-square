@@ -3,6 +3,7 @@ import requests
 import json
 import logging
 from datetime import datetime, timezone
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo import models, api, fields
 from odoo.exceptions import UserError
 
@@ -102,6 +103,8 @@ class SquareApiClient(models.Model):
                 )
                 return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(f"Error fetching order {order_id} from Square API: {str(e)}")
             return None
@@ -406,6 +409,8 @@ class SquareApiClient(models.Model):
                 )
                 return None
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error fetching payment {payment_id} from Square API: {str(e)}"
