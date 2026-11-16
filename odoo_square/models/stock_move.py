@@ -51,7 +51,7 @@ class StockMove(models.Model):
 
         except Exception as e:
             _logger.error(
-                f"Error triggering Square sync for move {move.name}: {str(e)}"
+                f"Error triggering Square sync for move {move.display_name}: {str(e)}"
             )
 
     def _action_done(self, cancel_backorder=False):

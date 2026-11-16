@@ -89,7 +89,7 @@ class SquareStockSync(models.Model):
             return False
 
         # Only sync stockable products
-        if product.type != "product":
+        if not product.is_storable:
             _logger.info(f"Skipping product {product.name} - not stockable")
             return False
 
@@ -346,18 +346,18 @@ class SquareStockSync(models.Model):
 
         # Skip if Square-sourced move
         if self._is_square_sourced_move(stock_move):
-            _logger.info(f"Skipping Square-sourced move: {stock_move.name}")
+            _logger.info(f"Skipping Square-sourced move: {stock_move.display_name}")
             return
 
         # Skip if move is not done
         if stock_move.state != "done":
-            _logger.debug(f"Skipping non-done move: {stock_move.name}")
+            _logger.debug(f"Skipping non-done move: {stock_move.display_name}")
             return
 
         # Determine which warehouse this move affects
         affected_warehouse = self._get_affected_warehouse(stock_move)
         if not affected_warehouse:
-            _logger.debug(f"No mapped warehouse affected by move: {stock_move.name}")
+            _logger.debug(f"No mapped warehouse affected by move: {stock_move.display_name}")
             return
 
         # Find the corresponding location mapping
@@ -366,7 +366,7 @@ class SquareStockSync(models.Model):
             _logger.debug(f"No Square location mapping found for warehouse {affected_warehouse.name}")
             return
 
-        _logger.info(f"Processing stock move for Square sync: {stock_move.name} (warehouse: {affected_warehouse.name}, location: {square_location_id})")
+        _logger.info(f"Processing stock move for Square sync: {stock_move.display_name} (warehouse: {affected_warehouse.name}, location: {square_location_id})")
 
         # Get current stock quantity for this warehouse
         stock_quant = self.env["stock.quant"].search(
@@ -387,11 +387,11 @@ class SquareStockSync(models.Model):
             )
             self.env["square.integration.log"].log_square_event(
                 event_type="stock_sync",
-                title=f"Stock synchronisé suite au mouvement {stock_move.name}",
+                title=f"Stock synchronisé suite au mouvement {stock_move.display_name}",
                 description=f"""
                     <h4>Stock Synchronization Triggered by Movement</h4>
                     <ul>
-                        <li><strong>Stock movement:</strong> {stock_move.name}</li>
+                        <li><strong>Stock movement:</strong> {stock_move.display_name}</li>
                         <li><strong>Product:</strong> {stock_move.product_id.name}</li>
                         <li><strong>SKU :</strong> <code>{stock_move.product_id.default_code}</code></li>
                         <li><strong>Moved quantity:</strong> {stock_move.quantity}</li>
