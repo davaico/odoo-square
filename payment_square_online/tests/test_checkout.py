@@ -84,6 +84,21 @@ class SquareOnlineCheckoutCase(HttpCase):
     def _square_response(body, status=200):
         return Mock(status_code=status, json=Mock(return_value=body))
 
+    def _call(self, model, method, ids, *, button=False, **kwargs):
+        endpoint = "call_button" if button else "call_kw"
+        return self.make_jsonrpc_request(f"/web/dataset/{endpoint}/{model}/{method}", {
+            "model": model, "method": method, "args": [ids], "kwargs": kwargs,
+        })
+
+    def _open_refund(self, payment, amount=None):
+        action = self._call("account.payment", "action_refund_wizard", payment.ids, button=True)
+        self.assertEqual(action["res_model"], "payment.refund.wizard")
+        values = {"payment_id": payment.id}
+        if amount is not None:
+            values["amount_to_refund"] = amount
+        wizard_id = self._call("payment.refund.wizard", "create", values)
+        return [wizard_id]
+
     def _make_order(self, product=None):
         return self.env["sale.order"].create({
             "partner_id": self.partner.id,

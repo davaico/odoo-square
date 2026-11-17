@@ -2,16 +2,21 @@
 
 ## Install
 
-Place `payment_square_online` on the Odoo addons path, restart Odoo, update the Apps list, and install **Square Online Payments**. The addon uses Odoo eCommerce and Accounting. The Square POS integration is optional. This guide is for a self-hosted Odoo 19 Community website; Odoo Online, the hosted service, does not allow deployment of this custom addon.
+Use a self-hosted Odoo 19 Community database for your Odoo online store. Odoo Online hosting is incompatible with this custom addon. The addon installs Odoo eCommerce and its accounting dependencies. Square POS is optional. [Odoo Online hosting](https://www.odoo.com/documentation/19.0/administration/odoo_online.html)
 
-The repository's Compose setup mounts the addon. On a fresh database, run:
+For an existing self-hosted installation, place `payment_square_online` on the addons path, ensure the Odoo Python environment includes `cryptography` and `requests`, restart Odoo, update the Apps list, and install **Square Online Payments**.
+
+For a fresh local database with Docker Compose, copy `.env.example` to the private `.env` file. Set `DB_PASSWORD`, `DB_NAME=odoo_square_v19`, and `ODOO_PORT=8070`. The loopback port 8070 lets this instance run separately from an Odoo 18 instance on port 8069. Use the same database name in the install command and the environment file.
 
 ```bash
-docker compose run --rm odoo odoo --database=odoo_square_v19 --init=payment_square_online --stop-after-init
-docker compose up -d
+docker compose --project-name odoo-square-v19 run --rm odoo \
+  odoo --database=odoo_square_v19 --init=payment_square_online --stop-after-init
+docker compose --project-name odoo-square-v19 up -d
 ```
 
-Set `SQUARE_ONLINE_ENCRYPTION_KEY` in the Odoo service environment before adding credentials. For the included Compose setup, put it in the private `.env` file. Generate a Fernet key with:
+Open [Odoo at localhost port 8070](http://localhost:8070), sign in with the initial `admin` login and password, and change the password. The database and filestore remain in this Compose project's volumes. PostgreSQL is reachable on the project's internal network.
+
+Before saving Square credentials, set `SQUARE_ONLINE_ENCRYPTION_KEY` in the Odoo service environment. With Compose, add the key to the private `.env` file and run `docker compose --project-name odoo-square-v19 up -d odoo` to apply it. Generate a Fernet key with the following command.
 
 ```bash
 python3 -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())'
@@ -19,11 +24,17 @@ python3 -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token
 
 Use the same key for all Odoo processes serving the database. Back it up privately alongside your Odoo recovery materials. Restoring an Odoo database requires its original key to read the saved Square credentials.
 
+### Prepare the company and store
+
+1. Set up the chart of accounts for the company that owns the website. Open **Invoicing → Configuration → Journals** and configure that company's bank journal. For sandbox refunds, enable its outgoing **Manual** payment method with an **Outstanding Payments Account**. Check the currency against the [currency rules](#companies-websites-and-currencies).
+2. In **Website → Configuration → Settings**, select the intended website. Enable pricelists if needed and assign a pricelist in the Sandbox seller's currency. Publish a test product with a nonzero price. A service product lets you run the first checkout without configuring stock or shipping.
+3. Enable **Automatic Invoice** in the website settings if your product's invoicing policy allows invoicing ordered quantities and you want online payment to generate an invoice. With delivered-quantity invoicing, use Odoo's standard delivery and invoicing workflow. [Odoo eCommerce order handling](https://www.odoo.com/documentation/19.0/applications/websites/ecommerce/order_handling.html) · [Odoo invoicing policies](https://www.odoo.com/documentation/19.0/applications/sales/sales/invoicing/invoicing_policy.html)
+
 ## Create and authorize your Square application
 
 1. Open the [Square Developer Console](https://developer.squareup.com/apps) and create an application owned by your business. Open its **OAuth** page and choose **Sandbox**.
 2. In Odoo, go to **Website → Configuration → eCommerce → Payment Providers → Square Online → Credentials**. Select **Manage Square Connections** and create a connection. Set its company, select **Sandbox**, and enter the corresponding application ID and secret from Square.
-3. Copy the connection's **OAuth Redirect URL** into the Square application's **OAuth → Redirect URL** setting. The path is `/payment/square_online/oauth/callback`. Odoo builds the URL from its `web.base.url` system parameter. Use HTTPS on a public host. For OAuth testing through a local browser, Square also allows a Sandbox URL such as `http://localhost:8070/payment/square_online/oauth/callback`. Open Odoo with that same hostname and port when starting authorization.
+3. Copy the connection's **OAuth Redirect URL** into the Square application's **OAuth → Redirect URL** setting. Odoo takes the origin from `web.base.url`, which you can set in developer mode under **Settings → Technical → Parameters → System Parameters**. Use HTTPS for public hosts. For a loopback Sandbox test, set the origin to `http://localhost:8070` and register `http://localhost:8070/payment/square_online/oauth/callback`. Open Odoo on that exact origin before starting authorization. Set `web.base.url.freeze` to `True` if administrators also visit this database on another origin. If you test another Odoo instance, give it a separate Sandbox application so each application can point to the correct callback.
 4. Open the Sandbox Square Dashboard for a test seller in a separate tab in the same browser. Return to the connection form and select **Authorize with Square**. Grant access to the intended seller account. Odoo displays the result and verified merchant ID when Square returns.
 5. Choose a **Square Location**. The location selector shows active locations from the authorized account with card processing and a supported processing currency. The form shows the selected country's code and currency.
 
@@ -33,7 +44,6 @@ Use the same key for all Odoo processes serving the database. Back it up private
 
 1. Return to **Square Online → Credentials** and choose your **Sandbox Connection**. Under **Configuration**, choose a bank **Payment Journal** from the same Odoo company. Follow the currency rules below when selecting the journal.
 2. Set the provider to **Test Mode**. Select a **Website** beside the provider state if the provider should only appear on that website. Odoo shows this field when the user has multi-website access. Use the normal Odoo **Published** control to make the provider available to shoppers.
-3. When ready to use live payments, configure the application's **Production** OAuth settings separately with an HTTPS URL and production credentials. Create a separate **Production** connection, authorize the production seller, choose its location, and assign it as the provider's **Production Connection**. Review the company, journal, website, and location before switching the provider to **Enabled**. To stop offering Square, set the provider to **Disabled**.
 
 ## Companies, websites, and currencies
 
@@ -57,24 +67,34 @@ Odoo renews the merchant's OAuth access automatically, generally every seven day
 
 ## Make a sandbox payment
 
-1. With **Square Online** in **Test Mode** and published, open the store in a shopper session. Use an HTTPS checkout origin. For testing on the same computer as Odoo, Square also supports the browser's secure localhost context.
+1. With **Square Online** in **Test Mode** and published, open the store in a shopper session. Use an HTTPS checkout origin with the [checkout security policy](#configure-checkout-security). For testing on the same computer as Odoo, use the browser's secure localhost context and apply the policy to that origin too.
 2. Put a product in the cart, enter the billing and shipping details, and select a delivery method if Odoo asks for one. Check that the order currency matches the Sandbox location. Select **Card** secured by **Square Online**.
-3. Use the [Square Sandbox test cards](https://developer.squareup.com/docs/devtools/sandbox/payments) in the embedded card form. Select **Pay now** and complete the bank verification prompt when the chosen test card requires it.
-4. Confirm that the existing Odoo order is confirmed and the charge appears in the Square Sandbox seller's transactions. Check the payment in Odoo Accounting and the order's invoice if automatic invoicing is enabled. Odoo handles delivery through its normal fulfillment workflow.
-5. Try a Sandbox decline card to see how checkout handles a definitive failure. If a payment remains processing after an interruption, keep the order reference for support and check its status before trying to pay again.
+3. Pay on desktop with a documented success test card, then repeat on a phone or mobile emulation with Square's authentication-required test card. Enter Square's documented test verification code when prompted. Use the success, Strong Customer Authentication, and decline cases in Square's test card tables. [Square Sandbox test cards](https://developer.squareup.com/docs/devtools/sandbox/payments)
+4. Check the capture in the Sandbox seller's transactions, the confirmed Odoo order, and the posted payment under **Invoicing → Customers → Payments**. Check the invoice when automatic invoicing is enabled. Odoo handles deliveries through its normal fulfillment workflow.
+5. Try the Sandbox decline case and confirm the failed attempt leaves the order unpaid. To check interruption recovery, interrupt the shopper's connection after submitting a test payment, then compare the order's Square transaction and Odoo payment history. If Odoo still shows processing, keep the order reference and use **Refresh status** before allowing a new attempt.
+6. Use the [native refund workflow](#refund-a-square-online-payment) and confirm the outcome in both systems. A partial refund followed by the remaining amount exercises the refundable balance after each refund.
 
-Square requires a Content Security Policy on the checkout page. Configure the checkout host to allow the selected environment's Square SDK and its frame, network, stylesheet, and font origins. Check that the policy also allows your Odoo assets. [Square Web Payments SDK security policy](https://developer.squareup.com/docs/web-payments/content-security-policy)
+### Configure checkout security
 
-The automated checkout tests simulate Square's SDK and API. Use Square Sandbox to qualify your store's actual card form, authentication, and capture.
+Set a Content Security Policy (CSP) on the checkout host. Merge Square's environment-specific script, frame, network, stylesheet, and font origins into the policy that serves your Odoo assets. The SDK loads from `https://sandbox.web.squarecdn.com` in Sandbox and `https://web.squarecdn.com` in Production. In a Sandbox checkout on Odoo 19, Chrome also needed `https://api.squareupsandbox.com` in `frame-src` to display the 3-D Secure challenge. [Square Web Payments SDK security policy](https://developer.squareup.com/docs/web-payments/content-security-policy)
+
+Check console violations while loading the card form and completing issuer verification on your own checkout origin. Odoo scripts, inline styles, fonts, and Owl template compilation can have additional requirements depending on your website assets. Allow the specific resources your checkout needs and validate the resulting policy in each deployment environment.
 
 ## Set up Square webhooks
 
 1. Open a saved Square connection in Odoo. Copy its **Webhook Route** and add the public HTTPS origin that routes to this Odoo database. For example, join `https://shop.example.com` with `/payment/square_online/webhook/1`.
 2. In the Square Developer Console, select the application's environment and open **Webhooks → Subscriptions**. Create a subscription with that notification URL in the same Sandbox or Production environment as the connection. Choose Square API version `2026-09-16` and select `payment.created`, `payment.updated`, `refund.created`, `refund.updated`, and `oauth.authorization.revoked`.
 3. Enter the exact subscription URL in Odoo's **Webhook Notification URL** field and paste the subscription's **Webhook Signature Key**. Save the connection. Odoo checks the signature against that exact URL and the unmodified request body, so preserve the POST body through the reverse proxy. Copy the replacement key to Odoo when rotating the subscription key.
-4. Complete a Sandbox checkout and verify both the event delivery in Square and the corresponding transaction in Odoo. Keep the subscriptions for historical connections while their transactions may still need reconciliation. To turn off an endpoint in Odoo, clear its notification URL.
+4. With the HTTPS route reachable by Square, complete a Sandbox checkout and refund. In the Developer Console's webhook event logs, check for a successful HTTP 2xx delivery to the exact subscribed URL. In Odoo, check the payment and linked refund in **Square Payment History**. A loopback-only checkout can recover status by polling or **Refresh status**. Qualify actual notification delivery separately on the public HTTPS endpoint.
+5. Keep the subscriptions for historical connections while their transactions may still need reconciliation. To turn off an endpoint in Odoo, clear its notification URL.
 
 [Square webhook subscriptions](https://developer.squareup.com/docs/webhooks/step2subscribe) · [Square notification signatures](https://developer.squareup.com/docs/webhooks/step3validate)
+
+## Enable production payments
+
+Complete the Sandbox checkout, refund, and HTTPS notification checks before publishing live payments. Configure the production checkout origin and its CSP, then register the exact HTTPS OAuth callback in the application's **Production** settings. Create a separate **Production** connection in Odoo, authorize the production seller, select its location, and register the corresponding Production webhook subscription.
+
+Select the **Production Connection** on the provider. Review the company, website, payment journal, location, and checkout currency. Use **Enabled** and **Published** to offer Square to eligible customers. Use **Disabled** to stop offering it at checkout. Keep the original Sandbox and Production connections for historical recovery and refunds.
 
 ## Run alongside Square POS
 
@@ -105,7 +125,7 @@ The deterministic recovery tests simulate Square API responses and sign represen
 
 Accounting managers and administrators can refund captured Square payments in their allowed Odoo companies. Keep the outbound **Manual** payment method available on the original bank journal and configure its outstanding payments account.
 
-1. In Odoo Accounting, open the posted customer payment for the website order and select **Refund**. The wizard shows the completed refunds and the remaining amount available after both completed and pending refunds. The refund amount defaults to the available balance. Enter a smaller positive amount for a partial refund, in the original payment currency. JPY amounts must be whole yen.
+1. In **Invoicing → Customers → Payments**, open the posted payment for the website order and select **Refund**. The wizard shows the completed refunds and the remaining amount available after both completed and pending refunds. The refund amount defaults to the available balance. Enter a smaller positive amount for a partial refund, in the original payment currency. JPY amounts must be whole yen.
 2. Confirm **Refund**, then open **Square Payment History** and select the linked refund transaction. The history shows the amount, original transaction, requesting user, status, and verified Square refund ID as each becomes available.
 3. Odoo reserves the requested amount and checks the original payment's balance in Square before dispatch. If you need to return an additional amount, open a new wizard and check the balance shown there. If an existing refund still shows **Pending** after dispatch, use **Refresh status** on that refund to check its outcome. The reservation stays in place while the outcome is unknown and is released when failure is confirmed. If Odoo requests reauthorization, reconnect the original Square account.
 4. Each completed refund creates a posted outbound customer payment in the original journal and currency. Confirm the refund in Square Sandbox and check the related outbound payment in Odoo. Create and reconcile any required credit note separately in Accounting. Process any return of goods separately in Inventory.
@@ -118,10 +138,47 @@ When you refund a website payment in the Square Dashboard, Odoo links the refund
 
 Pending Square refunds reduce the available balance shown in Odoo. Completed Square refunds post an outbound payment in the original journal and currency. Synchronization retrieves the existing refund from Square. Create any required credit note in Accounting and process any goods return separately in Inventory.
 
-## Test refund concurrency
+## Run the automated Odoo 19 tests
 
-Use a fresh, disposable Odoo 19 test database with `payment_square_online` installed, a USD company with a bank journal, and the test encryption key configured. The fixture runs simultaneous Odoo refund requests and an overlapping Square refund and Odoo request on separate PostgreSQL connections. It checks the posted refunds with a simulated Square API and commits test records.
+Run the following commands from the repository root in Bash. The browser test image uses Linux amd64 and adds pinned Chrome and its Python WebSocket dependency to the Odoo 19 Community image. If the pinned package is no longer available, select a compatible Odoo 19 test image with a working Chrome or Chromium binary and `python3-websocket` by setting `ODOO_TEST_IMAGE` to its local tag.
 
 ```bash
-odoo shell -d odoo_square_test --no-http < payment_square_online/tests/refund_race.py
+docker build -f config/Dockerfile.test -t odoo-square-v19-browser-test config
+export ODOO_TEST_IMAGE=odoo-square-v19-browser-test
+
+run_square_tests() (
+  set -e -o pipefail
+  export SQUARE_ONLINE_TEST_ENCRYPTION_KEY
+  SQUARE_ONLINE_TEST_ENCRYPTION_KEY=$(python3 -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')
+  local compose=(docker compose --project-name "odoo-square-v19-test-$(date +%s)-$BASHPID" -f docker-compose.test.yml)
+  trap '"${compose[@]}" down --volumes' EXIT
+  "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_test \
+    --init="$1" --test-tags="$2" --workers=0 --stop-after-init --log-level=test 2>&1 | tee "$3"
+  grep -E '0 failed, 0 error\(s\) of [1-9][0-9]* tests when loading database' "$3"
+)
+
+run_square_tests payment_square_online,website_sale_stock \
+  /payment_square_online,-/payment_square_online:TestSquareOnlinePosCoexistence square-online-test.log
+run_square_tests payment_square_online,website_sale_stock,odoo_square \
+  /payment_square_online,/odoo_square square-combined-test.log
+```
+
+Each run uses fresh project-scoped database and filestore volumes and publishes no ports. `website_sale_stock` enables Odoo's website stock workflows used by some online tests. The standalone selection excludes the POS coexistence class because POS is absent. In the combined run, check that `TestSquareOnlinePosCoexistence` ran. Check both logs for skipped tests and confirm that the checkout browser case ran in Chrome. These suites exercise Odoo checkout, accounting, and POS workflows while simulating Square's SDK and API. Complete the [Sandbox payment and refund checks](#make-a-sandbox-payment) for evidence against Square itself.
+
+### Exercise concurrent refunds
+
+The concurrency fixture uses separate PostgreSQL connections to submit simultaneous Odoo refunds and overlap a Square refund with an Odoo request. It simulates Square's API and checks the posted refunds. It commits test records, so run it in a fresh disposable project with a USD company and bank journal.
+
+```bash
+(
+  set -e
+  export SQUARE_ONLINE_TEST_ENCRYPTION_KEY
+  SQUARE_ONLINE_TEST_ENCRYPTION_KEY=$(python3 -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')
+  compose=(docker compose --project-name "odoo-square-v19-race-$(date +%s)-$BASHPID" -f docker-compose.test.yml)
+  trap '"${compose[@]}" down --volumes' EXIT
+  "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_test \
+    --init=payment_square_online --stop-after-init --no-http
+  "${compose[@]}" run --rm -T odoo odoo shell --database=odoo_square_test --no-http \
+    < payment_square_online/tests/refund_race.py
+)
 ```

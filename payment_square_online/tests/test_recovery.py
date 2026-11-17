@@ -228,14 +228,8 @@ class TestSquareOnlineRecovery(SquareOnlineCheckoutCase):
         self.assertEqual(self.url_open(f"{callback}?{params}", allow_redirects=False).status_code, 303)
         self.env.invalidate_all()
 
-    @patch(square_boundary)
-    def test_revoked_connection_recovers_only_after_original_merchant_reconnects(self, external):
-        self._configure_webhook()
-        order, payment = self._accepted_charge_timeout(external)
-        tx = order.transaction_ids
-        other_order = self._make_order()
-        draft = self._prepare(other_order, self._open_payment_page(other_order))
-        event = {
+    def _revocation_event(self):
+        return {
             "type": "oauth.authorization.revoked",
             "merchant_id": "MERCHANT_TEST",
             "event_id": "square-oauth-revocation",
@@ -247,6 +241,35 @@ class TestSquareOnlineRecovery(SquareOnlineCheckoutCase):
                 }},
             },
         }
+
+    def _authenticate_connection_admin(self):
+        self.env.ref("base.user_admin").password = "square-reconnect-admin"
+        self.env["ir.config_parameter"].set_param("web.base.url", "https://shop.example.test")
+        self.env["ir.config_parameter"].set_param("web.base.url.freeze", "True")
+        self.authenticate("admin", "square-reconnect-admin")
+
+    def _select_replacement_connection(self, external):
+        replacement = self.env["square.online.connection"].create({
+            "name": "Replacement Sandbox",
+            "company_id": self.company.id,
+            "application_id": "sandbox-sq0idp-replacement",
+            "application_secret": "replacement-secret",
+        })
+        self._authorize_connection(
+            replacement, external, merchant="OTHER_MERCHANT", access="replacement-token", location="OTHER-LOC",
+        )
+        replacement.location_id = replacement.available_location_ids
+        self.provider.square_online_sandbox_connection_id = replacement
+
+    @patch(square_boundary)
+    def test_revoked_connection_recovers_only_after_original_merchant_reconnects(self, external):
+        self._configure_webhook()
+        order, payment = self._accepted_charge_timeout(external)
+        tx = order.transaction_ids
+        other_order = self._make_order()
+        draft = self._prepare(other_order, self._open_payment_page(other_order))
+        event = self._revocation_event()
+
         self.assertEqual(self._send_webhook(event, environment="Production").status_code, 200)
         self.assertEqual(self._send_webhook(event, transform=lambda raw: raw.rstrip()).status_code, 403)
         self.env.invalidate_all()
@@ -262,26 +285,13 @@ class TestSquareOnlineRecovery(SquareOnlineCheckoutCase):
         self.assertEqual(other_order.transaction_ids.state, "draft")
         external.assert_called_once()
 
-        self.env.ref("base.user_admin").password = "square-reconnect-admin"
-        self.env["ir.config_parameter"].set_param("web.base.url", "https://shop.example.test")
-        self.env["ir.config_parameter"].set_param("web.base.url.freeze", "True")
-        self.authenticate("admin", "square-reconnect-admin")
+        self._authenticate_connection_admin()
         self._authorize_connection(self.connection, external, merchant="OTHER_MERCHANT", access="wrong-token")
         self.assertIn("different merchant", self.connection.oauth_status_message)
         self.assertEqual(self.connection.oauth_health, "reconnect")
         self.assertEqual(self.connection.merchant_id, "MERCHANT_TEST")
 
-        replacement = self.env["square.online.connection"].create({
-            "name": "Replacement Sandbox",
-            "company_id": self.company.id,
-            "application_id": "sandbox-sq0idp-replacement",
-            "application_secret": "replacement-secret",
-        })
-        self._authorize_connection(
-            replacement, external, merchant="OTHER_MERCHANT", access="replacement-token", location="OTHER-LOC",
-        )
-        replacement.location_id = replacement.available_location_ids
-        self.provider.square_online_sandbox_connection_id = replacement
+        self._select_replacement_connection(external)
         external.reset_mock()
         external.side_effect = AssertionError("Recovery must wait for the original merchant.")
         self.assertEqual(self._call_refresh(tx)["tag"], "reload")
@@ -304,6 +314,145 @@ class TestSquareOnlineRecovery(SquareOnlineCheckoutCase):
         self.assertFalse(tx.square_online_recovery_message)
         self.assertEqual(external.call_args.args, ("GET", "https://connect.squareupsandbox.com/v2/payments"))
         self.assertEqual(external.call_args.kwargs["headers"]["Authorization"], "Bearer restored-token")
+
+    @patch(square_boundary)
+    def test_captured_payment_and_pending_refund_keep_the_original_connection(self, external):
+        self._configure_webhook()
+        self.env["ir.config_parameter"].set_param("sale.automatic_invoice", "True")
+        order, payment = self._accepted_charge_timeout(external)
+        self.assertEqual(self._signed_webhook(payment).status_code, 200)
+        post_process = self.env.ref("payment.cron_post_process_payment_tx")
+        post_process.method_direct_trigger()
+        self.env.invalidate_all()
+        tx = order.transaction_ids
+        incoming = tx.payment_id
+        invoice = order.invoice_ids
+        self.assertEqual(incoming.move_id.state, "posted")
+        self.assertEqual(invoice.amount_residual, 0)
+
+        manager = new_test_user(
+            self.env, login="square-historical-refund-manager", groups="account.group_account_manager",
+            company_id=self.company.id, company_ids=[Command.set(self.company.ids)],
+        )
+        self.authenticate(manager.login, manager.login)
+        first_wizard = self._open_refund(incoming, amount=12)
+        self._call("payment.refund.wizard", "action_refund", first_wizard, button=True)
+        self.env.invalidate_all()
+        pending = tx.child_transaction_ids
+        first_refund = {
+            "id": "SQUARE-PARTIAL-REFUND",
+            "payment_id": payment["id"],
+            "location_id": "SQUARE-NY",
+            "amount_money": {"amount": 1200, "currency": "USD"},
+            "reason": pending.square_online_refund_reason,
+            "status": "PENDING",
+        }
+        dispatch = self.env.ref("payment_square_online.cron_square_online_dispatch_refunds")
+        external.side_effect = [
+            self._square_response({"payment": payment}),
+            self._square_response({"refund": first_refund}),
+        ]
+        dispatch.method_direct_trigger()
+        self.env.invalidate_all()
+        self.assertEqual(pending.state, "pending")
+        self.assertEqual(pending.provider_reference, first_refund["id"])
+        self.assertFalse(pending.payment_id)
+        self.assertEqual(incoming.amount_available_for_refund, 35)
+
+        self.assertEqual(self._send_webhook(self._revocation_event()).status_code, 200)
+        self._authenticate_connection_admin()
+        self._select_replacement_connection(external)
+        self.authenticate(manager.login, manager.login)
+        external.reset_mock()
+        external.side_effect = AssertionError("The replacement connection cannot recover historical operations.")
+        self.assertEqual(self._call_refresh(tx)["tag"], "reload")
+        self.assertEqual(self._call_refresh(pending)["tag"], "reload")
+        self.env.invalidate_all()
+        self.assertEqual(tx.state, "done")
+        self.assertEqual(pending.state, "pending")
+        for operation in tx | pending:
+            self.assertIn("Reauthorize the original connection", operation.square_online_recovery_message)
+        external.assert_not_called()
+
+        self._authenticate_connection_admin()
+        self._authorize_connection(self.connection, external, merchant="MERCHANT_TEST", access="restored-token")
+        self._expire_access_token(self.connection)
+        self.authenticate(manager.login, manager.login)
+        first_refund["status"] = "COMPLETED"
+        captured = {
+            **payment, "refund_ids": [first_refund["id"]],
+            "refunded_money": first_refund["amount_money"],
+        }
+        external.reset_mock()
+        external.side_effect = [
+            self._square_response({
+                "merchant_id": "MERCHANT_TEST",
+                "access_token": "renewed-historical-token",
+                "refresh_token": "restored-token-refresh",
+                "token_type": "bearer",
+                "expires_at": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+            }),
+            self._square_response({"payment": captured}),
+            self._square_response({"refund": {**first_refund, "status": "PENDING"}}),
+            self._square_response({"refund": first_refund}),
+        ]
+        self.assertEqual(self._call_refresh(tx)["tag"], "reload")
+        self.assertEqual(self._call_refresh(pending)["tag"], "reload")
+        post_process.method_direct_trigger()
+        self.env.invalidate_all()
+        self.assertEqual(pending.state, "done")
+        self.assertEqual(pending.payment_id.amount, 12)
+        self.assertEqual(incoming.amount_available_for_refund, 35)
+
+        next_wizard = self._open_refund(incoming)
+        self._call("payment.refund.wizard", "action_refund", next_wizard, button=True)
+        self.env.invalidate_all()
+        remainder = tx.child_transaction_ids - pending
+        external.side_effect = [
+            self._square_response({"payment": captured}),
+            self._square_response({"refund": first_refund}),
+            self._square_response({"refund": {
+                **first_refund, "id": "SQUARE-REMAINDER-REFUND", "reason": remainder.square_online_refund_reason,
+                "amount_money": {"amount": 3500, "currency": "USD"},
+            }}),
+        ]
+        dispatch.method_direct_trigger()
+        post_process.method_direct_trigger()
+        self.env.invalidate_all()
+        api = "https://connect.squareupsandbox.com/v2"
+        self.assertEqual([call.args for call in external.call_args_list], [
+            ("POST", "https://connect.squareupsandbox.com/oauth2/token"),
+            ("GET", f"{api}/payments/{payment['id']}"),
+            ("GET", f"{api}/refunds/{first_refund['id']}"),
+            ("GET", f"{api}/refunds/{first_refund['id']}"),
+            ("GET", f"{api}/payments/{payment['id']}"),
+            ("GET", f"{api}/refunds/{first_refund['id']}"),
+            ("POST", f"{api}/refunds"),
+        ])
+        renewal, *requests = external.call_args_list
+        self.assertEqual(renewal.kwargs["json"]["grant_type"], "refresh_token")
+        self.assertEqual(renewal.kwargs["json"]["client_id"], self.connection.application_id)
+        self.assertEqual(renewal.kwargs["json"]["refresh_token"], "restored-token-refresh")
+        for call in requests:
+            self.assertEqual(call.kwargs["headers"]["Authorization"], "Bearer renewed-historical-token")
+        self.assertEqual(external.call_args.kwargs["json"]["payment_id"], payment["id"])
+        self.assertEqual(external.call_args.kwargs["json"]["amount_money"], {"amount": 3500, "currency": "USD"})
+        self.assertEqual(remainder.state, "done")
+        self.assertEqual(remainder.payment_id.amount, 35)
+        self.assertEqual(incoming.amount_available_for_refund, 0)
+        self.assertEqual(order.state, "sale")
+        self.assertEqual(order.invoice_ids, invoice)
+        self.assertEqual(invoice.amount_residual, 0)
+        self.assertEqual(tx.payment_id, incoming)
+        for operation in tx | pending | remainder:
+            self.assertEqual(operation.square_online_connection_id, self.connection)
+            self.assertEqual(operation.square_online_location_id, "SQUARE-NY")
+            self.assertFalse(operation.square_online_recovery_message)
+        for refund in (pending | remainder).payment_id:
+            self.assertEqual(refund.source_payment_id, incoming)
+            self.assertEqual(refund.journal_id, self.journal)
+            self.assertEqual(refund.payment_type, "outbound")
+            self.assertEqual(refund.move_id.state, "posted")
 
     @patch(square_boundary)
     def test_signed_notification_recovers_charge_after_browser_closes(self, external):
@@ -386,10 +535,7 @@ class TestSquareOnlineRecovery(SquareOnlineCheckoutCase):
         external.assert_called_once()
 
     def _call_refresh(self, tx):
-        method = "action_square_online_refresh_status"
-        return self.make_jsonrpc_request(f"/web/dataset/call_button/payment.transaction/{method}", {
-            "model": "payment.transaction", "method": method, "args": [tx.ids], "kwargs": {},
-        })
+        return self._call("payment.transaction", "action_square_online_refresh_status", tx.ids, button=True)
 
     @patch(square_boundary)
     def test_account_manager_refreshes_the_original_location_and_follows_list_pages(self, external):

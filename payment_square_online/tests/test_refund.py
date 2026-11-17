@@ -27,12 +27,6 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
             company_id=cls.company.id, company_ids=[Command.set(cls.company.ids)],
         )
 
-    def _call(self, model, method, ids, *, button=False, **kwargs):
-        endpoint = "call_button" if button else "call_kw"
-        return self.make_jsonrpc_request(f"/web/dataset/{endpoint}/{model}/{method}", {
-            "model": model, "method": method, "args": [ids], "kwargs": kwargs,
-        })
-
     def _capture(self, external, order=None):
         order = order or self._make_order()
         draft = self._prepare(order, self._open_payment_page(order))
@@ -42,15 +36,6 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         self.assertEqual(self.make_jsonrpc_request("/payment/status/poll")["state"], "done")
         self.env.invalidate_all()
         return order, order.transaction_ids, charge.json()["payment"]
-
-    def _open_refund(self, payment, amount=None):
-        action = self._call("account.payment", "action_refund_wizard", payment.ids, button=True)
-        self.assertEqual(action["res_model"], "payment.refund.wizard")
-        values = {"payment_id": payment.id}
-        if amount is not None:
-            values["amount_to_refund"] = amount
-        wizard_id = self._call("payment.refund.wizard", "create", values)
-        return [wizard_id]
 
     def _dispatch(self):
         self.env.ref("payment_square_online.cron_square_online_dispatch_refunds").method_direct_trigger()
