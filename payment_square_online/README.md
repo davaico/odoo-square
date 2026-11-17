@@ -22,6 +22,14 @@ Duplicate the Odoo provider to create a separate, disabled configuration. Select
 
 If authorization is rejected or expires, return to the provider form and choose **Authorize or Reconnect with Square** using the original merchant account. Replace the application secret in Odoo if you rotate it in Square. If Odoo reports that it cannot decrypt the credentials, restore the original server encryption key. To connect a different merchant, company, application, or environment, configure a separate provider.
 
+## Offer Square at the intended storefronts
+
+Leave **Website** empty to make the provider eligible across stores in its company. Select a website when a store should use its own Square connection or location. Configure a provider in each company that accepts Square, with a bank journal from that company.
+
+If customers cannot see Square, check that the provider is published, the connection is ready, and the order's pricelist uses the selected location's currency. Checkout sends the full order total in that currency, including tax and shipping. The total must fit the currency's minor units, such as whole yen for JPY or cents for USD. Odoo uses its usual exchange rates for company-currency accounting entries.
+
+International buyers can use eligible cards, subject to Square and card issuer approval. The buyer's card issuer handles any conversion needed to bill the cardholder in a different currency. [Square international development](https://developer.squareup.com/docs/international-development)
+
 ## Make a Sandbox checkout payment
 
 1. Open the storefront you configured using HTTPS. If your reverse proxy sets a Content Security Policy, allow the Sandbox Web Payments SDK, its secure card frame, and its network endpoints using [Square's CSP instructions](https://developer.squareup.com/docs/web-payments/content-security-policy). Apply the Production domains when you switch to Production.

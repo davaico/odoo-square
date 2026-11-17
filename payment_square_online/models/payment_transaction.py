@@ -95,11 +95,18 @@ class PaymentTransaction(models.Model):
             raise ValidationError(_("The cart or payment method has changed. Please refresh checkout."))
 
         order._check_cart_is_ready_to_be_paid()
+        # Use the same buyer and checkout context as the native website payment page.
+        user = self.env.user
+        partner = order.partner_id if user._is_public() else user.partner_id
+        checkout = {'sale_order_id': order.id, 'website_id': order.website_id.id}
         available_providers = provider.with_context(square_online_checkout=True)._get_compatible_providers(
-            order.company_id.id, self.partner_id.id, order.amount_total, currency_id=order.currency_id.id,
-            website_id=order.website_id.id,
+            order.company_id.id, partner.id, order.amount_total, currency_id=order.currency_id.id,
+            **checkout,
         )
-        if provider not in available_providers:
+        available_methods = self.env['payment.method']._get_compatible_payment_methods(
+            (available_providers & provider).ids, partner.id, currency_id=order.currency_id.id, **checkout,
+        )
+        if self.payment_method_id not in available_methods:
             raise ValidationError(_("Square is unavailable for this order. Please choose a different payment method."))
         return connection
 
@@ -113,7 +120,6 @@ class PaymentTransaction(models.Model):
         method_line = provider.journal_id.inbound_payment_method_line_ids.filtered(
             lambda line: line.payment_provider_id == provider,
         )
-        digits = 0 if self.currency_id.name == 'JPY' else 2
         self.write({
             'landing_route': '/shop/payment/validate',
             'amount': order.amount_total,
@@ -125,7 +131,7 @@ class PaymentTransaction(models.Model):
             'square_journal_id': provider.journal_id.id,
             'square_outstanding_account_id': method_line.payment_account_id.id,
             'square_currency_code': self.currency_id.name,
-            'square_amount_minor': payment_utils.to_minor_currency_units(order.amount_total, self.currency_id, digits),
+            'square_amount_minor': payment_utils.to_minor_currency_units(order.amount_total, self.currency_id),
             'square_order_reference': f'odoo-web-{uuid4().hex[:23]}',
             'square_cart_signature': cart_signature,
         })
