@@ -101,6 +101,41 @@ class TestSquareOnlineRecovery(SquareOnlineCheckoutCase):
         self.assertEqual(check.kwargs["headers"]["Authorization"], "Bearer square-renewed-access-test")
         self.assertEqual(check.kwargs["params"]["location_id"], "SQUARE-NY")
 
+    @patch(square_boundary)
+    def test_refresh_status_retries_only_its_read_when_square_reports_an_expired_token(self, external):
+        order, payment = self._accepted_charge_timeout(external)
+        manager = new_test_user(
+            self.env, login="square-expiry-manager", groups="account.group_account_manager",
+            company_id=self.company.id, company_ids=[Command.set(self.company.ids)],
+        )
+        self.authenticate(manager.login, manager.login)
+        external.side_effect = [
+            self._square_response({"errors": [{"code": "ACCESS_TOKEN_EXPIRED"}]}, 401),
+            self._square_response({
+                "merchant_id": "MERCHANT_TEST",
+                "access_token": "square-renewed-after-rejection",
+                "refresh_token": "checkout-refresh-test",
+                "token_type": "bearer",
+                "expires_at": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+            }),
+            self._square_response({"payments": [payment]}),
+        ]
+
+        tx = order.transaction_ids
+        self.assertEqual(self._call_refresh(tx)["tag"], "reload")
+        self.env.invalidate_all()
+        self.assertEqual(tx.state, "done")
+        self.assertEqual(tx.provider_reference, payment["id"])
+        self.assertEqual([call.args for call in external.call_args_list], [
+            ("POST", "https://connect.squareupsandbox.com/v2/payments"),
+            ("GET", "https://connect.squareupsandbox.com/v2/payments"),
+            ("POST", "https://connect.squareupsandbox.com/oauth2/token"),
+            ("GET", "https://connect.squareupsandbox.com/v2/payments"),
+        ])
+        initial_read, _, retry = external.call_args_list[1:]
+        self.assertEqual(initial_read.kwargs["params"], retry.kwargs["params"])
+        self.assertEqual(retry.kwargs["headers"]["Authorization"], "Bearer square-renewed-after-rejection")
+
     def _signed_webhook(
         self, payment, *, merchant="MERCHANT_TEST", environment="Sandbox",
         signature_url=None, location=None, event_type="payment.updated", transform=None,
@@ -149,14 +184,17 @@ class TestSquareOnlineRecovery(SquareOnlineCheckoutCase):
         external.return_value = self._square_response({
             "errors": [{"code": "ACCESS_TOKEN_REVOKED", "detail": "private Square diagnostics"}],
         }, 401)
-        self.assertEqual(self._submit(draft)["state"], "pending")
+        result = self._submit(draft)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("Square is temporarily unavailable", result["state_message"])
+        self.assertNotIn("private Square diagnostics", result["state_message"])
 
         self.env.invalidate_all()
         self.assertEqual(self.connection.oauth_health, "reconnect")
         self.assertFalse(order.transaction_ids.provider_reference)
         self.assertFalse(order.transaction_ids.payment_id)
         self.assertEqual(order.state, "draft")
-        self.assertEqual(self._submit(draft)["state"], "pending")
+        self.assertEqual(self._submit(draft)["state"], "error")
         external.assert_called_once()
         self.assertEqual(external.call_args.args, ("POST", "https://connect.squareupsandbox.com/v2/payments"))
 

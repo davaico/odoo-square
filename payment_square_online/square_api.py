@@ -24,6 +24,7 @@ CURRENCY_BY_COUNTRY = {
     "US": "USD",
 }
 _ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+_AUTHORIZATION_ERROR_CODES = {"ACCESS_TOKEN_EXPIRED", "ACCESS_TOKEN_REVOKED", "INSUFFICIENT_SCOPES"}
 
 
 class SquareAPIError(Exception):
@@ -33,6 +34,10 @@ class SquareAPIError(Exception):
         super().__init__("The Square request did not succeed.")
         self.status_code = status_code
         self.codes = tuple(codes)
+
+    @property
+    def authorization_failed(self):
+        return self.status_code == 401 or bool(_AUTHORIZATION_ERROR_CODES.intersection(self.codes))
 
 
 def square_request(environment, method, path, *, token=None, payload=None, params=None):

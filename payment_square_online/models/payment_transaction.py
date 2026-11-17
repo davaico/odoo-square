@@ -253,12 +253,14 @@ class PaymentTransaction(models.Model):
 
     def _square_online_apply_charge_error(self, error):
         codes = set(error.codes)
-        if error.status_code not in (400, 402) or not codes:
+        if not error.authorization_failed and (error.status_code not in (400, 402) or not codes):
             return
         self._square_online_lock_payment()
         if self.state != "pending" or self.provider_reference:
             return
-        if codes <= _CARD_DECLINE_CODES:
+        if error.authorization_failed:
+            self._set_error(_("Square is temporarily unavailable. Try another payment method."))
+        elif codes <= _CARD_DECLINE_CODES:
             self._set_error(_("The card was declined. Check your details or try a different card."))
         elif codes <= _AUTHENTICATION_CODES:
             self._set_error(_("Card authentication is required. Try again and complete the bank's verification."))
