@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <template id="inline_form">
+        <div t-att-id="'o_square_card_' + str(provider_sudo.id)"
+             name="o_square_card"
+             t-att-data-square-environment="provider_sudo.square_environment"
+             t-att-data-square-application-id="provider_sudo.square_application_id"
+             t-att-data-square-location-id="provider_sudo.square_location_id.sudo().square_id"
+             t-att-data-square-cart-signature="website_sale_order._square_cart_signature()"/>
+    </template>
+</odoo>

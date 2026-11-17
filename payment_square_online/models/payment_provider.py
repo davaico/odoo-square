@@ -206,7 +206,8 @@ class PaymentProvider(models.Model):
         )
         currency = self.env['res.currency'].browse(currency_id).exists()
         unavailable = providers.filtered(lambda p: p.code == 'square_online' and not (
-            p.company_id.id == company_id
+            self.env.context.get('square_online_checkout') and amount > 0
+            and p.company_id.id == company_id
             and (not p.website_id or p.website_id.id == kwargs.get('website_id'))
             and p.inline_form_view_id
             and currency.name == p.square_location_id.sudo().currency_code
