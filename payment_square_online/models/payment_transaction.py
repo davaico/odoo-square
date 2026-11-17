@@ -353,6 +353,10 @@ class PaymentTransaction(models.Model):
                 # The order may have changed between verified ingestion and accounting.
                 tx._square_online_record_order_mismatch()
             super(PaymentTransaction, tx)._post_process()
+            # Native accounting skips the parent when a child has already completed.
+            # Square's refund children never replace the original inbound payment.
+            if tx.state == "done" and not tx.payment_id:
+                tx.with_company(tx.company_id)._create_payment()
 
     def _square_online_record_order_mismatch(self):
         self.ensure_one()

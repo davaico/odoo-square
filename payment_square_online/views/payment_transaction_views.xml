@@ -17,6 +17,7 @@
                     <field name="square_online_environment"/>
                     <field name="square_online_merchant_id"/>
                     <field name="square_online_location_id"/>
+                    <field name="square_online_refund_requested_by" invisible="not square_online_refund_requested_by"/>
                     <field name="square_online_recovery_checked_at"/>
                     <field name="square_online_recovery_message" invisible="not square_online_recovery_message"/>
                 </group>
@@ -35,7 +36,7 @@
         <field name="res_model">payment.transaction</field>
         <field name="view_mode">list,form</field>
         <field name="path">square-payment-history</field>
-        <field name="domain">[('provider_code', '=', 'square_online'), ('square_online_dispatch_at', '!=', False)]</field>
+        <field name="domain">[('provider_code', '=', 'square_online'), '|', ('square_online_dispatch_at', '!=', False), ('square_online_refund_requested_by', '!=', False)]</field>
     </record>
 
     <menuitem id="square_online_transaction_history_menu" parent="account.root_payment_menu"

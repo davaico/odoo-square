@@ -67,7 +67,7 @@ The automated checkout tests simulate Square's SDK and API. Use Square Sandbox t
 ## Set up Square webhooks
 
 1. Open a saved Square connection in Odoo. Copy its **Webhook Route** and add the public HTTPS origin that routes to this Odoo database. For example, join `https://shop.example.com` with `/payment/square_online/webhook/1`.
-2. In the Square Developer Console, select the application's environment and open **Webhooks → Subscriptions**. Create a subscription with that notification URL in the same Sandbox or Production environment as the connection. Choose Square API version `2026-09-16` and select `payment.created` and `payment.updated`.
+2. In the Square Developer Console, select the application's environment and open **Webhooks → Subscriptions**. Create a subscription with that notification URL in the same Sandbox or Production environment as the connection. Choose Square API version `2026-09-16` and select `payment.created`, `payment.updated`, `refund.created`, and `refund.updated`.
 3. Enter the exact subscription URL in Odoo's **Webhook Notification URL** field and paste the subscription's **Webhook Signature Key**. Save the connection. Odoo checks the signature against that exact URL and the unmodified request body, so preserve the POST body through the reverse proxy. Copy the replacement key to Odoo when rotating the subscription key.
 4. Complete a Sandbox checkout and verify both the event delivery in Square and the corresponding transaction in Odoo. Keep the subscriptions for historical connections while their transactions may still need reconciliation. To turn off an endpoint in Odoo, clear its notification URL.
 
@@ -82,3 +82,14 @@ Accounting managers and administrators can open **Invoicing → Configuration �
 If Square captured the payment after the Odoo order was cancelled or changed, Odoo records the incoming payment and flags the transaction and order for review. Leave fulfillment on hold while reviewing the payment and order. Resolve the amount collected with the shopper and, if money needs to be returned, handle that as a separate refund.
 
 The deterministic recovery tests simulate Square API responses and sign representative notifications with a test key. Use a Square Sandbox account and the public HTTPS endpoint to verify actual checkout and webhook delivery.
+
+## Return the full remaining payment
+
+Accounting managers and administrators can refund captured Square payments in their allowed Odoo companies. Keep the outbound **Manual** payment method available on the original bank journal and configure its outstanding payments account.
+
+1. In Odoo Accounting, open the posted customer payment for the website order and select **Refund**. The wizard shows the full available amount after completed and pending refunds.
+2. Confirm **Refund**, then open **Square Payment History** and select the linked refund transaction. The history shows the refund amount, the original transaction, who requested the refund, its status, and the Square refund ID once verified.
+3. While queued, the refund reserves the amount. The scheduled dispatch sends it through the original Square connection against the original payment, even if the provider was disabled or reconfigured. If the outcome remains pending, use **Refresh status** to check the existing request. If Odoo requests reauthorization, reconnect the original Square account.
+4. A completed refund creates a posted outbound customer payment in the original journal and currency. Confirm the refund in Square Sandbox and check the related outbound payment in Odoo. Create and reconcile any required credit note separately in Accounting. Process any return of goods separately in Inventory.
+
+Cancelling an order leaves any decision to refund with Accounting.
