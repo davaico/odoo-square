@@ -20,12 +20,25 @@ _SQUARE_STATES = {
     "FAILED": "error",
     "CANCELED": "cancel",
 }
+# Definitive CreatePayment rejections documented by Square. A used token, an
+# idempotency conflict, or an unknown code does not establish non-collection.
 _CARD_DECLINE_CODES = {
-    "CARD_DECLINED", "CARD_DECLINED_CALL_ISSUER", "CARD_EXPIRED", "CVV_FAILURE", "GENERIC_DECLINE",
-    "INSUFFICIENT_FUNDS", "INVALID_EXPIRATION", "INVALID_POSTAL_CODE", "VERIFY_CVV_FAILURE",
-    "VERIFY_AVS_FAILURE",
+    "ADDRESS_VERIFICATION_FAILURE", "ALLOWABLE_PIN_TRIES_EXCEEDED", "BAD_EXPIRATION", "CARD_DECLINED",
+    "CARD_DECLINED_CALL_ISSUER", "CARD_EXPIRED", "CARDHOLDER_INSUFFICIENT_PERMISSIONS", "CARD_NOT_SUPPORTED",
+    "CARD_TOKEN_EXPIRED", "CHIP_INSERTION_REQUIRED", "CVV_FAILURE", "EXPIRATION_FAILURE", "GENERIC_DECLINE",
+    "INSUFFICIENT_FUNDS", "INVALID_ACCOUNT", "INVALID_CARD", "INVALID_CARD_DATA", "INVALID_EXPIRATION",
+    "INVALID_PIN", "INVALID_POSTAL_CODE", "MANUALLY_ENTERED_PAYMENT_NOT_SUPPORTED", "PAN_FAILURE",
+    "TRANSACTION_LIMIT", "VERIFY_AVS_FAILURE", "VERIFY_CVV_FAILURE", "VOICE_FAILURE",
 }
 _AUTHENTICATION_CODES = {"CARD_DECLINED_VERIFICATION_REQUIRED", "VERIFY_BUYER_FAILED"}
+_AMOUNT_REJECTION_CODES = {"AMOUNT_TOO_HIGH", "AMOUNT_TOO_LOW", "PAYMENT_AMOUNT_MISMATCH", "PAYMENT_LIMIT_EXCEEDED"}
+_UNAVAILABLE_PAYMENT_CODES = {
+    "INSUFFICIENT_PERMISSIONS", "INVALID_EMAIL_ADDRESS", "INVALID_FEES", "INVALID_LOCATION",
+    "INVALID_PHONE_NUMBER", "PAYMENT_SOURCE_NOT_ENABLED_FOR_TARGET", "UNSUPPORTED_CURRENCY",
+}
+_DEFINITIVE_CHARGE_CODES = (
+    _CARD_DECLINE_CODES | _AUTHENTICATION_CODES | _AMOUNT_REJECTION_CODES | _UNAVAILABLE_PAYMENT_CODES
+)
 
 
 class PaymentTransaction(models.Model):
@@ -69,7 +82,13 @@ class PaymentTransaction(models.Model):
             for vals in vals_list
         ):
             raise AccessError(_("Square payments are created through website checkout."))
-        return super().create(vals_list)
+        transactions = super().create(vals_list)
+        for tx in transactions.filtered(lambda tx: tx.provider_code != "square_online" and tx.operation in (
+            "online_direct", "online_redirect", "online_token", "validation",
+        )):
+            # Both native sales portals create the transaction before calling a provider.
+            tx.sale_order_ids.filtered("website_id")._square_online_guard_other_checkout(tx)
+        return transactions
 
     def write(self, vals):
         if not self.env.su and (
@@ -253,17 +272,21 @@ class PaymentTransaction(models.Model):
 
     def _square_online_apply_charge_error(self, error):
         codes = set(error.codes)
-        if not error.authorization_failed and (error.status_code not in (400, 402) or not codes):
+        if error.authorization_failed or (error.status_code == 403 and codes == {"CARD_PROCESSING_NOT_ENABLED"}):
+            message = _("Square is temporarily unavailable. Try another payment method.")
+        elif error.status_code not in (400, 402) or not codes or not codes <= _DEFINITIVE_CHARGE_CODES:
             return
+        elif codes & _UNAVAILABLE_PAYMENT_CODES:
+            message = _("Square is temporarily unavailable. Try another payment method.")
+        elif codes & _AMOUNT_REJECTION_CODES:
+            message = _("Square could not accept the payment amount. Try another payment method.")
+        elif codes & _AUTHENTICATION_CODES:
+            message = _("Card authentication is required. Try again and complete the bank's verification.")
+        else:
+            message = _("The card was declined. Check your details or try a different card.")
         self._square_online_lock_payment()
-        if self.state != "pending" or self.provider_reference:
-            return
-        if error.authorization_failed:
-            self._set_error(_("Square is temporarily unavailable. Try another payment method."))
-        elif codes <= _CARD_DECLINE_CODES:
-            self._set_error(_("The card was declined. Check your details or try a different card."))
-        elif codes <= _AUTHENTICATION_CODES:
-            self._set_error(_("Card authentication is required. Try again and complete the bank's verification."))
+        if self.state == "pending" and not self.provider_reference:
+            self._set_error(message)
 
     def _square_online_apply_payment(self, payment, connection):
         self.ensure_one()

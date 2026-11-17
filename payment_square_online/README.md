@@ -157,13 +157,13 @@ run_square_tests() (
   grep -E '0 failed, 0 error\(s\) of [1-9][0-9]* tests when loading database' "$3"
 )
 
-run_square_tests payment_square_online,website_sale_stock \
+run_square_tests payment_square_online,website_sale_stock,payment_demo \
   /payment_square_online,-/payment_square_online:TestSquareOnlinePosCoexistence square-online-test.log
-run_square_tests payment_square_online,website_sale_stock,odoo_square \
+run_square_tests payment_square_online,website_sale_stock,payment_demo,odoo_square \
   /payment_square_online,/odoo_square square-combined-test.log
 ```
 
-Each run uses fresh project-scoped database and filestore volumes and publishes no ports. `website_sale_stock` enables Odoo's website stock workflows used by some online tests. The standalone selection excludes the POS coexistence class because POS is absent. In the combined run, check that `TestSquareOnlinePosCoexistence` ran. Check both logs for skipped tests and confirm that the checkout browser case ran in Chrome. These suites exercise Odoo checkout, accounting, and POS workflows while simulating Square's SDK and API. Complete the [Sandbox payment and refund checks](#make-a-sandbox-payment) for evidence against Square itself.
+Each run uses fresh project-scoped database and filestore volumes and publishes no ports. `website_sale_stock` enables Odoo's website stock workflows used by some online tests. Odoo's `payment_demo` is a test fixture for a second provider with saved cards; the Square add-on does not require it. The standalone selection excludes the POS coexistence class because POS is absent. In the combined run, check that `TestSquareOnlinePosCoexistence` ran. Check both logs for skipped tests and confirm that the checkout browser case ran in Chrome. These suites exercise Odoo checkout, accounting, and POS workflows while simulating Square's SDK and API. Complete the [Sandbox payment and refund checks](#make-a-sandbox-payment) for evidence against Square itself.
 
 ### Exercise concurrent refunds
 

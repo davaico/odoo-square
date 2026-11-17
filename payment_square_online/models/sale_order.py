@@ -2,10 +2,13 @@
 import hashlib
 import json
 
-from odoo import models
-from odoo.tools import SQL
+from odoo import _, models
+from odoo.exceptions import ValidationError
+from odoo.tools import SQL, consteq
 
 from odoo.addons.payment import utils as payment_utils
+
+from ..square_api import square_amount_in_minor_units
 
 
 class SaleOrder(models.Model):
@@ -53,6 +56,36 @@ class SaleOrder(models.Model):
         return payment_utils.generate_access_token(
             "square-online-cart", self._square_online_cart_snapshot(), env=self.env,
         )
+
+    def _square_online_prepare_website_checkout(self, transaction, website_id, cart_id, user):
+        self.ensure_one()
+        if self._square_online_block_conflicting_checkout(transaction):
+            raise ValidationError(_("A payment for this order is already being processed."))
+        if (
+            cart_id != self.id
+            or (not user._is_public() and user.partner_id.commercial_partner_id != self.partner_id.commercial_partner_id)
+            or not consteq(self._square_online_cart_token(), self.env.context.get("square_online_cart", ""))
+        ):
+            raise ValidationError(_("Your checkout changed. Refresh the checkout page."))
+        try:
+            requested_minor = square_amount_in_minor_units(
+                self.env.context.get("square_online_cart_amount"), self.currency_id.name,
+            )
+            order_minor = square_amount_in_minor_units(self.amount_total, self.currency_id.name)
+        except ValueError:
+            raise ValidationError(_("The cart total is invalid. Refresh the checkout page.")) from None
+        if requested_minor != order_minor:
+            raise ValidationError(_("The cart total changed. Refresh the checkout page."))
+        transaction._square_online_prepare_checkout(self, website_id)
+        # The native website transaction route already holds the order lock.
+        self._square_online_mark_checkout_change()
+
+    def _square_online_guard_other_checkout(self, transaction):
+        for order in self.sorted("id"):
+            order._square_online_lock_checkout()
+            if order._square_online_block_conflicting_checkout(transaction):
+                raise ValidationError(_("A payment for this order is already being processed."))
+            order._square_online_mark_checkout_change()
 
     def _square_online_lock_checkout(self):
         self.ensure_one()

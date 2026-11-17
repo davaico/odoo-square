@@ -212,7 +212,6 @@ class SquareWebhookController(http.Controller):
 
     def _process_event(
         self, event_type, event_data, webhook_event_id=None, *, merchant_id=None, environment=None,
-        square_config=None,
     ):
         """
         Unified event processor for all Square webhook events
@@ -223,14 +222,14 @@ class SquareWebhookController(http.Controller):
                 order_data = event_data.get("object", {}).get("order_created", {})
                 return request.env["square.order.processor"]._process_order_event(
                     order_data, "created", webhook_event_id, merchant_id=merchant_id,
-                    environment=environment, square_config=square_config,
+                    environment=environment,
                 )
 
             elif event_type == "order.updated":
                 order_data = event_data.get("object", {}).get("order_updated", {})
                 return request.env["square.order.processor"]._process_order_event(
                     order_data, "updated", webhook_event_id, merchant_id=merchant_id,
-                    environment=environment, square_config=square_config,
+                    environment=environment,
                 )
 
             elif event_type == "payment.updated":
@@ -334,16 +333,13 @@ class SquareWebhookController(http.Controller):
                     "message": f"Failed to fetch order {order_id} from Square API",
                 }
 
-            # Check if this is an exchange (has returns in line items)
-            has_returns = self._detect_exchange(order_data)
+            has_returns, routing = processor._check_square_exchange_order(
+                order_id, order_data, merchant_id=merchant_id, environment=environment,
+            )
+            if routing:
+                return routing
 
             if has_returns:
-                routing = processor._square_online_event_result(
-                    order_id=order_id, location_id=order_data.get("location_id"),
-                    merchant_id=merchant_id, environment=environment, full_order=order_data,
-                )
-                if routing:
-                    return routing
                 _logger.info(
                     f"Exchange detected for order {order_id}, processing exchange flow"
                 )
@@ -438,28 +434,3 @@ class SquareWebhookController(http.Controller):
                 f"Error processing payment.updated event: {str(e)}", exc_info=True
             )
             return {"status": "error", "message": str(e)}
-
-    def _detect_exchange(self, order_data):
-        """
-        Detect if an order contains returns (indicating an exchange)
-
-        Args:
-            order_data: Full order data from Square API
-
-        Returns:
-            bool: True if order contains returns, False otherwise
-        """
-        line_items = order_data.get("line_items", [])
-
-        # Check if any line item has a returns field
-        for line_item in line_items:
-            if "return_line_items" in order_data or line_item.get("quantity_unit", {}).get(
-                "measurement_unit", {}
-            ).get("type") == "TYPE_RETURN":
-                return True
-
-        # Also check for explicit returns field at order level
-        if order_data.get("returns") or order_data.get("return_line_items"):
-            return True
-
-        return False

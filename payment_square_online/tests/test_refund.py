@@ -521,6 +521,42 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         self.assertEqual(sum(call.args[0] == "POST" for call in external.call_args_list), 1)
 
     @patch(square_boundary)
+    def test_aggregate_only_refund_does_not_double_use_an_unlinked_reservation(self, external):
+        _, tx, original = self._capture(external)
+        self.authenticate(self.manager.login, self.manager.login)
+        self._call(
+            "payment.refund.wizard", "action_refund", self._open_refund(tx.payment_id, 20), button=True,
+        )
+        self.env.invalidate_all()
+        known = tx.child_transaction_ids
+        external.side_effect = [self._square_response({"payment": original}), self._square_response({"refund": {
+            "id": "KNOWN-PENDING", "reason": known.square_online_refund_reason, "payment_id": original["id"],
+            "location_id": original["location_id"], "amount_money": {"amount": 2000, "currency": "USD"},
+            "status": "PENDING",
+        }})]
+        self._dispatch()
+        self.assertEqual(known.provider_reference, "KNOWN-PENDING")
+
+        def square(method, url, **kwargs):
+            if method != "GET" or not url.endswith("/v2/payments/" + original["id"]):
+                self.fail("Unattributed Square refund balance must prevent an over-balance POST")
+            return self._square_response({"payment": {
+                **original, "refunded_money": {"currency": "USD", "amount": 1500},
+            }})
+
+        external.reset_mock()
+        external.side_effect = square
+        self._call(
+            "payment.refund.wizard", "action_refund", self._open_refund(tx.payment_id, 13), button=True,
+        )
+        self._dispatch()
+        refused = tx.child_transaction_ids - known
+        self.assertEqual(refused.state, "error")
+        self.assertFalse(refused.square_online_dispatch_at)
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 12)
+        self.assertEqual([call.args[0] for call in external.call_args_list], ["GET"])
+
+    @patch(square_boundary)
     def test_square_amount_rejection_rechecks_original_payment_and_releases_attempt(self, external):
         _, tx, original = self._capture(external)
         self.authenticate(self.manager.login, self.manager.login)

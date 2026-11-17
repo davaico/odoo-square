@@ -153,6 +153,54 @@ class TestSquareOnlinePosCoexistence(SquareOnlineCheckoutCase):
 
     @patch(SquareOnlineCheckoutCase.square_boundary)
     @patch("odoo.addons.odoo_square.models.square_api_client.requests.get")
+    def test_unresolved_website_checkout_does_not_block_independent_pos_drafts(self, pos_api, online_api):
+        website_order, transaction, _payment = self._start_website_goods_checkout(online_api)
+        self.pos_objects = {}
+        pos_api.side_effect = self._pos_api
+
+        def notify(order, event_type, event_id):
+            self.pos_objects[f"/v2/orders/{order['id']}"] = {"order": order}
+            return self._notify(event_type, {
+                "order_id": order["id"], "state": order["state"], "location_id": order["location_id"],
+            }, event_id=event_id)
+
+        pos_order = self._square_order("INDEPENDENT-POS-DRAFT")
+        pos_order.update(
+            state="OPEN", created_at="2025-04-16T10:00:00Z", version=1,
+        )
+        self.assertEqual(notify(pos_order, "order.created", "pos-open").json()["status"], "success")
+        imported = self.env["sale.order"].search([("square_order_id", "=", pos_order["id"])])
+        self.assertEqual(imported.state, "draft")
+        self.assertEqual(imported.order_line.product_uom_qty, 2)
+        pos_order.update(state="DRAFT", version=2)
+        pos_order["line_items"][0]["quantity"] = "3"
+        self.assertEqual(notify(pos_order, "order.updated", "pos-draft-update").json()["status"], "updated")
+        self.assertEqual(imported.order_line.product_uom_qty, 3)
+        self.assertEqual(
+            notify(pos_order, "order.updated", "pos-draft-update").json()["status"], "already_processed",
+        )
+
+        unrelated = self._square_order("UNRELATED-NEW-POS-DRAFT")
+        unrelated.update(state="OPEN", total_money={"amount": 2350, "currency": "USD"})
+        unrelated["line_items"][0].update(quantity="1", total_money=unrelated["total_money"])
+        self.assertEqual(notify(unrelated, "order.created", "new-pos-open").json()["status"], "success")
+        self.assertEqual(
+            self.env["sale.order"].search([("square_order_id", "=", unrelated["id"])]).amount_total, 23.50,
+        )
+
+        candidate = self._square_order("UNVERIFIED-WEBSITE-ORDER")
+        candidate["state"] = "OPEN"
+        response = notify(candidate, "order.created", "possible-website-order")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["status"], "retry")
+        self.assertFalse(self.env["sale.order"].search([("square_order_id", "=", candidate["id"])]))
+        self.assertFalse(imported.invoice_ids)
+        self.assertFalse(imported.picking_ids)
+        self._assert_website_unpaid(website_order, transaction)
+        online_api.assert_called_once()
+
+    @patch(SquareOnlineCheckoutCase.square_boundary)
+    @patch("odoo.addons.odoo_square.models.square_api_client.requests.get")
     def test_website_return_and_payment_webhooks_cannot_create_pos_records(self, pos_api, online_api):
         order, transaction, payment = self._start_website_goods_checkout(online_api)
         self.assertFalse(transaction.provider_reference)

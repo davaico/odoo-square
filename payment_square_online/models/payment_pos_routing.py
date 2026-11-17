@@ -1,4 +1,6 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
+from datetime import UTC, datetime, timedelta
+
 from odoo import api, models
 from odoo.fields import Domain
 
@@ -42,12 +44,36 @@ class PaymentTransaction(models.Model):
         return bool(self.search_count(scope & identifiers, limit=1))
 
     @api.model
-    def _square_online_pos_has_unknown_charge(self, scope):
-        return bool(self.search_count(
-            scope & Domain("operation", "=", "online_direct")
-            & Domain("state", "=", "pending") & Domain("provider_reference", "=", False),
-            limit=1,
-        ))
+    def _square_online_pos_has_unknown_charge(self, scope, *, order=None):
+        scope &= (
+            Domain("operation", "=", "online_direct")
+            & Domain("state", "=", "pending")
+            & Domain("provider_reference", "=", False)
+        )
+        if order is not None:
+            # Website checkout lets CreatePayment create its own order. It cannot
+            # pay a draft or an order that already existed before dispatch.
+            if order.get("state") == "DRAFT":
+                return False
+            total = order.get("total_money")
+            if (
+                isinstance(total, dict) and type(total.get("amount")) is int
+                and total["amount"] > 0 and isinstance(total.get("currency"), str)
+            ):
+                scope &= Domain("square_online_amount_minor", "=", total["amount"])
+                scope &= Domain("square_online_currency_code", "=", total["currency"])
+            created_at = order.get("created_at")
+            if isinstance(created_at, str):
+                try:
+                    created = datetime.fromisoformat(created_at)
+                except ValueError:
+                    pass
+                else:
+                    if created.tzinfo:
+                        # Allow for a difference between the Odoo and Square clocks.
+                        latest_dispatch = created.astimezone(UTC).replace(tzinfo=None) + timedelta(minutes=5)
+                        scope &= Domain("square_online_dispatch_at", "<=", latest_dispatch)
+        return bool(self.search_count(scope, limit=1))
 
     @api.model
     def _square_online_pos_owns_payment(self, scope, payment):

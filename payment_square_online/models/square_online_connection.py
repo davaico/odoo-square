@@ -517,9 +517,10 @@ class SquareOnlineConnection(models.Model):
                     self.environment, method, path, token=token, payload=payload, params=params,
                 )
             except SquareAPIError as error:
+                if not error.authorization_failed:
+                    raise
                 expired = "ACCESS_TOKEN_EXPIRED" in error.codes
-                if error.authorization_failed:
-                    self._square_online_sync_access(rejected_access=encrypted, expired=expired)
+                self._square_online_sync_access(rejected_access=encrypted, expired=expired)
                 # Only a read can be repeated after Square rejects an access token.
                 if not (expired and method == "GET" and attempt == 0):
                     raise

@@ -13,8 +13,6 @@ from odoo.addons.website_sale.controllers.main import WebsiteSale
 from odoo.addons.website_sale.controllers.payment import PaymentPortal
 from odoo.addons.website_sale.models.website import CART_SESSION_CACHE_KEY
 
-from ..square_api import square_amount_in_minor_units
-
 
 _SOURCE_TOKEN = re.compile(r"cnon:[A-Za-z0-9_.:-]{1,187}")
 
@@ -55,32 +53,11 @@ class SquareOnlinePaymentPortal(PaymentPortal):
 
     def _validate_transaction_for_order(self, transaction, order):
         super()._validate_transaction_for_order(transaction, order)
-        if order._square_online_block_conflicting_checkout(transaction):
-            raise ValidationError(_("A payment for this order is already being processed."))
         if transaction.provider_code == "square_online":
-            user = request.env.user
-            if (
-                request.session.get(CART_SESSION_CACHE_KEY) != order.id
-                or (not user._is_public() and user.partner_id.commercial_partner_id
-                    != order.partner_id.commercial_partner_id)
-                or not consteq(
-                    order._square_online_cart_token(), request.env.context.get("square_online_cart", "")
-                )
-            ):
-                raise ValidationError(_("Your checkout changed. Refresh the checkout page."))
-            try:
-                requested_minor = square_amount_in_minor_units(
-                    request.env.context.get("square_online_cart_amount"), order.currency_id.name,
-                )
-                order_minor = square_amount_in_minor_units(order.amount_total, order.currency_id.name)
-            except ValueError:
-                raise ValidationError(_("The cart total is invalid. Refresh the checkout page.")) from None
-            if requested_minor != order_minor:
-                raise ValidationError(_("The cart total changed. Refresh the checkout page."))
-            transaction._square_online_prepare_checkout(order, request.website.id)
+            order._square_online_prepare_website_checkout(
+                transaction, request.website.id, request.session.get(CART_SESSION_CACHE_KEY), request.env.user,
+            )
             request.session["sale_last_order_id"] = order.id
-        # The native checkout route already holds the order lock.
-        order._square_online_mark_checkout_change()
 
 
 class SquareOnlineCheckout(Controller):

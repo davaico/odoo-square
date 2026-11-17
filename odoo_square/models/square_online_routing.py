@@ -5,6 +5,23 @@ from odoo import _, models
 class SquareOrderProcessor(models.Model):
     _inherit = "square.order.processor"
 
+    def _check_square_exchange_order(self, order_id, order, *, merchant_id=None, environment=None):
+        has_returns = bool(
+            order.get("returns")
+            or order.get("return_line_items")
+            or any(
+                "return_line_items" in order
+                or line.get("quantity_unit", {}).get("measurement_unit", {}).get("type") == "TYPE_RETURN"
+                for line in order.get("line_items", [])
+            )
+        )
+        if not has_returns:
+            return False, None
+        return True, self._square_online_event_result(
+            order_id=order_id, location_id=order.get("location_id"),
+            merchant_id=merchant_id, environment=environment, full_order=order,
+        )
+
     def _square_online_event_result(
         self, *, order_id=None, payment_id=None, refund_id=None, location_id=None,
         merchant_id=None, environment=None, square_config=None, full_order=None,
@@ -109,7 +126,7 @@ class SquareOrderProcessor(models.Model):
                 return True
             if payment is None:
                 result = None
-        if not (tenders or sources) and transactions._square_online_pos_has_unknown_charge(scope):
+        if not (tenders or sources) and transactions._square_online_pos_has_unknown_charge(scope, order=order):
             # The order may be visible before its website tender is attached.
             return None
         return result

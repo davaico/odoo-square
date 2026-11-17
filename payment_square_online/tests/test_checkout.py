@@ -1,5 +1,6 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from datetime import UTC, datetime, timedelta
+from unittest import SkipTest
 from unittest.mock import Mock, patch
 
 import requests
@@ -258,6 +259,68 @@ class TestSquareOnlineCheckout(SquareOnlineCheckoutCase):
         self.assertEqual(external.call_count, 2)
 
     @patch(square_boundary)
+    def test_definitive_square_validation_and_issuer_rejections_allow_checkout_to_continue(self, external):
+        order = self._make_order()
+        for status, code, message in (
+            (400, "AMOUNT_TOO_LOW", "could not accept the payment amount"),
+            (400, "PAYMENT_LIMIT_EXCEEDED", "could not accept the payment amount"),
+            (400, "TRANSACTION_LIMIT", "card was declined"),
+            (400, "CARDHOLDER_INSUFFICIENT_PERMISSIONS", "card was declined"),
+            (400, "PAYMENT_SOURCE_NOT_ENABLED_FOR_TARGET", "Square is temporarily unavailable"),
+            (402, "CHIP_INSERTION_REQUIRED", "card was declined"),
+        ):
+            draft = self._prepare(order, self._open_payment_page(order))
+            external.return_value = self._square_response({"errors": [{
+                "code": code, "detail": "private response detail",
+            }]}, status)
+            result = self._submit(draft)
+            self.assertEqual(result["state"], "error", code)
+            self.assertIn(message, result["state_message"])
+            self.assertNotIn("private response detail", result["state_message"])
+            self.env.invalidate_all()
+            self.assertEqual(order.state, "draft")
+            self.assertFalse(order.transaction_ids.payment_id)
+
+        replacement = self._prepare(order, self._open_payment_page(order))
+        external.side_effect = self._completed_payment
+        self.assertEqual(self._submit(replacement)["state"], "done")
+        self.assertEqual(self._submit(replacement)["state"], "done")
+        self.assertEqual(self.make_jsonrpc_request("/payment/status/poll")["state"], "done")
+        self.env.invalidate_all()
+        self.assertEqual(order.state, "sale")
+        self.assertEqual(len(order.transaction_ids.payment_id), 1)
+        self.assertEqual(order.transaction_ids.payment_id.amount, 47)
+        keys = [call.kwargs["json"]["idempotency_key"] for call in external.call_args_list]
+        self.assertEqual(len(keys), 7)
+        self.assertEqual(len(set(keys)), len(keys))
+
+    @patch(square_boundary)
+    def test_unverified_square_response_does_not_allow_a_new_attempt(self, external):
+        for status, codes in (
+            (503, ["AMOUNT_TOO_LOW"]),
+            (503, ["ACCESS_TOKEN_EXPIRED"]),
+            (400, ["UNKNOWN_SQUARE_ERROR"]),
+            (400, ["CARD_TOKEN_USED"]),
+            (400, ["CARD_DECLINED", "UNKNOWN_SQUARE_ERROR"]),
+        ):
+            with self.subTest(status=status, codes=codes):
+                external.reset_mock()
+                order = self._make_order()
+                form = self._open_payment_page(order)
+                draft = self._prepare(order, form)
+                external.return_value = self._square_response({
+                    "errors": [{"code": code} for code in codes],
+                }, status)
+                self.assertEqual(self._submit(draft)["state"], "pending")
+                self.assertEqual(self._submit(draft)["state"], "pending")
+                with self.assertRaises(JsonRpcException):
+                    self._prepare(order, form)
+                self.env.invalidate_all()
+                self.assertEqual(order.state, "draft")
+                self.assertFalse(order.transaction_ids.payment_id)
+                external.assert_called_once()
+
+    @patch(square_boundary)
     def test_lost_square_response_keeps_an_unpaid_order_processing(self, external):
         order = self._make_order()
         form = self._open_payment_page(order)
@@ -278,6 +341,68 @@ class TestSquareOnlineCheckout(SquareOnlineCheckoutCase):
         self.assertFalse(tx.payment_id)
         self.assertFalse(order.invoice_ids)
         external.assert_called_once()
+
+    @patch(square_boundary)
+    def test_portal_saved_card_cannot_collect_an_unresolved_or_paid_square_order(self, external):
+        alternate = self.env.ref("payment.payment_provider_demo")
+        if alternate.code != "demo":
+            raise SkipTest("Requires Odoo's optional Demo payment provider")
+        token = self.env["payment.token"].create({
+            "provider_id": alternate.id,
+            "payment_method_id": self.env.ref("payment_demo.payment_method_demo").id,
+            "partner_id": self.partner.id,
+            "provider_ref": "saved-other-card",
+            "demo_simulated_state": "done",
+        })
+
+        def portal_payment(order):
+            return self.make_jsonrpc_request(f"/my/orders/{order.id}/transaction", {
+                "access_token": order._portal_ensure_token(),
+                "provider_id": alternate.id,
+                "payment_method_id": None,
+                "amount": order.amount_total,
+                "flow": "token",
+                "token_id": token.id,
+                "tokenization_requested": False,
+                "landing_route": f"/my/orders/{order.id}",
+            })
+
+        order = self._make_order()
+        draft = self._prepare(order, self._open_payment_page(order))
+        external.side_effect = requests.Timeout
+        self.assertEqual(self._submit(draft)["state"], "pending")
+        with self.assertRaisesRegex(JsonRpcException, "ValidationError"):
+            portal_payment(order)
+        self.env.invalidate_all()
+        self.assertEqual(order.transaction_ids.state, "pending")
+        self.assertFalse(order.transaction_ids.payment_id)
+
+        paid_order = self._make_order()
+        draft = self._prepare(paid_order, self._open_payment_page(paid_order))
+        external.side_effect = self._completed_payment
+        self.assertEqual(self._submit(draft)["state"], "done")
+        with self.assertRaisesRegex(JsonRpcException, "ValidationError"):
+            portal_payment(paid_order)
+        self.env.invalidate_all()
+        self.assertEqual(paid_order.transaction_ids.state, "done")
+
+        declined_order = self._make_order()
+        draft = self._prepare(declined_order, self._open_payment_page(declined_order))
+        external.side_effect = None
+        external.return_value = self._square_response({"errors": [{"code": "CARD_DECLINED"}]}, 400)
+        self.assertEqual(self._submit(draft)["state"], "error")
+        self.assertIn("reference", portal_payment(declined_order))
+        self.env.invalidate_all()
+        alternate_payment = declined_order.transaction_ids.filtered(lambda tx: tx.provider_id == alternate)
+        self.assertEqual(alternate_payment.state, "done")
+
+        quote = self._make_order()
+        quote.website_id = False
+        quote.action_quotation_sent()
+        self.assertIn("reference", portal_payment(quote))
+        self.env.invalidate_all()
+        self.assertEqual(quote.transaction_ids.state, "done")
+        self.assertEqual(external.call_count, 3)
 
     @patch(square_boundary)
     def test_tampered_or_stale_checkout_never_reaches_square(self, external):

@@ -37,7 +37,9 @@ class SquareAPIError(Exception):
 
     @property
     def authorization_failed(self):
-        return self.status_code == 401 or bool(_AUTHORIZATION_ERROR_CODES.intersection(self.codes))
+        return self.status_code == 401 or (
+            self.status_code in (400, 403) and bool(_AUTHORIZATION_ERROR_CODES.intersection(self.codes))
+        )
 
 
 def square_request(environment, method, path, *, token=None, payload=None, params=None):
@@ -54,9 +56,11 @@ def square_request(environment, method, path, *, token=None, payload=None, param
             timeout=(5, 15),
             allow_redirects=False,
         )
-        content = response.json()
     except requests.RequestException:
         raise SquareAPIError() from None
+
+    try:
+        content = response.json()
     except ValueError:
         raise SquareAPIError(response.status_code) from None
 

@@ -198,6 +198,26 @@ class TestSquareOnlineRecovery(SquareOnlineCheckoutCase):
         external.assert_called_once()
         self.assertEqual(external.call_args.args, ("POST", "https://connect.squareupsandbox.com/v2/payments"))
 
+    @patch(square_boundary)
+    def test_square_rejects_access_with_a_non_json_response(self, external):
+        order = self._make_order()
+        draft = self._prepare(order, self._open_payment_page(order))
+        response = requests.Response()
+        response.status_code = 401
+        response._content = b"<html>private Square diagnostics</html>"
+        external.return_value = response
+
+        result = self._submit(draft)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("Square is temporarily unavailable", result["state_message"])
+        self.assertNotIn("private Square diagnostics", result["state_message"])
+        self.env.invalidate_all()
+        self.assertEqual(self.connection.oauth_health, "reconnect")
+        self.assertEqual(order.state, "draft")
+        self.assertFalse(order.transaction_ids.payment_id)
+        external.assert_called_once()
+        self.assertEqual(external.call_args.args, ("POST", "https://connect.squareupsandbox.com/v2/payments"))
+
     def _authorize_connection(self, connection, external, *, merchant, access, location="SQUARE-NY"):
         method = "action_square_online_connect"
         action = self.make_jsonrpc_request(f"/web/dataset/call_button/square.online.connection/{method}", {

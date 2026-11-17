@@ -261,13 +261,17 @@ class PaymentTransaction(models.Model):
 
     def _square_online_reconcile_refund_balance(self, reported_minor, refunds):
         self.ensure_one()
+        verified_ids = set()
         for refund in refunds:
             if not self._square_online_apply_locked_refund(refund, discover=True):
                 raise SquareAPIError()
-        # Square's aggregate includes pending and completed refunds. Reserve only
-        # its unexplained remainder, since each verified ID already has a child.
+            if refund["status"] in ("PENDING", "COMPLETED"):
+                verified_ids.add(refund["id"])
+        # Square's aggregate includes pending and completed refunds. Subtract only
+        # the overlap verified on this read; other local reservations stand on their own.
         linked = self.child_transaction_ids.filtered(
-            lambda tx: tx.operation == "refund" and tx.provider_reference and tx.state in ("pending", "done")
+            lambda tx: tx.operation == "refund"
+            and tx.provider_reference in verified_ids and tx.state in ("pending", "done")
         )
         unattributed = max(0, reported_minor - sum(linked.mapped("square_online_amount_minor")))
         if self.square_online_unattributed_refund_minor != unattributed:
