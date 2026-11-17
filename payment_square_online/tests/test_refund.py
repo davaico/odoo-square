@@ -769,6 +769,31 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         self.assertEqual([call.args[0] for call in external.call_args_list], ["GET", "POST"])
 
     @patch(square_boundary)
+    def test_context_defaults_cannot_forge_a_square_refund_reservation(self, external):
+        _, tx, _original = self._capture(external)
+        other_provider = self.provider.copy({"name": "Other payment provider", "code": "none"})
+        administrator = new_test_user(
+            self.env, login="square-refund-defaults-admin", groups="base.group_system",
+            company_id=self.company.id, company_ids=[Command.set(self.company.ids)],
+        )
+        self.authenticate(administrator.login, administrator.login)
+        with self.assertRaises(JsonRpcException):
+            self._call("payment.transaction", "create", {
+                "provider_id": other_provider.id,
+                "payment_method_id": self.method.id,
+                "partner_id": self.partner.id,
+                "currency_id": self.currency.id,
+                "amount": -tx.amount,
+                "operation": "refund",
+                "state": "pending",
+                "source_transaction_id": tx.id,
+            }, context={"default_square_online_amount_minor": tx.square_online_amount_minor})
+        self.env.invalidate_all()
+        self.assertFalse(tx.child_transaction_ids)
+        self.assertEqual(tx.payment_id.amount_available_for_refund, tx.amount)
+        external.assert_called_once()
+
+    @patch(square_boundary)
     def test_refund_routes_enforce_role_and_selected_company(self, external):
         _, tx, _original = self._capture(external)
         other_company = self.env["res.company"].create({"name": "Other refund company"})

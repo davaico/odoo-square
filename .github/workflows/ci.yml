@@ -1,9 +1,9 @@
-# Fresh Odoo 19 Community install and addon tests.
+# Each selection installs into its own fresh database and filestore.
 name: CI
 
 on:
   push:
-    branches: ["19.0"]
+    branches: ['19.0']
   pull_request:
   workflow_dispatch:
 
@@ -13,22 +13,87 @@ permissions:
 jobs:
   odoo-tests:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: pos
+            modules: odoo_square
+            tags: /odoo_square
+          - suite: online
+            modules: payment_square_online,website_sale_stock,payment_demo
+            tags: /payment_square_online,-/payment_square_online:TestSquareOnlinePosCoexistence
+          - suite: combined
+            modules: payment_square_online,website_sale_stock,payment_demo,odoo_square
+            tags: /payment_square_online,/odoo_square
+          - suite: refund-races
+            modules: payment_square_online
+            tags: ''
+    env:
+      COMPOSE_PROJECT_NAME: odoo-square-v19-test-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+      ODOO_INIT_MODULES: ${{ matrix.modules }}
+      ODOO_TEST_TAGS: ${{ matrix.tags }}
+      TEST_SUITE: ${{ matrix.suite }}
+      ODOO_TEST_IMAGE: odoo-square-v19-browser-test
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install and test Odoo Square
+      - name: Prepare isolated test credentials and Chrome image
         shell: bash
         run: |
-          docker compose -f docker-compose.test.yml run --rm -T odoo 2>&1 \
-            | tee "$RUNNER_TEMP/odoo-tests.log"
-          # Odoo can exit successfully with zero tests if it skips the addon.
-          grep -Eq '0 failed, 0 error\(s\) of [1-9][0-9]* tests when loading database' \
-            "$RUNNER_TEMP/odoo-tests.log"
+          set -euo pipefail
+          printf 'SQUARE_ONLINE_TEST_ENCRYPTION_KEY=%s\n' \
+            "$(python3 -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')" \
+            >> "$GITHUB_ENV"
+          docker build -f config/Dockerfile.test -t "$ODOO_TEST_IMAGE" config
+      - name: Install and exercise the selected workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          compose=(docker compose -f docker-compose.test.yml)
+          if [[ "$TEST_SUITE" == refund-races ]]; then
+            "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_test \
+              --init="$ODOO_INIT_MODULES" --stop-after-init --no-http 2>&1 \
+              | tee test-results/install.log
+            "${compose[@]}" run --rm -T odoo odoo shell --database=odoo_square_test --no-http \
+              < payment_square_online/tests/refund_race.py 2>&1 | tee test-results/refund-races.log
+            grep -Fq 'Verified local requests dispatched once, Square ingestion made no request, and each refund posted once.' \
+              test-results/refund-races.log
+          else
+            "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_test \
+              --init="$ODOO_INIT_MODULES" --test-tags="$ODOO_TEST_TAGS" \
+              --workers=0 --stop-after-init --log-level=test 2>&1 | tee test-results/odoo-tests.log
+            log=test-results/odoo-tests.log
+            grep -Eq '(^|[[:space:]])0 failed, 0 error\(s\) of [1-9][0-9]* tests when loading database' "$log"
+            if grep -Eq 'odoo\.addons\.(odoo_square|payment_square_online)\.tests\..*: skipped ' "$log"; then
+              echo 'A required addon test was skipped.' >&2
+              exit 1
+            fi
+            if [[ "$TEST_SUITE" != pos ]]; then
+              grep -Fq 'Starting TestSquareOnlineCheckout.test_mobile_browser_completes_bank_verification_and_submits_the_embedded_card ' "$log"
+            fi
+            if [[ "$TEST_SUITE" != online ]]; then
+              grep -Eq 'odoo\.addons\.odoo_square\.tests\..*: Starting ' "$log"
+            fi
+            if [[ "$TEST_SUITE" == combined ]]; then
+              grep -Fq 'Starting TestSquareOnlinePosCoexistence.' "$log"
+            fi
+          fi
 
-      - name: Logs on failure
-        if: failure()
-        run: docker compose -f docker-compose.test.yml logs db
+      - name: Collect service logs
+        if: always()
+        run: |
+          mkdir -p test-results
+          docker compose -f docker-compose.test.yml logs --no-color > test-results/services.log 2>&1
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odoo19-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: test-results/
 
       - name: Cleanup
         if: always()

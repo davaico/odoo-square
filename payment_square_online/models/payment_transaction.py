@@ -76,10 +76,13 @@ class PaymentTransaction(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
-        if not self.env.su and any(
-            any(name.startswith("square_online_") for name in vals)
-            or self.env["payment.provider"].sudo().browse(vals.get("provider_id")).code == "square_online"
-            for vals in vals_list
+        if not self.env.su and (
+            any(name.startswith("default_square_online_") for name in self.env.context)
+            or any(
+                any(name.startswith("square_online_") for name in vals)
+                or self.env["payment.provider"].sudo().browse(vals.get("provider_id")).code == "square_online"
+                for vals in vals_list
+            )
         ):
             raise AccessError(_("Square payments are created through website checkout."))
         transactions = super().create(vals_list)

@@ -140,6 +140,8 @@ Pending Square refunds reduce the available balance shown in Odoo. Completed Squ
 
 ## Run the automated Odoo 19 tests
 
+CI runs separate POS-only, standalone online, combined, and concurrent-refund jobs. It requires nonzero passing test results, rejects skipped addon tests, and checks that the browser and combined coexistence cases ran. Logs are attached to each job.
+
 Run the following commands from the repository root in Bash. The browser test image uses Linux amd64 and adds pinned Chrome and its Python WebSocket dependency to the Odoo 19 Community image. If the pinned package is no longer available, select a compatible Odoo 19 test image with a working Chrome or Chromium binary and `python3-websocket` by setting `ODOO_TEST_IMAGE` to its local tag.
 
 ```bash
