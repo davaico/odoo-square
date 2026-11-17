@@ -201,6 +201,11 @@ class PaymentTransaction(models.Model):
             or minor != self.square_online_amount_minor
         ):
             raise ValidationError(_("The checkout changed. Refresh the checkout page."))
+        # A renewal failure before dispatch must leave checkout free to try again.
+        try:
+            connection._square_online_sync_access()
+        except SquareAPIError:
+            raise ValidationError(_("Square is temporarily unavailable. Try another payment method.")) from None
         order._square_online_mark_checkout_change()
         self.square_online_dispatch_at = fields.Datetime.now()
         self._set_pending(state_message=_("Square is processing your payment."))

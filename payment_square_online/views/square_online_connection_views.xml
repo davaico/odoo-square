@@ -10,6 +10,7 @@
                 <field name="environment"/>
                 <field name="merchant_id" optional="show"/>
                 <field name="location_id"/>
+                <field name="oauth_health"/>
                 <field name="token_expires_at" optional="show"/>
             </list>
         </field>
@@ -32,6 +33,11 @@
                     <div class="alert alert-info" role="status" invisible="not oauth_status_message">
                         <field name="oauth_status_message" nolabel="1"/>
                     </div>
+                    <div class="alert alert-warning" role="status" invisible="not oauth_reconnect_required">
+                        Square authorization needs attention. Select <strong>Authorize with Square</strong>
+                        and sign in as the original merchant to restore access.
+                    </div>
+                    <field name="oauth_reconnect_required" invisible="1"/>
                     <group>
                         <group string="Application">
                             <field name="company_id" readonly="id"/>
@@ -42,6 +48,7 @@
                         </group>
                         <group string="Merchant">
                             <field name="merchant_id"/>
+                            <field name="oauth_health"/>
                             <field name="token_expires_at"/>
                             <field name="location_locked" invisible="1"/>
                             <field name="location_id"
