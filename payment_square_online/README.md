@@ -52,6 +52,6 @@ Square processes in the location's currency and the checkout currency must match
 4. Confirm that the existing Odoo order is confirmed and the charge appears in the Square Sandbox seller's transactions. Check the payment in Odoo Accounting and the order's invoice if automatic invoicing is enabled. Odoo handles delivery through its normal fulfillment workflow.
 5. Try a Sandbox decline card to see how checkout handles a definitive failure. If a payment remains processing after an interruption, keep the order reference for support and check its status before trying to pay again.
 
-If you enforce a Content Security Policy, allow the appropriate environment's Square SDK and its frame, network, and font origins for checkout. Check Square's requirements against your existing policy. [Square Web Payments SDK security policy](https://developer.squareup.com/docs/web-payments/content-security-policy)
+Square requires a Content Security Policy on the checkout page. Configure the checkout host to allow the selected environment's Square SDK and its frame, network, stylesheet, and font origins. Check that the policy also allows your Odoo assets. [Square Web Payments SDK security policy](https://developer.squareup.com/docs/web-payments/content-security-policy)
 
 The automated checkout tests simulate Square's SDK and API. Use Square Sandbox to qualify your store's actual card form, authentication, and capture.
