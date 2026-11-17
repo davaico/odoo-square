@@ -202,8 +202,8 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         self.assertEqual(tx.square_online_order_reference, original["order_id"])
         self.assertEqual(child.square_online_order_reference, refund["order_id"])
         self.assertFalse(tx.payment_id)
-        # The native cron can reach the refund before it reaches the capture.
-        child._cron_post_process()
+        # Exercise native post-processing with the refund selected before the capture.
+        child.sudo().action_post_process()
         self.env.invalidate_all()
         self.assertEqual(order.state, "sale")
         self.assertEqual(tx.payment_id.payment_type, "inbound")
