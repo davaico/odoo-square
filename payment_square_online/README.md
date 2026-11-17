@@ -174,7 +174,7 @@ The concurrency fixture uses separate PostgreSQL connections to submit simultane
   set -e
   export SQUARE_ONLINE_TEST_ENCRYPTION_KEY
   SQUARE_ONLINE_TEST_ENCRYPTION_KEY=$(python3 -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')
-  compose=(docker compose --project-name "odoo-square-v19-race-$(date +%s)-$BASHPID" -f docker-compose.test.yml)
+  compose=(docker compose --project-name "odoo-square-v19-test-race-$(date +%s)-$BASHPID" -f docker-compose.test.yml)
   trap '"${compose[@]}" down --volumes' EXIT
   "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_test \
     --init=payment_square_online --stop-after-init --no-http
