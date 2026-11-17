@@ -3,4 +3,5 @@ from . import test_provider
 from . import test_oauth
 
 from . import test_checkout
+from . import test_recovery
 from . import test_markets

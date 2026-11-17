@@ -13,8 +13,11 @@
         "security/square_online_rules.xml",
         "views/square_online_connection_views.xml",
         "views/payment_provider_views.xml",
+        "views/payment_transaction_views.xml",
         "views/payment_form_templates.xml",
+        "views/payment_recovery_templates.xml",
         "data/payment_provider_data.xml",
+        "data/payment_recovery_data.xml",
     ],
     "assets": {
         "web.assets_frontend": [

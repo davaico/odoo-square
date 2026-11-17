@@ -52,6 +52,11 @@
                             <field name="location_currency_code"/>
                         </group>
                     </group>
+                    <group string="Webhook" groups="base.group_system" invisible="not id">
+                        <field name="webhook_route"/>
+                        <field name="webhook_notification_url" placeholder="https://shop.example.com/payment/square_online/webhook/1"/>
+                        <field name="webhook_signature_key" password="True"/>
+                    </group>
                     <div class="text-muted">
                         Eligible Square locations process cards in their local currency.
                         Supported markets are Australia (AUD), Canada (CAD), France, Ireland

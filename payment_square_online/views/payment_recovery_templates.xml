@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <template id="sale_order_portal_square_payment_mismatch" inherit_id="sale.sale_order_portal_template">
+        <xpath expr="//div[@id='portal_sale_content']" position="before">
+            <div t-if="current_tx and current_tx.square_online_has_order_mismatch"
+                 class="alert alert-warning d-print-none" role="alert">
+                Square collected your payment. Please contact us about this order.
+            </div>
+        </xpath>
+    </template>
+
+    <template id="shop_confirmation_square_payment_mismatch" inherit_id="website_sale.payment_confirmation_status">
+        <xpath expr="//t[@t-if=&quot;tx_sudo.state == 'done'&quot;]" position="after">
+            <span t-if="tx_sudo.square_online_has_order_mismatch">
+                Square collected your payment. Please contact us about this order.
+            </span>
+        </xpath>
+    </template>
+</odoo>
