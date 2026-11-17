@@ -8,6 +8,8 @@ Odoo 19 Community addon for integrating Square POS with Odoo Sales, Accounting, 
 
 Checkout, payment collection, and refund initiation happen in Square. The addon processes Square webhooks and records the resulting sales, payments, refunds, exchanges, and stock movements in Odoo.
 
+For Odoo website checkout, see the separate [Square Online Payments setup guide](payment_square_online/README.md).
+
 ## Features
 
 - Secure Square webhook endpoint at `/square/webhook` with HMAC-SHA256 validation when a webhook signature key is configured.
