@@ -17,7 +17,7 @@ class SquareApiClient(models.Model):
     @api.model
     def _get_square_config(self):
         """Get Square configuration"""
-        config = self.env["square.config"].search([], limit=1)
+        config = self.env["square.config"].search([("company_id", "=", self.env.company.id), ("active", "=", True)], limit=1)
         if not config:
             raise UserError(
                 "No Square configuration found. Please configure Square integration first."
@@ -70,12 +70,6 @@ class SquareApiClient(models.Model):
 
         except requests.exceptions.RequestException as e:
             _logger.error(f"Square API request failed: {str(e)}")
-            if hasattr(e, "response") and e.response is not None:
-                try:
-                    error_data = e.response.json()
-                    _logger.error(f"Square API error response: {error_data}")
-                except:
-                    _logger.error(f"Square API error response (raw): {e.response.text}")
             raise UserError(f"Failed to communicate with Square API: {str(e)}")
 
     @api.model
@@ -126,9 +120,7 @@ class SquareApiClient(models.Model):
 
             if "customer" in response:
                 customer_data = response["customer"]
-                _logger.info(
-                    f"Retrieved customer {customer_id}: {customer_data.get('given_name', '')} {customer_data.get('family_name', '')}"
-                )
+                _logger.info("Retrieved Square customer details")
                 return customer_data
             else:
                 _logger.error(
@@ -317,7 +309,7 @@ class SquareApiClient(models.Model):
 
 
     @api.model
-    def set_physical_count(
+    def _set_physical_count(
         self, catalog_object_id, location_id, target_quantity, product_sku
     ):
         """

@@ -27,6 +27,7 @@
                     <sheet>
                         <group>
                             <group>
+                                <field name="company_id" groups="base.group_multi_company"/>
                                 <field name="square_environment"/>
                                 <field name="square_application_id"/>
                                 <field name="square_access_token" password="True"/>

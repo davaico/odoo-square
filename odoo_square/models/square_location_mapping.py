@@ -60,54 +60,20 @@ class SquareLocationMapping(models.Model):
         "Each Square location can only be mapped once per configuration",
     )
 
-    @api.model_create_multi
-    def create(self, vals_list):
-        """Override create to validate warehouse selection"""
-        records = super().create(vals_list)
-
-        # Validate each record
-        for record in records:
-            # Validate that the selected warehouse is not already mapped in this config
-            existing_mapping = self.search(
-                [
-                    ("config_id", "=", record.config_id.id),
-                    ("warehouse_id", "=", record.warehouse_id.id),
-                    ("id", "!=", record.id),
-                ]
-            )
-
-            if existing_mapping:
+    @api.constrains("config_id", "warehouse_id")
+    def _check_warehouse_mapping(self):
+        for mapping in self:
+            if mapping.warehouse_id.company_id != mapping.config_id.company_id:
+                raise ValidationError("The Square location and warehouse must belong to the same company.")
+            if self.search_count([
+                ("config_id", "=", mapping.config_id.id),
+                ("warehouse_id", "=", mapping.warehouse_id.id),
+                ("id", "!=", mapping.id),
+            ], limit=1):
                 raise ValidationError(
-                    f"Warehouse '{record.warehouse_id.name}' is already mapped to another Square location in this configuration."
+                    f"Warehouse '{mapping.warehouse_id.name}' is already mapped to "
+                    "another Square location in this configuration."
                 )
-
-            _logger.info(
-                f"Created mapping: Square location '{record.square_location_name}' -> "
-                f"Odoo warehouse '{record.warehouse_id.name}'"
-            )
-
-        return records
-
-    def write(self, vals):
-        """Override write to validate warehouse selection"""
-        result = super().write(vals)
-
-        if "warehouse_id" in vals:
-            # Validate that the selected warehouse is not already mapped in this config
-            existing_mapping = self.search(
-                [
-                    ("config_id", "=", self.config_id.id),
-                    ("warehouse_id", "=", self.warehouse_id.id),
-                    ("id", "!=", self.id),
-                ]
-            )
-
-            if existing_mapping:
-                raise ValidationError(
-                    f"Warehouse '{self.warehouse_id.name}' is already mapped to another Square location in this configuration."
-                )
-
-        return result
 
     @api.depends("square_location_name", "warehouse_id.name")
     def _compute_display_name(self):
@@ -128,7 +94,7 @@ class SquareLocationMapping(models.Model):
     def _get_square_locations(self, config):
         """Get available Square locations from API"""
         try:
-            square_api = self.env["square.api.client"]
+            square_api = self.env["square.api.client"].with_company(config.company_id)
             locations = square_api.get_locations()
 
             if not locations:

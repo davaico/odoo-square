@@ -5,7 +5,8 @@ class StockPicking(models.Model):
     _inherit = "stock.picking"
 
     square_exchange_order_id = fields.Char(
-        string="Square Exchange Order ID", copy=False, readonly=True
+        string="Square Exchange Order ID", copy=False, readonly=True,
+        groups="base.group_system,odoo_square.group_square_pos_service",
     )
 
     def _force_quantity_for_square(self):

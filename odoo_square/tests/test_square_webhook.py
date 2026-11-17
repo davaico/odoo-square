@@ -42,6 +42,7 @@ class TestSquareWebhook(SquareHttpCase):
                 "name": "Test Square Config",
                 "square_application_id": "test_app_id",
                 "square_access_token": "test_access_token",
+                "square_webhook_signature_key": self.square_test_key,
                 "square_environment": "sandbox",
             }
         )
@@ -114,7 +115,7 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Make webhook request using Odoo's HTTP testing
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -175,7 +176,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -208,7 +209,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -256,7 +257,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -269,7 +270,7 @@ class TestSquareWebhook(SquareHttpCase):
             ("success", "updated", "already_processed"),
         )
 
-        response2 = self.url_open(
+        response2 = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -313,7 +314,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -335,7 +336,7 @@ class TestSquareWebhook(SquareHttpCase):
     def test_webhook_invalid_content_type(self):
         """Test webhook with invalid content type returns error"""
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data="invalid data",
             headers={"Content-Type": "text/plain"},
@@ -387,7 +388,7 @@ class TestSquareWebhook(SquareHttpCase):
     def test_webhook_malformed_json(self):
         """Test webhook with malformed JSON returns error"""
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data="{ invalid json }",
             headers={"Content-Type": "application/json"},
@@ -412,7 +413,7 @@ class TestSquareWebhook(SquareHttpCase):
             }
         }
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -429,7 +430,7 @@ class TestSquareWebhook(SquareHttpCase):
 
         webhook_data = {"type": "catalog.updated", "data": {}}  # Unhandled event type
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -545,7 +546,7 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         processor = self.env["square.order.processor"]
-        result = processor.process_square_order(square_data)
+        result = processor._process_square_order(square_data)
 
         # Check result
         self.assertIn("sale_order_id", result)
@@ -597,7 +598,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -669,7 +670,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -704,7 +705,7 @@ class TestSquareWebhook(SquareHttpCase):
             "reason": "Customer request",
         }
 
-        refund_record = self.env["square.refund"].create_from_square_data(
+        refund_record = self.env["square.refund"]._create_from_square_data(
             refund_data, sale_order
         )
 
@@ -860,12 +861,12 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Create first refund
-        refund1 = self.env["square.refund"].create_from_square_data(
+        refund1 = self.env["square.refund"]._create_from_square_data(
             refund_data, sale_order
         )
 
         # Try to create duplicate
-        refund2 = self.env["square.refund"].create_from_square_data(
+        refund2 = self.env["square.refund"]._create_from_square_data(
             refund_data, sale_order
         )
 
@@ -1142,7 +1143,7 @@ class TestSquareWebhook(SquareHttpCase):
                     },
                 }
                 for expected_status in ("updated", "already_processed"):
-                    response = self.url_open(
+                    response = self._post_signed_square_webhook(
                         "/square/webhook",
                         data=json.dumps(webhook_data),
                         headers={"Content-Type": "application/json"},
@@ -1247,7 +1248,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -1343,7 +1344,7 @@ class TestSquareWebhook(SquareHttpCase):
 
         # Process the webhook
         with patch.object(SquareApiClient, "get_order", return_value=None):
-            response = self.url_open(
+            response = self._post_signed_square_webhook(
                 "/square/webhook",
                 data=json.dumps(webhook_data),
                 headers={"Content-Type": "application/json"},
@@ -1454,7 +1455,7 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Process the webhook
-        response = self.url_open(
+        response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},

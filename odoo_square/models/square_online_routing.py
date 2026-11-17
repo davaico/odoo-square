@@ -31,7 +31,7 @@ class SquareOrderProcessor(models.Model):
         if not hasattr(transactions, "_square_online_pos_scope"):
             return None
         config = square_config if square_config is not None else self.env["square.config"].sudo().search(
-            [], limit=1,
+            [("company_id", "=", self.sudo().env.company.id)], limit=1,
         )
         if not config:
             return None

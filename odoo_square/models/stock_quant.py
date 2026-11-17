@@ -39,13 +39,16 @@ class StockQuant(models.Model):
                 return
 
             # Get Square configuration
-            square_config = self.env["square.config"].search([], limit=1)
+            stock_sync = self.env["square.stock.sync"].sudo().with_context({}).with_company(warehouse.company_id)
+            square_config = stock_sync.env["square.config"].search(
+                [("company_id", "=", warehouse.company_id.id), ("active", "=", True)], limit=1,
+            )
             if not square_config:
                 _logger.debug("No Square configuration found")
                 return
 
             # Find location mapping for this warehouse
-            location_mapping = square_config.location_mapping_ids.filtered(
+            location_mapping = square_config._valid_location_mappings().filtered(
                 lambda m: m.warehouse_id == warehouse
             )
 
@@ -61,18 +64,18 @@ class StockQuant(models.Model):
                 return
 
             # Get the Square stock sync service
-            stock_sync = self.env["square.stock.sync"].search([], limit=1)
+            stock_sync = stock_sync.search([], limit=1)
             if not stock_sync:
                 # Create default sync service if it doesn't exist
-                stock_sync = self.env["square.stock.sync"].create(
+                stock_sync = stock_sync.create(
                     {"name": "Square Stock Sync"}
                 )
 
             # Get current stock quantity for this product and warehouse
-            current_stock = quant._get_current_stock_for_warehouse(warehouse)
+            current_stock = quant.sudo()._get_current_stock_for_warehouse(warehouse)
 
             # Sync to Square for the specific location
-            stock_sync.sync_product_stock_for_location(
+            stock_sync._sync_product_stock_for_location(
                 quant.product_id, location_mapping.square_location_id, current_stock
             )
 
@@ -90,7 +93,7 @@ class StockQuant(models.Model):
         quants = self.env["stock.quant"].search(
             [
                 ("product_id", "=", self.product_id.id),
-                ("location_id", "=", stock_location.id),
+                ("location_id", "child_of", stock_location.id),
             ]
         )
 

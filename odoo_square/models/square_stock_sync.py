@@ -153,13 +153,13 @@ class SquareStockSync(models.Model):
 
             # Simply set the exact quantity from Odoo - no adjustments needed
             api_client = self._get_square_api_client()
-            result = api_client.set_physical_count(
+            result = api_client._set_physical_count(
                 catalog_object_id, location_id, int(new_quantity), product_sku
             )
 
             if not result:
                 _logger.error(f"Square API failed to set inventory for {product_sku}")
-                self.env["square.integration.log"].log_error(
+                self.env["square.integration.log"]._log_error(
                     title=f"Square API Error - Sync refused",
                     error_message=f"Square API refused stock sync for {product_sku}",
                     technical_details=f"SKU: {product_sku}, Odoo Quantity: {new_quantity}",
@@ -173,7 +173,7 @@ class SquareStockSync(models.Model):
             )
             return False
 
-    def sync_product_stock(self, product):
+    def _sync_product_stock(self, product):
         """Sync stock for a specific product to Square"""
         if not self._should_sync_product(product):
             return True
@@ -200,7 +200,7 @@ class SquareStockSync(models.Model):
 
             # Log to integration dashboard
             if success:
-                self.env["square.integration.log"].log_square_event(
+                self.env["square.integration.log"]._log_square_event(
                     event_type="stock_sync",
                     title=f"Stock synchronized for {product.name}",
                     description=f"""
@@ -216,7 +216,7 @@ class SquareStockSync(models.Model):
                     status="success",
                 )
             else:
-                self.env["square.integration.log"].log_error(
+                self.env["square.integration.log"]._log_error(
                     title=f"Stock sync failed for {product.name}",
                     error_message=f"Unable to synchronize stock for product {product.name} (SKU: {product.default_code}) vers Square",
                     technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Quantité: {total_quantity}, Entrepôt: {configured_warehouse.name}",
@@ -237,7 +237,7 @@ class SquareStockSync(models.Model):
             _logger.error(f"Error syncing product {product.default_code}: {str(e)}")
 
             # Log exception to integration dashboard
-            self.env["square.integration.log"].log_error(
+            self.env["square.integration.log"]._log_error(
                 title=f"Critical stock sync error for {product.name}",
                 error_message=f"Exception during stock synchronization: {str(e)}",
                 technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Exception: {str(e)}",
@@ -246,7 +246,7 @@ class SquareStockSync(models.Model):
             self.total_syncs += 1
             self.failed_syncs += 1
 
-    def sync_product_stock_for_location(self, product, square_location_id, quantity):
+    def _sync_product_stock_for_location(self, product, square_location_id, quantity):
         """Sync stock for a specific product to a specific Square location"""
         if not self._should_sync_product(product):
             return True
@@ -273,7 +273,7 @@ class SquareStockSync(models.Model):
 
             # Simply set the exact quantity from Odoo - no adjustments needed
             api_client = self._get_square_api_client()
-            result = api_client.set_physical_count(
+            result = api_client._set_physical_count(
                 catalog_object_id, square_location_id, int(quantity), product.default_code
             )
 
@@ -284,7 +284,7 @@ class SquareStockSync(models.Model):
                 )
 
                 # Log to integration dashboard
-                self.env["square.integration.log"].log_square_event(
+                self.env["square.integration.log"]._log_square_event(
                     event_type="stock_sync",
                     title=f"Stock synchronized for {product.name}",
                     description=f"""
@@ -309,7 +309,7 @@ class SquareStockSync(models.Model):
                 _logger.error(f"Stock sync failed for {product.name}: API call returned False")
 
                 # Log error to integration dashboard
-                self.env["square.integration.log"].log_error(
+                self.env["square.integration.log"]._log_error(
                     title=f"Stock sync failed for {product.name}",
                     error_message=f"Unable to synchronize stock for product {product.name} vers Square",
                     technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Quantité: {quantity}, Emplacement: {square_location_id}",
@@ -325,7 +325,7 @@ class SquareStockSync(models.Model):
             _logger.error(f"Error syncing product {product.default_code}: {str(e)}")
 
             # Log exception to integration dashboard
-            self.env["square.integration.log"].log_error(
+            self.env["square.integration.log"]._log_error(
                 title=f"Critical stock sync error for {product.name}",
                 error_message=f"Exception during stock synchronization: {str(e)}",
                 technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Exception: {str(e)}",
@@ -338,9 +338,9 @@ class SquareStockSync(models.Model):
             return False
 
     @api.model
-    def sync_stock_changes(self, stock_move):
+    def _sync_stock_changes(self, stock_move):
         """Main method to handle stock move changes"""
-        if not self.auto_sync_enabled:
+        if not self.auto_sync_enabled or stock_move.company_id != self.env.company:
             _logger.debug("Auto sync disabled - skipping stock sync")
             return
 
@@ -378,14 +378,14 @@ class SquareStockSync(models.Model):
         total_quantity = sum(quant.quantity for quant in stock_quant)
 
         # Sync affected product to the specific location
-        success = self.sync_product_stock_to_location(stock_move.product_id, affected_warehouse, square_location_id, total_quantity)
+        success = self._sync_product_stock_to_location(stock_move.product_id, affected_warehouse, square_location_id, total_quantity)
 
         # Log the stock move trigger event
         if success:
             _logger.info(
                 f"Successfully synced {stock_move.product_id.default_code} to Square location {square_location_id}"
             )
-            self.env["square.integration.log"].log_square_event(
+            self.env["square.integration.log"]._log_square_event(
                 event_type="stock_sync",
                 title=f"Stock synchronisé suite au mouvement {stock_move.display_name}",
                 description=f"""
@@ -442,12 +442,11 @@ class SquareStockSync(models.Model):
         """Get all configured location mappings from Square config"""
         api_client = self._get_square_api_client()
         config = api_client._get_square_config()
-        if config and config.location_mapping_ids:
-            return config.location_mapping_ids
-        return self.env["square.location.mapping"]
+        return config._valid_location_mappings()
 
     def manual_sync_all_products(self):
         """Manually sync all products to Square for all configured location mappings"""
+        self.check_access("write")
         _logger.info("Starting manual sync of all products to Square")
 
         # Get all location mappings
@@ -494,7 +493,7 @@ class SquareStockSync(models.Model):
                 <li><strong>{loc_result['warehouse']}</strong> → <em>{loc_result['square_location']}</em>
                     ({loc_result['successful']} réussis, {loc_result['failed']} échecs)</li>"""
 
-        self.env["square.integration.log"].log_square_event(
+        self.env["square.integration.log"]._log_square_event(
             event_type="stock_sync",
             title=f"Synchronisation manuelle multi-entrepôts terminée",
             description=f"""
@@ -551,13 +550,13 @@ class SquareStockSync(models.Model):
 
             if square_location_id:
                 # Sync to specific Square location
-                if self.sync_product_stock_to_location(product, warehouse, square_location_id, total_quantity):
+                if self._sync_product_stock_to_location(product, warehouse, square_location_id, total_quantity):
                     successful += 1
                 else:
                     failed += 1
             else:
                 # Fallback to legacy sync method
-                if self.sync_product_stock(product):
+                if self._sync_product_stock(product):
                     successful += 1
                 else:
                     failed += 1
@@ -566,7 +565,7 @@ class SquareStockSync(models.Model):
 
         return {"successful": successful, "failed": failed, "total": len(products)}
 
-    def sync_product_stock_to_location(self, product, warehouse, square_location_id, quantity):
+    def _sync_product_stock_to_location(self, product, warehouse, square_location_id, quantity):
         """Sync a specific product's stock to a specific Square location"""
         if not self._should_sync_product(product):
             return True
@@ -593,7 +592,7 @@ class SquareStockSync(models.Model):
 
             # Simply set the exact quantity from Odoo - no adjustments needed
             api_client = self._get_square_api_client()
-            result = api_client.set_physical_count(
+            result = api_client._set_physical_count(
                 catalog_object_id, square_location_id, int(quantity), product.default_code
             )
 
@@ -604,7 +603,7 @@ class SquareStockSync(models.Model):
                 )
 
                 # Log to integration dashboard
-                self.env["square.integration.log"].log_square_event(
+                self.env["square.integration.log"]._log_square_event(
                     event_type="stock_sync",
                     title=f"Stock synchronized for {product.name}",
                     description=f"""
@@ -630,7 +629,7 @@ class SquareStockSync(models.Model):
                 _logger.error(f"Stock sync failed for {product.name} in location {square_location_id}: API call returned False")
 
                 # Log error to integration dashboard
-                self.env["square.integration.log"].log_error(
+                self.env["square.integration.log"]._log_error(
                     title=f"Stock sync failed for {product.name}",
                     error_message=f"Unable to synchronize stock for product {product.name} vers Square",
                     technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Quantité: {quantity}, Entrepôt: {warehouse.name}, Emplacement: {square_location_id}",
@@ -646,7 +645,7 @@ class SquareStockSync(models.Model):
             _logger.error(f"Error syncing product {product.default_code} to location {square_location_id}: {str(e)}")
 
             # Log exception to integration dashboard
-            self.env["square.integration.log"].log_error(
+            self.env["square.integration.log"]._log_error(
                 title=f"Critical stock sync error for {product.name}",
                 error_message=f"Exception during stock synchronization: {str(e)}",
                 technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Quantité: {quantity}, Entrepôt: {warehouse.name}, Emplacement: {square_location_id}, Exception: {str(e)}",

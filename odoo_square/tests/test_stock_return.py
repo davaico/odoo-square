@@ -259,7 +259,7 @@ class TestStockReturn(SquareHttpCase):
             }
         )
 
-        refund.action_process_refund()
+        refund._action_process_refund()
 
         # Return picking should have been created
         self.assertTrue(
@@ -269,7 +269,7 @@ class TestStockReturn(SquareHttpCase):
 
         # Now complete the refund
         refund.write({"status": "completed"})
-        refund.action_process_refund()
+        refund._action_process_refund()
         self.assertAlmostEqual(refund.credit_note_id.amount_total, 110.00, places=2)
 
         # Verify return picking is done
@@ -389,7 +389,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._process_square_order_update(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(
@@ -440,7 +440,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._process_square_order_update(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(
@@ -505,7 +505,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._process_square_order_update(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(
@@ -557,7 +557,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._process_square_order_update(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(

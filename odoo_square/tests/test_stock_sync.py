@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from odoo import Command
 from odoo.tests import Form, TransactionCase, tagged
+from odoo.tests.common import new_test_user
 
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
 
@@ -116,11 +117,12 @@ class TestStockSync(TransactionCase):
 
     def test_validated_receipt_updates_mapped_square_inventory(self):
         receipt = self._create_receipt(self.warehouse)
+        stock_user = new_test_user(self.env, login="square_stock_operator", groups="stock.group_stock_user")
 
         with patch.object(
             SquareApiClient, "_make_api_request", side_effect=self._square_response
         ) as square_requests:
-            receipt.button_validate()
+            receipt.with_user(stock_user).button_validate()
 
         self.assertEqual(receipt.state, "done")
         self.assertEqual(

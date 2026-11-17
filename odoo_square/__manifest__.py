@@ -3,7 +3,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 {
     "name": "Square POS Integration",
-    "version": "19.0.1.4.0",
+    "version": "19.0.1.4.1",
     "category": "Sales",
     "summary": "Complete Square POS integration for orders, refunds, exchanges and inventory sync",
     "description": """
@@ -25,6 +25,7 @@ Features:
         "python": ["requests"],
     },
     "data": [
+        "security/square_security.xml",
         "security/ir.model.access.csv",
         "data/square_bot_user.xml",
         "data/square_products.xml",

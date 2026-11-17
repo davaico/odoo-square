@@ -28,9 +28,10 @@ class SquareWebhookController(http.Controller):
         Main webhook endpoint for Square events
         Expected to be configured in Square as: https://<random-string>.ngrok-free.app/square/webhook
         """
+        authenticated = False
         try:
             # Get raw request body for signature validation
-            raw_body = request.httprequest.data.decode("utf-8")
+            raw_body = request.httprequest.data
             square_signature = request.httprequest.headers.get(
                 "x-square-hmacsha256-signature"
             )
@@ -44,9 +45,10 @@ class SquareWebhookController(http.Controller):
                 f"Notification URL for signature validation: {notification_url}"
             )
 
+            config = request.env["square.config"].sudo().search([], limit=1)
             # Validate webhook signature
             if not self._validate_webhook_signature(
-                raw_body, square_signature, notification_url
+                raw_body, square_signature, notification_url, config
             ):
                 _logger.error("Square webhook: Invalid signature")
                 return http.Response(
@@ -54,6 +56,9 @@ class SquareWebhookController(http.Controller):
                     content_type="application/json",
                     status=403,
                 )
+
+            authenticated = True
+            request.update_context(allowed_company_ids=config.company_id.ids)
 
             # Get JSON data from request
             if (
@@ -87,7 +92,7 @@ class SquareWebhookController(http.Controller):
             event_data = data.get("data", {})
 
             # Log webhook reception
-            request.env["square.integration.log"].sudo().log_webhook_received(
+            request.env["square.integration.log"].sudo()._log_webhook_received(
                 event_type, event_data, data.get("event_id")
             )
 
@@ -95,15 +100,12 @@ class SquareWebhookController(http.Controller):
                 _logger.error("Square webhook: No event type specified")
                 raise ValidationError("No event type specified in webhook data")
 
-            # NOTE: Uncomment this to print a full JSON
-            # _logger.debug(f"Square webhook data: {json.dumps(data, indent=4)}")
-
             # Process different event types using unified processor with transaction isolation
             with request.env.cr.savepoint():
                 result = self._process_event(
                     event_type, event_data, data.get("event_id"),
                     merchant_id=data.get("merchant_id"),
-                    environment=request.httprequest.headers.get("Square-Environment"),
+                    environment=config.square_environment,
                 )
 
             return http.Response(
@@ -132,14 +134,12 @@ class SquareWebhookController(http.Controller):
             _logger.error(f"Square webhook error: {str(e)}", exc_info=True)
 
             # Log error to integration dashboard
-            try:
-                request.env["square.integration.log"].sudo().log_error(
+            if authenticated:
+                request.env["square.integration.log"].sudo()._log_error(
                     title="Webhook Processing Error",
                     error_message=str(e),
                     technical_details=f"Event type: {event_type if 'event_type' in locals() else 'Unknown'}\nError: {str(e)}",
                 )
-            except:
-                pass  # Don't let logging errors break the webhook
 
             return http.Response(
                 json.dumps({"status": "error", "message": "Internal server error"}),
@@ -148,7 +148,7 @@ class SquareWebhookController(http.Controller):
             )
 
     def _validate_webhook_signature(
-        self, request_body, signature_header, notification_url
+        self, request_body, signature_header, notification_url, square_config
     ):
         """
         Validate Square webhook signature manually (based on Square SDK implementation)
@@ -162,13 +162,11 @@ class SquareWebhookController(http.Controller):
             bool: True if signature is valid, False otherwise
         """
         try:
-            # Get Square configuration
-            square_config = request.env["square.config"].sudo().search([], limit=1)
             if not square_config or not square_config.square_webhook_signature_key:
                 _logger.warning(
-                    "Square webhook signature key not configured - skipping validation"
+                    "Square webhook signature key not configured"
                 )
-                return True
+                return False
 
             signature_key = square_config.square_webhook_signature_key
 
@@ -190,8 +188,7 @@ class SquareWebhookController(http.Controller):
 
             # Perform UTF-8 encoding to bytes
             # https://github.com/square/square-python-sdk/blob/4e073b8df70daa190fcbf09e1b19423241b3e717/src/square/utils/webhooks_helper.py#L41
-            payload = notification_url + request_body
-            payload_bytes = payload.encode("utf-8")
+            payload_bytes = notification_url.encode("utf-8") + request_body
             signature_header_bytes = signature_header.encode("utf-8")
             signature_key_bytes = signature_key.encode("utf-8")
 
@@ -297,34 +294,15 @@ class SquareWebhookController(http.Controller):
             if routing:
                 return routing
 
-            # Check for existing processing of this payment event
-            if webhook_event_id:
-                existing_log = (
-                    request.env["square.integration.log"]
-                    .sudo()
-                    .search(
-                        [
-                            ("webhook_event_id", "=", webhook_event_id),
-                            ("status", "=", "success"),
-                        ],
-                        limit=1,
-                    )
-                )
-
-                if existing_log:
-                    _logger.info(
-                        f"Payment event {webhook_event_id} already processed successfully, skipping"
-                    )
-                    return {
-                        "status": "already_processed",
-                        "payment_id": payment_id,
-                    }
+            receipts = request.env["square.event.receipt"].sudo()
+            if receipts._was_applied("payment.updated", payment_id, webhook_event_id):
+                return {"status": "already_processed", "payment_id": payment_id}
 
             # Fetch full order details from Square API to check for exchanges
             api_client = request.env["square.api.client"].sudo()
             order_data = api_client.get_order(order_id)
 
-            if not order_data:
+            if not order_data or (order_data.get("id") or order_data.get("order_id")) != order_id:
                 _logger.error(
                     f"Failed to fetch order {order_id} from Square API for payment {payment_id}"
                 )
@@ -386,7 +364,7 @@ class SquareWebhookController(http.Controller):
                     request.env["sale.order"]
                     .sudo()
                     .with_user(bot_user)
-                    .search([("square_order_id", "=", source_order_id)], limit=1)
+                    .search([("square_order_id", "=", source_order_id), ("company_id", "=", receipts.env.company.id)], limit=1)
                 )
 
                 if not sale_order:
@@ -399,16 +377,18 @@ class SquareWebhookController(http.Controller):
                     }
 
                 # Process the exchange
-                result = square_processor.process_product_exchange(
+                result = square_processor._process_product_exchange(
                     sale_order, order_data, payment_data
                 )
 
                 # Log successful processing
-                if webhook_event_id and result.get("status") == "success":
+                if result.get("status") == "success":
+                    receipts._record_applied("payment.updated", payment_id, webhook_event_id)
                     request.env["square.integration.log"].sudo().with_user(
                         bot_user
                     ).create(
                         {
+                            "company_id": receipts.env.company.id,
                             "webhook_event_id": webhook_event_id,
                             "square_order_id": source_order_id,
                             "status": "success",
@@ -419,16 +399,20 @@ class SquareWebhookController(http.Controller):
                     )
 
                 return result
-            else:
-                _logger.info(
-                    f"No exchange detected for order {order_id}, payment processed normally"
-                )
-                return {
-                    "status": "success",
-                    "message": "Payment processed, no exchange detected",
-                    "payment_id": payment_id,
-                }
+            processor = processor.with_user(processor.sudo()._get_square_bot_user())
+            sale_order = processor._check_existing_order(order_id)
+            if sale_order and processor._settle_existing_order_invoice(
+                sale_order, payment_data, square_order=order_data,
+            ):
+                receipts._record_applied("payment.updated", payment_id, webhook_event_id)
+            return {
+                "status": "success",
+                "message": "Payment processed, no exchange detected",
+                "payment_id": payment_id,
+            }
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             _logger.error(
                 f"Error processing payment.updated event: {str(e)}", exc_info=True

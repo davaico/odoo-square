@@ -68,15 +68,15 @@ class StockMove(models.Model):
         """Trigger Square stock synchronization for a completed move"""
         try:
             # Get the Square stock sync service
-            stock_sync = self.env["square.stock.sync"].search([], limit=1)
+            stock_sync = self.env["square.stock.sync"].sudo().with_context({}).with_company(move.company_id).search([], limit=1)
             if not stock_sync:
                 # Create default sync service if it doesn't exist
-                stock_sync = self.env["square.stock.sync"].create(
+                stock_sync = stock_sync.create(
                     {"name": "Square Stock Sync"}
                 )
 
             # Trigger the sync
-            stock_sync.sync_stock_changes(move)
+            stock_sync._sync_stock_changes(move.with_env(stock_sync.env))
 
         except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
             raise

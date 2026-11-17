@@ -13,6 +13,7 @@ class SaleOrderLine(models.Model):
         help="The unique identifier from Square for this order line",
         index=True,
         copy=False,
+        groups="base.group_system,odoo_square.group_square_pos_service",
     )
 
     square_catalog_id = fields.Char(
@@ -20,6 +21,7 @@ class SaleOrderLine(models.Model):
         help="The Square catalog object ID for this product (used for exchange tracking)",
         index=True,
         copy=False,
+        groups="base.group_system,odoo_square.group_square_pos_service",
     )
 
     # Return tracking fields
@@ -29,6 +31,7 @@ class SaleOrderLine(models.Model):
         default=0.0,
         help="Quantity of this product that has been returned via Square refunds",
         copy=False,
+        groups="base.group_system,odoo_square.group_square_pos_service",
     )
 
     effective_qty = fields.Float(
@@ -70,7 +73,7 @@ class SaleOrderLine(models.Model):
         for line in self:
             line.effective_qty = line.product_uom_qty - line.returned_qty
 
-    def update_returned_quantity(self, returned_qty):
+    def _update_returned_quantity(self, returned_qty):
         """
         Update the returned quantity for this order line
         Called during refund processing to track returned items

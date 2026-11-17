@@ -160,6 +160,8 @@ class SquareManualResyncWizard(models.TransientModel):
         Scan Square for orders and identify missing ones in Odoo
         """
         self.ensure_one()
+        self.check_access("write")
+        self.config_id.check_access("write")
         _logger.info("=" * 70)
         _logger.info("SCAN MISSING ORDERS STARTED")
         _logger.info(f"Wizard ID: {self.id}, Config: {self.config_id.name if self.config_id else 'None'}")
@@ -340,7 +342,7 @@ class SquareManualResyncWizard(models.TransientModel):
     def _process_resync_order_event(self, order, event_type):
         try:
             with self.env.cr.savepoint():
-                return self.env["square.order.processor"]._process_order_event(
+                return self.env["square.order.processor"].with_company(self.config_id.company_id)._process_order_event(
                     order, event_type, square_config=self.config_id,
                 )
         except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
@@ -354,6 +356,8 @@ class SquareManualResyncWizard(models.TransientModel):
         Process selected missing orders through the webhook pipeline
         """
         self.ensure_one()
+        self.check_access("write")
+        self.config_id.check_access("write")
 
         try:
             # Get selected lines
@@ -382,7 +386,7 @@ class SquareManualResyncWizard(models.TransientModel):
                     order_data = api_client.get_order(
                         order_id, square_config=self.config_id
                     )
-                    if not order_data:
+                    if not order_data or order_data.get("id") != order_id:
                         raise UserError(f"Could not fetch order {order_id} from Square")
 
                     result = self._process_resync_order_event(order_data, "created")
@@ -432,7 +436,7 @@ class SquareManualResyncWizard(models.TransientModel):
             self.state = "done"
 
             # Log batch operation
-            self.env["square.integration.log"].log_square_event(
+            self.env["square.integration.log"]._log_square_event(
                 event_type="manual_resync",
                 title=f"Manual resync completed: {processed_count} orders processed",
                 description=f"""

@@ -20,14 +20,14 @@ class TestSquareModuleContracts(TransactionCase):
         manifest = Manifest.for_addon("odoo_square")
 
         self.assertEqual(manifest["license"], "AGPL-3")
-        self.assertEqual(manifest["version"], "19.0.1.4.0")
+        self.assertEqual(manifest["version"], "19.0.1.4.1")
         self.assertTrue(manifest["installable"])
         self.assertTrue(manifest["application"])
         self.assertIn("requests", manifest["external_dependencies"]["python"])
         self.assertIn("sale_stock", manifest["depends"])
 
         data_files = manifest["data"]
-        self.assertEqual(data_files[0], "security/ir.model.access.csv")
+        self.assertEqual(data_files[:2], ["security/square_security.xml", "security/ir.model.access.csv"])
         self.assertIn("views/square_config_views.xml", data_files)
         self.assertIn("views/square_webhook_queue_views.xml", data_files)
 
@@ -73,7 +73,7 @@ class TestSquareModuleContracts(TransactionCase):
         self.assertEqual(config.square_application_id, "square_app_test")
         self.assertEqual(config.square_access_token, "square_token_test")
         self.assertEqual(config.square_webhook_signature_key, "square_key_test")
-        self.assertEqual(config.module_version_display, "1.4.0")
+        self.assertEqual(config.module_version_display, "1.4.1")
         self.assertEqual(config.get_payment_journal().id, journal.id)
         self.assertEqual(
             config.get_warehouse_for_location("LOCATION_SECOND").id, second_warehouse.id
@@ -143,7 +143,7 @@ class TestSquareModuleContracts(TransactionCase):
         )
 
     def test_webhook_queue_generates_synthetic_event_id_when_missing(self):
-        queue = self.env["square.webhook.queue"].queue_event(
+        queue = self.env["square.webhook.queue"]._queue_event(
             webhook_event_id=None,
             event_type="order.updated",
             order_data={
@@ -167,7 +167,7 @@ class TestSquareModuleContracts(TransactionCase):
 
     def test_webhook_queue_reuses_existing_event_id(self):
         queue_model = self.env["square.webhook.queue"]
-        first = queue_model.queue_event(
+        first = queue_model._queue_event(
             webhook_event_id="evt_duplicate_contract",
             event_type="order.updated",
             order_data={"id": "SQ-ORDER-003", "version": 1},
@@ -175,7 +175,7 @@ class TestSquareModuleContracts(TransactionCase):
         )
         first.write({"state": "failed"})
 
-        second = queue_model.queue_event(
+        second = queue_model._queue_event(
             webhook_event_id="evt_duplicate_contract",
             event_type="order.updated",
             order_data={"id": "SQ-ORDER-003", "version": 2},

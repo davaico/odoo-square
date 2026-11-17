@@ -3,6 +3,7 @@ from . import square_config
 from . import square_location_mapping
 from . import sale_order
 from . import sale_order_line
+from . import square_event_receipt
 from . import square_order_processor
 from . import square_online_routing
 from . import square_refund

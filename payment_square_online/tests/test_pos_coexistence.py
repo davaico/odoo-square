@@ -542,7 +542,7 @@ class TestSquareOnlinePosCoexistence(SquareOnlineCheckoutCase):
             "next_retry_time": fields.Datetime.now(),
         })
         self._pos_action("square.webhook.queue", "process_pending_events", [])
-        self.assertEqual(queue.state, "completed")
+        self.assertEqual(queue.state, "failed")
         self.assertEqual(self.env["sale.order"].search([]), sale_orders)
         self.assertEqual(self.env["account.payment"].search([]), payments)
         self.assertFalse(self.env["square.refund"].search([]))
