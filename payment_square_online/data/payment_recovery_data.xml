@@ -9,4 +9,13 @@
         <field name="interval_number">5</field>
         <field name="interval_type">minutes</field>
     </record>
+    <record id="cron_square_online_discover_refunds" model="ir.cron">
+        <field name="name">Square Online: Discover refunds</field>
+        <field name="model_id" ref="model_square_online_connection"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_square_online_discover_refunds()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+    </record>
 </odoo>

@@ -97,9 +97,15 @@ Accounting managers and administrators can refund captured Square payments in th
 
 Cancelling an order leaves any decision to refund with Accounting.
 
+### Refunds initiated in Square
+
+When you refund a website payment in the Square Dashboard, Odoo links the refund to the original payment and identifies its origin as **Square** in **Square Payment History**. Odoo receives signed notifications and runs a scheduled check for missed notifications. Use **Refresh status** on the original transaction to check its linked refunds sooner, or on a known refund to check its current state.
+
+Pending Square refunds reduce the available balance shown in Odoo. Completed Square refunds post an outbound payment in the original journal and currency. Synchronization retrieves the existing refund from Square. Create any required credit note in Accounting and process any goods return separately in Inventory.
+
 ## Test refund concurrency
 
-Use a fresh, disposable Odoo 19 test database with `payment_square_online` installed, a USD company with a bank journal, and the test encryption key configured. The fixture runs two merchant actions against the same payment on separate PostgreSQL connections, then checks the posted refunds with a simulated Square API. It commits test records.
+Use a fresh, disposable Odoo 19 test database with `payment_square_online` installed, a USD company with a bank journal, and the test encryption key configured. The fixture runs simultaneous Odoo refund requests and an overlapping Square refund and Odoo request on separate PostgreSQL connections. It checks the posted refunds with a simulated Square API and commits test records.
 
 ```bash
 odoo shell -d odoo_square_test --no-http < payment_square_online/tests/refund_race.py

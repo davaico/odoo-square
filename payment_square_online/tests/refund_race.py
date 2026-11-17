@@ -90,6 +90,7 @@ cases = [
     (*create_capture("PARTIAL-FIRST"), 18.25, 47),
     (*create_capture("FULL-FIRST"), 47, 18.25),
 ]
+dashboard_id, dashboard_payment = create_capture("DASHBOARD-FIRST")
 env.cr.commit()
 
 
@@ -109,13 +110,13 @@ def run_competing_request(transaction_id, amount, started, backend):
         tx.action_refund(amount_to_refund=amount)
 
 
-for transaction_id, payment, first, second in cases:
+def verify_refund_contention(transaction_id, first_operation, second):
     started = Event()
     backend = []
     with ThreadPoolExecutor(max_workers=1) as pool:
         with env.registry.cursor() as cr:
             tx = parent(cr, transaction_id)
-            tx.action_refund(amount_to_refund=first)
+            first_operation(tx)
             cr.execute("SELECT pg_backend_pid()")
             holder = cr.fetchone()[0]
             contender = pool.submit(run_competing_request, transaction_id, second, started, backend)
@@ -142,12 +143,37 @@ for transaction_id, payment, first, second in cases:
         pass
     else:
         raise AssertionError("A fresh retry reserved more than the remaining balance")
+
+
+for transaction_id, payment, first, second in cases:
+    verify_refund_contention(transaction_id, lambda tx: tx.action_refund(amount_to_refund=first), second)
     with env.registry.cursor() as cr:
         tx = parent(cr, transaction_id)
         assert tx.child_transaction_ids.state == "pending"
         assert tx.child_transaction_ids.amount == -first
         assert tx.payment_id.amount_available_for_refund == 47 - first
     print(f"Verified overlap: reserved {first}, blocked {second}, then rejected a fresh retry.")
+
+
+def apply_dashboard_refund(tx):
+    tx = tx.sudo()
+    refund = {
+        "id": "REFUND-DASHBOARD-FIRST", "payment_id": dashboard_payment["id"],
+        "location_id": dashboard_payment["location_id"], "status": "COMPLETED",
+        "amount_money": {"amount": 1825, "currency": "USD"},
+    }
+    tx._square_online_handle_webhook(tx.square_online_connection_id, "refund.updated", {"refund": refund})
+
+
+with patch(boundary) as external:
+    verify_refund_contention(dashboard_id, apply_dashboard_refund, 47)
+    external.assert_not_called()
+with env.registry.cursor() as cr:
+    tx = parent(cr, dashboard_id)
+    child = tx.child_transaction_ids
+    assert child.state == "done" and child.amount == -18.25 and child.square_online_refund_origin == "square"
+    assert tx.payment_id.amount_available_for_refund == 28.75
+print("Verified Square dashboard refund overlapped a local request and reduced its available balance.")
 
 
 payments = {cash["id"]: (tx_id, cash, int(round(first * 100))) for tx_id, cash, first, _ in cases}
@@ -188,4 +214,9 @@ for transaction_id, payment, first, _ in cases:
         assert child.provider_reference == "REFUND-" + payment["id"]
         assert child.payment_id.amount == first and child.payment_id.payment_type == "outbound"
         assert child.payment_id.move_id.state == "posted"
-print("Verified each overlap produced exactly one durable Square request and one posted native refund.")
+with env.registry.cursor() as cr:
+    tx = parent(cr, dashboard_id)
+    child = tx.child_transaction_ids
+    assert child.payment_id.amount == 18.25 and child.payment_id.payment_type == "outbound"
+    assert child.payment_id.move_id.state == "posted"
+print("Verified local requests dispatched once, Square ingestion made no request, and each refund posted once.")

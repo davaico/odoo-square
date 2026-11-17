@@ -45,7 +45,12 @@ class SquareOnlineWebhook(Controller):
             return request.make_response("")
         resource_type = event["type"].partition(".")[0]
         resource = object_data.get(resource_type) if isinstance(object_data, dict) else None
-        if isinstance(resource, dict) and resource.get("id") and resource["id"] == data.get("id"):
+        if (
+            isinstance(resource, dict)
+            and data.get("type") == resource_type
+            and resource.get("id")
+            and resource["id"] == data.get("id")
+        ):
             try:
                 with request.env.cr.savepoint():
                     request.env["payment.transaction"].sudo()._square_online_handle_webhook(

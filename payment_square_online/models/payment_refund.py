@@ -1,4 +1,5 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
+import logging
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -8,6 +9,8 @@ from odoo.fields import Domain
 
 from ..square_api import MINOR_UNIT_DIGITS, SquareAPIError, square_amount_in_minor_units
 
+
+_logger = logging.getLogger(__name__)
 
 _REFUND_STATES = {
     "PENDING": "pending",
@@ -29,8 +32,13 @@ class PaymentTransaction(models.Model):
     square_online_refund_requested_by = fields.Many2one(
         "res.users", string="Refund Requested By", readonly=True, copy=False, ondelete="restrict",
     )
+    square_online_refund_origin = fields.Selection(
+        [("odoo", "Odoo"), ("square", "Square")], compute="_compute_square_online_refund_origin",
+        string="Refund Origin",
+    )
     square_online_refund_reason = fields.Char(readonly=True, copy=False)
     square_online_refund_revision = fields.Integer(copy=False, readonly=True)
+    square_online_unattributed_refund_minor = fields.Integer(copy=False, readonly=True)
 
     _square_online_refund_reference_unique = models.UniqueIndex(
         "(square_online_environment, square_online_merchant_id, provider_reference) "
@@ -38,9 +46,20 @@ class PaymentTransaction(models.Model):
         "A Square refund can only belong to one Odoo payment transaction.",
     )
 
+    @api.depends("operation", "provider_code", "provider_reference", "square_online_refund_requested_by")
+    def _compute_square_online_refund_origin(self):
+        for tx in self:
+            origin = False
+            if tx.provider_code == "square_online" and tx.operation == "refund":
+                if tx.square_online_refund_requested_by:
+                    origin = "odoo"
+                elif tx.provider_reference:
+                    origin = "square"
+            tx.square_online_refund_origin = origin
+
     @api.ondelete(at_uninstall=False)
     def _unlink_except_square_online_requested_refund(self):
-        if any(self.mapped("square_online_refund_requested_by")):
+        if any(self.mapped("square_online_refund_origin")):
             raise AccessError(_("Square refunds must be kept for payment history."))
 
     def _square_online_check_refund_access(self):
@@ -73,7 +92,7 @@ class PaymentTransaction(models.Model):
         refunds = self.child_transaction_ids.filtered(
             lambda tx: tx != exclude and tx.operation == "refund" and tx.state in ("pending", "done")
         )
-        reserved = sum(refunds.mapped("square_online_amount_minor"))
+        reserved = sum(refunds.mapped("square_online_amount_minor")) + self.square_online_unattributed_refund_minor
         return max(0, self.square_online_amount_minor - reserved)
 
     def _square_online_refund_amount_minor(self, amount_to_refund, available):
@@ -211,10 +230,10 @@ class PaymentTransaction(models.Model):
             raise SquareAPIError()
         reported_minor, refunds = source._square_online_read_refund_balance(original, connection)
         source._square_online_lock_refunds()
+        source._square_online_reconcile_refund_balance(reported_minor, refunds)
         if self.state != "pending" or self.square_online_dispatch_at:
             return False
         available = source._square_online_refundable_minor(exclude=self)
-        available -= source._square_online_unreserved_remote_refund_minor(reported_minor, refunds)
         if self.square_online_amount_minor > available:
             self._set_error(_("The refundable Square balance changed before this refund was sent."))
             return False
@@ -240,27 +259,19 @@ class PaymentTransaction(models.Model):
             refunds.append(refund)
         return (remote_refunded or {}).get("amount", 0), refunds
 
-    def _square_online_unreserved_remote_refund_minor(self, reported_minor, refunds):
-        completed_minor = pending_minor = overlapping_minor = 0
-        matched_children = set()
+    def _square_online_reconcile_refund_balance(self, reported_minor, refunds):
+        self.ensure_one()
         for refund in refunds:
-            status = refund["status"]
-            if status not in ("COMPLETED", "PENDING"):
-                continue
-            amount = refund["amount_money"]["amount"]
-            if status == "COMPLETED":
-                completed_minor += amount
-            else:
-                pending_minor += amount
-            child = self._square_online_find_refund_child(refund)
-            if child and child.state in ("done", "pending") and child.id not in matched_children:
-                if child.square_online_amount_minor != amount:
-                    raise SquareAPIError()
-                overlapping_minor += amount
-                matched_children.add(child.id)
-        # Include any additional completed amount from the Payment aggregate and
-        # subtract local overlap only for an exact Square ID or Odoo request reason.
-        return max(reported_minor, completed_minor) + pending_minor - overlapping_minor
+            if not self._square_online_apply_locked_refund(refund, discover=True):
+                raise SquareAPIError()
+        # Square's aggregate includes pending and completed refunds. Reserve only
+        # its unexplained remainder, since each verified ID already has a child.
+        linked = self.child_transaction_ids.filtered(
+            lambda tx: tx.operation == "refund" and tx.provider_reference and tx.state in ("pending", "done")
+        )
+        unattributed = max(0, reported_minor - sum(linked.mapped("square_online_amount_minor")))
+        if self.square_online_unattributed_refund_minor != unattributed:
+            self.square_online_unattributed_refund_minor = unattributed
 
     def _square_online_post_refund(self):
         self.ensure_one()
@@ -307,6 +318,8 @@ class PaymentTransaction(models.Model):
             and self.provider_code == "square_online"
             and self.state == "done"
             and self.provider_reference
+            and self.square_online_dispatch_at
+            and self.square_online_order_id
             and connection
             and connection == self.square_online_connection_id
             and connection.company_id == self.company_id
@@ -319,8 +332,9 @@ class PaymentTransaction(models.Model):
         money = refund.get("amount_money")
         status = refund.get("status")
         return (
-            isinstance(refund_id, str) and 0 < len(refund_id) <= 192 and refund_id not in (".", "..")
+            isinstance(refund_id, str) and 0 < len(refund_id) <= 255 and refund_id not in (".", "..")
             and (order_id is None or isinstance(order_id, str) and 0 < len(order_id) <= 192)
+            and not refund.get("unlinked")
             and refund.get("payment_id") == self.provider_reference
             and refund.get("location_id") == self.square_online_location_id
             and isinstance(status, str) and status in _REFUND_STATES
@@ -342,28 +356,37 @@ class PaymentTransaction(models.Model):
             )
         return child
 
-    def _square_online_apply_refund(self, refund, connection):
+    def _square_online_apply_refund(self, refund, connection, *, discover=False):
         self.ensure_one()
         if not self._square_online_refund_data_matches(refund, connection):
             return False
         self._square_online_lock_refunds()
+        return self._square_online_apply_locked_refund(refund, discover=discover)
+
+    def _square_online_apply_locked_refund(self, refund, *, discover):
         child = self._square_online_find_refund_child(refund)
-        if not child or child.square_online_amount_minor != refund["amount_money"]["amount"]:
+        amount_minor = refund["amount_money"]["amount"]
+        if not child and discover:
+            child = self._square_online_create_refund(
+                amount_minor, provider_reference=refund["id"],
+            )
+        if not child or child.square_online_amount_minor != amount_minor:
             return False
         if child.square_online_order_reference and refund.get("order_id") not in (
             None, child.square_online_order_reference,
         ):
             return False
         target = _REFUND_STATES[refund["status"]]
-        if child.state in ("done", "error"):
-            return target in (child.state, "pending")
-        if child.state != "pending":
+        if child.state not in ("draft", "pending") and target not in (child.state, "pending"):
             return False
-        child.write({
+        values = {
             "provider_reference": refund["id"],
             "square_online_order_reference": refund.get("order_id") or child.square_online_order_reference,
             "square_online_recovery_message": False,
-        })
+        }
+        child.write({name: value for name, value in values.items() if child[name] != value})
+        if child.state not in ("draft", "pending"):
+            return True
         child._process("square_online", {"square_online_refund": refund})
         if child.state == "done" and not child.is_post_processed:
             self.env.ref("payment.cron_post_process_payment_tx")._trigger()
@@ -383,7 +406,9 @@ class PaymentTransaction(models.Model):
         if not (refund := payment_data.get("square_online_refund")):
             return super()._apply_updates(payment_data)
         status = refund["status"]
-        if status == "COMPLETED":
+        if status == "PENDING" and self.state == "draft":
+            self._set_pending(state_message=_("Square is processing this refund."))
+        elif status == "COMPLETED":
             self._set_done()
         elif status in ("FAILED", "REJECTED"):
             self._set_error(_("Square did not complete this refund."))
@@ -392,41 +417,61 @@ class PaymentTransaction(models.Model):
     def _square_online_handle_webhook(self, connection, event_type, object_data):
         if event_type not in ("refund.created", "refund.updated"):
             return super()._square_online_handle_webhook(connection, event_type, object_data)
-        refund = object_data.get("refund")
+        self._square_online_discover_refund(object_data.get("refund"), connection)
+
+    @api.model
+    def _square_online_discover_refund(self, refund, connection):
         payment_id = refund.get("payment_id") if isinstance(refund, dict) else None
-        if not isinstance(payment_id, str) or not payment_id:
-            return
-        source = self.search([
+        if (
+            not isinstance(payment_id, str) or not 0 < len(payment_id) <= 192 or payment_id in (".", "..")
+            or not connection.location_id or refund.get("location_id") != connection.location_id.square_id
+        ):
+            return False
+        domain = Domain([
             ("provider_code", "=", "square_online"),
             ("operation", "=", "online_direct"),
+            ("company_id", "=", connection.company_id.id),
             ("square_online_connection_id", "=", connection.id),
-            ("provider_reference", "=", payment_id),
-        ], limit=1)
-        if source:
-            source._square_online_apply_refund(refund, connection)
+            ("square_online_dispatch_at", "!=", False),
+        ])
+        source = self.search(domain & Domain("provider_reference", "=", payment_id), limit=1)
+        if source.state != "done":
+            # The refund can arrive before the capture response. A verified original payment
+            # can link it to the exact checkout claim, including while POS shares the location.
+            pending = domain & Domain("state", "=", "pending")
+            if not source and not self.search_count(pending & Domain("provider_reference", "=", False), limit=1):
+                return False
+            payment = connection._square_online_get_payment(payment_id)
+            if not payment or payment.get("status") != "COMPLETED":
+                return False
+            reference = payment.get("reference_id")
+            if not isinstance(reference, str) or len(reference) != 32:
+                return False
+            source = source or self.search(
+                pending & Domain("square_online_operation_key", "=", reference), limit=1,
+            )
+            if not source or not source._square_online_apply_payment(payment, connection):
+                return False
+        return source._square_online_apply_refund(refund, connection, discover=True)
 
     def _square_online_read_status(self):
         self.ensure_one()
         if self.operation != "refund":
             return super()._square_online_read_status()
-        if not self.square_online_dispatch_at:
-            return False
         connection = self.square_online_connection_id
         source = self.source_transaction_id
         if self.provider_reference:
             refund = connection._square_online_get_refund(self.provider_reference)
             return source._square_online_apply_refund(refund, connection)
+        if not self.square_online_dispatch_at:
+            return False
 
         original = connection._square_online_get_payment(source.provider_reference)
         if not source._square_online_matches_payment(original, connection) or original["status"] != "COMPLETED":
             return False
-        refund_ids = original.get("refund_ids", [])
-        if not isinstance(refund_ids, list):
-            raise SquareAPIError()
-        for refund_id in refund_ids:
-            refund = connection._square_online_get_refund(refund_id)
-            if self._square_online_recover_matching_refund(refund):
-                return True
+        source._square_online_recover_linked_refunds(original, connection)
+        if self.provider_reference:
+            return True
 
         start = fields.Datetime.subtract(self.square_online_dispatch_at, minutes=5)
         params = {
@@ -448,6 +493,12 @@ class PaymentTransaction(models.Model):
             seen_cursors.add(cursor)
             params = {**params, "cursor": cursor}
 
+    def _square_online_recover_linked_refunds(self, payment, connection):
+        reported_minor, refunds = self._square_online_read_refund_balance(payment, connection)
+        if reported_minor or refunds or self.square_online_unattributed_refund_minor:
+            self._square_online_lock_refunds()
+            self._square_online_reconcile_refund_balance(reported_minor, refunds)
+
     def _square_online_recover_matching_refund(self, refund):
         return (
             isinstance(refund, dict)
@@ -457,6 +508,14 @@ class PaymentTransaction(models.Model):
                 refund, self.square_online_connection_id,
             )
         )
+
+    @api.model
+    def _square_online_refreshable_domain(self):
+        return super()._square_online_refreshable_domain() | Domain([
+            ("provider_code", "=", "square_online"),
+            ("operation", "=", "refund"),
+            ("provider_reference", "!=", False),
+        ])
 
     def _square_online_outbound_method(self):
         self.ensure_one()
@@ -479,6 +538,8 @@ class PaymentTransaction(models.Model):
                 continue
             if refund.state == "done" and not source.payment_id:
                 source._post_process()
+                if not source.payment_id:
+                    raise UserError(_("Record the original Square payment before posting its refund."))
             super(PaymentTransaction, refund)._post_process()
 
     def _create_payment(self, **extra_create_values):
@@ -498,9 +559,94 @@ class PaymentTransaction(models.Model):
 class SquareOnlineConnection(models.Model):
     _inherit = "square.online.connection"
 
+    square_online_transaction_ids = fields.One2many(
+        "payment.transaction", "square_online_connection_id", readonly=True, groups="base.group_system",
+    )
+    square_online_refund_discovery_at = fields.Datetime(readonly=True, copy=False, groups="base.group_system")
+    square_online_refund_discovery_checked_at = fields.Datetime(
+        readonly=True, copy=False, groups="base.group_system",
+    )
+
+    @api.model
+    def _square_online_refund_discovery_payment_domain(self):
+        return Domain([
+            ("provider_code", "=", "square_online"),
+            ("operation", "=", "online_direct"),
+            ("square_online_dispatch_at", "!=", False),
+            ("state", "in", ("pending", "done")),
+        ])
+
+    @api.model
+    def _cron_square_online_discover_refunds(self):
+        cutoff = fields.Datetime.subtract(fields.Datetime.now(), minutes=5)
+        domain = Domain([
+            ("location_id", "!=", False),
+            ("square_online_transaction_ids", "any", self._square_online_refund_discovery_payment_domain()),
+        ]) & (
+            Domain("square_online_refund_discovery_checked_at", "=", False)
+            | Domain("square_online_refund_discovery_checked_at", "<=", cutoff)
+        )
+        connections = self.sudo().search(
+            domain, order="square_online_refund_discovery_checked_at asc nulls first, id", limit=20,
+        )
+        cron = self.env["ir.cron"]
+        if not cron._commit_progress(remaining=self.sudo().search_count(domain)):
+            return
+        for connection in connections:
+            checked_at = fields.Datetime.now()
+            try:
+                with self.env.cr.savepoint():
+                    connection._square_online_discover_recent_refunds(checked_at)
+            except SquareAPIError:
+                _logger.warning("Odoo could not check for new Square refunds on connection %s.", connection.id)
+            else:
+                connection.square_online_refund_discovery_at = checked_at
+            connection.square_online_refund_discovery_checked_at = checked_at
+            if not cron._commit_progress(1):
+                break
+
+    def _square_online_discover_recent_refunds(self, checked_at):
+        self.ensure_one()
+        transactions = self.env["payment.transaction"]
+        previous = self.square_online_refund_discovery_at
+        if not previous:
+            first = transactions.search(
+                self._square_online_refund_discovery_payment_domain()
+                & Domain("square_online_connection_id", "=", self.id),
+                order="square_online_dispatch_at, id", limit=1,
+            )
+            if not first:
+                return
+            previous = first.square_online_dispatch_at
+        # A small overlap protects against the list's eventual consistency. The
+        # cutoff advances only once every page in this window has been retrieved.
+        begin = fields.Datetime.subtract(previous, minutes=5)
+        params = {
+            "begin_time": begin.isoformat(timespec="seconds") + "Z",
+            "end_time": checked_at.isoformat(timespec="seconds") + "Z",
+            "location_id": self.location_id.square_id,
+            "source_type": "CARD",
+            "sort_order": "ASC",
+        }
+        seen_cursors = set()
+        while True:
+            page = self._square_online_request("GET", "/v2/refunds", params=params)
+            refunds = page.get("refunds", [])
+            if not isinstance(refunds, list):
+                raise SquareAPIError()
+            for refund in refunds:
+                transactions._square_online_discover_refund(refund, self)
+            cursor = page.get("cursor")
+            if not cursor:
+                return
+            if not isinstance(cursor, str) or cursor in seen_cursors:
+                raise SquareAPIError()
+            seen_cursors.add(cursor)
+            params = {**params, "cursor": cursor}
+
     def _square_online_get_refund(self, refund_id):
         self.ensure_one()
-        if not isinstance(refund_id, str) or not 0 < len(refund_id) <= 192 or refund_id in (".", ".."):
+        if not isinstance(refund_id, str) or not 0 < len(refund_id) <= 255 or refund_id in (".", ".."):
             return False
         result = self._square_online_request("GET", "/v2/refunds/" + quote(refund_id, safe=""))
         refund = result.get("refund")

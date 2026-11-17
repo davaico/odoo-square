@@ -10,6 +10,7 @@ import requests
 from odoo import Command, fields
 from odoo.tests import tagged
 from odoo.tests.common import JsonRpcException, new_test_user
+from odoo.tools.safe_eval import safe_eval
 
 from .test_checkout import SquareOnlineCheckoutCase
 
@@ -75,7 +76,10 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         order._set_delivery_method(carrier)
         return order
 
-    def _refund_notification(self, refund, *, signing_key="refund-webhook-test-key"):
+    def _refund_notification(
+        self, refund, *, signing_key="refund-webhook-test-key", event_type="refund.updated",
+        merchant="MERCHANT_TEST", environment="Sandbox", valid_signature=True,
+    ):
         path = f"/payment/square_online/webhook/{self.connection.id}"
         url = "https://shop.example.test" + path
         self.connection.write({
@@ -83,16 +87,243 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
             "webhook_signature_key": signing_key,
         })
         raw = json.dumps({
-            "type": "refund.updated",
-            "merchant_id": "MERCHANT_TEST",
+            "type": event_type,
+            "merchant_id": merchant,
             "data": {"type": "refund", "id": refund["id"], "object": {"refund": refund}},
         }).encode()
-        signature = base64.b64encode(hmac.digest(signing_key.encode(), url.encode() + raw, "sha256"))
+        key = signing_key if valid_signature else "incorrect-key"
+        signature = base64.b64encode(hmac.digest(key.encode(), url.encode() + raw, "sha256"))
         return self.url_open(path, data=raw, headers={
             "Content-Type": "application/json",
             "X-Square-Hmacsha256-Signature": signature.decode(),
-            "Square-Environment": "Sandbox",
+            "Square-Environment": environment,
         })
+
+    @patch(square_boundary)
+    def test_square_dashboard_partial_refund_updates_history_and_accounts_once(self, external):
+        self.env["ir.config_parameter"].set_param("sale.automatic_invoice", "True")
+        order, tx, original = self._capture(external, self._make_refundable_goods_order())
+        invoice = order.invoice_ids
+        pickings = order.picking_ids
+        self.assertTrue(invoice and pickings)
+        refund = {
+            "id": "DASHBOARD-PARTIAL", "order_id": "SQUARE-RETURN-ORDER",
+            "payment_id": original["id"], "location_id": original["location_id"],
+            "status": "PENDING", "amount_money": {"amount": 1234, "currency": "USD"},
+            "reason": "Customer requested an adjustment",
+        }
+        external.reset_mock()
+        self.assertEqual(self._refund_notification(refund, event_type="refund.created").status_code, 200)
+        self.env.invalidate_all()
+        child = tx.child_transaction_ids
+        self.assertEqual(child.state, "pending")
+        self.assertFalse(child.payment_id)
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 34.66)
+
+        completed = {**refund, "status": "COMPLETED"}
+        for event in (completed, refund, completed):
+            self.assertEqual(self._refund_notification(event).status_code, 200)
+        self.env.ref("payment_square_online.cron_square_online_recover_status").method_direct_trigger()
+        self.env.invalidate_all()
+        external.assert_not_called()
+        self.assertEqual(tx.child_transaction_ids, child)
+        self.assertEqual(child.state, "done")
+        self.assertEqual(child.provider_reference, "DASHBOARD-PARTIAL")
+        self.assertEqual(child.square_online_order_reference, "SQUARE-RETURN-ORDER")
+        self.assertEqual(child.square_online_refund_origin, "square")
+        self.assertFalse(child.square_online_refund_requested_by)
+        self.assertFalse(child.square_online_dispatch_at)
+        self.assertFalse(child.invoice_ids)
+        self.assertFalse(child.sale_order_ids)
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 34.66)
+        payment = child.payment_id
+        self.assertEqual(payment.payment_type, "outbound")
+        self.assertEqual(payment.amount, 12.34)
+        self.assertEqual(payment.currency_id, tx.currency_id)
+        self.assertEqual(payment.journal_id, self.journal)
+        self.assertEqual(payment.source_payment_id, tx.payment_id)
+        self.assertEqual(payment.move_id.state, "posted")
+        self.assertEqual(sum(payment.move_id.line_ids.mapped("debit")), 12.34)
+        self.assertEqual(sum(payment.move_id.line_ids.mapped("credit")), 12.34)
+        self.assertEqual(order.invoice_ids, invoice)
+        self.assertEqual(invoice.amount_residual, 0)
+        self.assertEqual(order.picking_ids, pickings)
+        self.assertTrue(all(picking.state != "done" for picking in pickings))
+
+    @patch(square_boundary)
+    def test_square_dashboard_full_refund_arrives_before_the_original_payment_response(self, external):
+        self.env["ir.config_parameter"].set_param("sale.automatic_invoice", "True")
+        order = self._make_refundable_goods_order()
+        draft = self._prepare(order, self._open_payment_page(order))
+        external.side_effect = requests.Timeout
+        self.assertEqual(self._submit(draft)["state"], "pending")
+        original = self._completed_payment(*external.call_args.args, **external.call_args.kwargs).json()["payment"]
+        self.env.invalidate_all()
+        tx = order.transaction_ids
+        self.assertFalse(tx.provider_reference)
+        self.assertFalse(tx.payment_id)
+        refund = {
+            "id": "DASHBOARD-FULL", "order_id": "DASHBOARD-FULL-RETURN-ORDER",
+            "payment_id": original["id"], "location_id": original["location_id"],
+            "status": "COMPLETED", "amount_money": original["amount_money"],
+        }
+        external.reset_mock()
+        external.side_effect = None
+        self.assertEqual(self._refund_notification(refund, valid_signature=False).status_code, 403)
+        self.assertEqual(self._refund_notification(refund, merchant="OTHER-MERCHANT").status_code, 200)
+        self.assertEqual(self._refund_notification(refund, environment="Production").status_code, 200)
+        self.assertEqual(self._refund_notification({
+            **refund, "location_id": "OTHER-LOCATION",
+        }).status_code, 200)
+        external.assert_not_called()
+
+        def read_square(method, url, *, headers, **kwargs):
+            self.assertEqual(method, "GET")
+            self.assertEqual(headers["Authorization"], "Bearer checkout-access-test")
+            if url.endswith("/POS-PAYMENT"):
+                return self._square_response({"payment": {
+                    **original, "id": "POS-PAYMENT", "reference_id": "f" * 32,
+                }})
+            self.assertTrue(url.endswith("/v2/payments/" + original["id"]), url)
+            return self._square_response({"payment": original})
+
+        external.side_effect = read_square
+        self.assertEqual(self._refund_notification({
+            **refund, "id": "POS-REFUND", "payment_id": "POS-PAYMENT",
+        }).status_code, 200)
+        self.env.invalidate_all()
+        self.assertFalse(tx.child_transaction_ids)
+        self.assertFalse(tx.provider_reference)
+        self.assertEqual(self._refund_notification(refund).status_code, 200)
+        self.env.invalidate_all()
+        child = tx.child_transaction_ids
+        self.assertEqual(child.state, "done")
+        self.assertEqual(tx.provider_reference, original["id"])
+        self.assertEqual(tx.square_online_order_reference, original["order_id"])
+        self.assertEqual(child.square_online_order_reference, refund["order_id"])
+        self.assertFalse(tx.payment_id)
+        # The native cron can reach the refund before it reaches the capture.
+        child._cron_post_process()
+        self.env.invalidate_all()
+        self.assertEqual(order.state, "sale")
+        self.assertEqual(tx.payment_id.payment_type, "inbound")
+        self.assertEqual(tx.payment_id.amount, 47)
+        self.assertEqual(tx.payment_id.move_id.state, "posted")
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 0)
+        self.assertEqual(child.payment_id.payment_type, "outbound")
+        self.assertEqual(child.payment_id.amount, 47)
+        self.assertEqual(child.payment_id.move_id.state, "posted")
+        self.assertEqual(child.payment_id.source_payment_id, tx.payment_id)
+        self.assertEqual(order.invoice_ids.mapped("move_type"), ["out_invoice"])
+        self.assertEqual(order.invoice_ids.amount_residual, 0)
+        self.assertTrue(order.picking_ids)
+        self.assertTrue(all(picking.state != "done" for picking in order.picking_ids))
+        self.assertEqual([call.args[0] for call in external.call_args_list], ["GET", "GET"])
+
+    @patch(square_boundary)
+    def test_refresh_discovers_a_distinct_square_refund_for_the_same_amount_as_an_odoo_refund(self, external):
+        _, tx, original = self._capture(external)
+        self.authenticate(self.manager.login, self.manager.login)
+        self._call(
+            "payment.refund.wizard", "action_refund", self._open_refund(tx.payment_id, 15), button=True,
+        )
+        self.env.invalidate_all()
+        local_refund = tx.child_transaction_ids
+        external.side_effect = [
+            self._square_response({"payment": original}),
+            requests.Timeout,
+            self._square_response({"payment": original}),
+            self._square_response({"refunds": []}),
+        ]
+        self._dispatch()
+        self.assertEqual(local_refund.state, "pending")
+        self.assertFalse(local_refund.provider_reference)
+        external.reset_mock()
+
+        refund = {
+            "id": "EXTERNAL-SAME-AMOUNT", "payment_id": original["id"], "location_id": original["location_id"],
+            "status": "PENDING", "amount_money": {"amount": 1500, "currency": "USD"},
+            "reason": "Adjustment made at Square",
+        }
+        external.side_effect = [
+            self._square_response({"payment": {
+                **original, "refund_ids": [refund["id"]], "refunded_money": refund["amount_money"],
+            }}),
+            self._square_response({"refund": refund}),
+        ]
+        self.assertEqual(self._call(
+            "payment.transaction", "action_square_online_refresh_status", tx.ids, button=True,
+        )["tag"], "reload")
+        self.env.invalidate_all()
+        square_refund = tx.child_transaction_ids - local_refund
+        self.assertEqual(square_refund.provider_reference, refund["id"])
+        self.assertEqual(square_refund.state, "pending")
+        self.assertEqual(square_refund.square_online_refund_origin, "square")
+        self.assertFalse(square_refund.square_online_refund_requested_by)
+        self.assertFalse(square_refund.square_online_dispatch_at)
+        self.assertFalse(local_refund.provider_reference)
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 17)
+        history = self.env.ref("payment_square_online.action_square_online_transaction_history")
+        domain = safe_eval(history.domain) + [("id", "in", [tx.id, square_refund.id, local_refund.id])]
+        self.assertCountEqual(
+            self._call("payment.transaction", "search", domain),
+            [tx.id, square_refund.id, local_refund.id],
+        )
+        other_company = self.env["res.company"].create({"name": "Other Refund Company"})
+        other_manager = new_test_user(
+            self.env, login="other-refund-manager", groups="account.group_account_manager",
+            company_id=other_company.id, company_ids=[Command.set(other_company.ids)],
+        )
+        self.authenticate(other_manager.login, other_manager.login)
+        self.assertFalse(self._call("payment.transaction", "search", domain))
+        with self.assertRaises(JsonRpcException):
+            self._call("payment.transaction", "action_square_online_refresh_status", square_refund.ids, button=True)
+
+        external.side_effect = [self._square_response({"refund": {**refund, "status": "REJECTED"}})]
+        self.env.ref("payment_square_online.cron_square_online_recover_status").method_direct_trigger()
+        self.env.invalidate_all()
+        self.assertEqual(square_refund.state, "error")
+        self.assertEqual(local_refund.state, "pending")
+        self.assertFalse(square_refund.payment_id)
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 32)
+        self.assertEqual([call.args[0] for call in external.call_args_list], ["GET", "GET", "GET"])
+        self.assertTrue(external.call_args.args[1].endswith("/v2/refunds/" + refund["id"]))
+
+    @patch(square_boundary)
+    def test_scheduled_discovery_pages_through_square_refunds_when_no_webhook_arrives(self, external):
+        _, tx, original = self._capture(external)
+        refund = {
+            "id": "EXTERNAL-WEBHOOK-MISSED", "order_id": "EXTERNAL-WEBHOOK-MISSED-ORDER",
+            "payment_id": original["id"], "location_id": original["location_id"],
+            "status": "COMPLETED", "amount_money": {"amount": 987, "currency": "USD"},
+        }
+        wrong_location = {**refund, "id": "OTHER-LOCATION-REFUND", "location_id": "OTHER-LOCATION"}
+        pos = {**refund, "id": "POS-REFUND", "payment_id": "POS-PAYMENT"}
+        external.reset_mock()
+        external.side_effect = [
+            self._square_response({"refunds": [wrong_location, pos], "cursor": "second-page"}),
+            self._square_response({"refunds": [refund]}),
+        ]
+        self.env.ref("payment_square_online.cron_square_online_discover_refunds").method_direct_trigger()
+        self.env.ref("payment_square_online.cron_square_online_recover_status").method_direct_trigger()
+        self.env.invalidate_all()
+        child = tx.child_transaction_ids
+        self.assertEqual(child.provider_reference, refund["id"])
+        self.assertEqual(child.state, "done")
+        self.assertEqual(child.payment_id.amount, 9.87)
+        self.assertEqual(child.payment_id.move_id.state, "posted")
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 37.13)
+        self.assertEqual([call.args for call in external.call_args_list], [
+            ("GET", "https://connect.squareupsandbox.com/v2/refunds"),
+            ("GET", "https://connect.squareupsandbox.com/v2/refunds"),
+        ])
+        self.assertEqual(external.call_args.kwargs["params"]["cursor"], "second-page")
+        self.assertEqual(external.call_args.kwargs["params"]["location_id"], original["location_id"])
+        self.assertEqual(external.call_args.kwargs["headers"]["Authorization"], "Bearer checkout-access-test")
+        self.assertEqual(self._refund_notification(refund).status_code, 200)
+        self.env.invalidate_all()
+        self.assertEqual(tx.child_transaction_ids, child)
+        self.assertEqual(external.call_count, 2)
 
     @patch(square_boundary)
     def test_successive_partial_refunds_and_default_remaining_amount(self, external):
@@ -259,8 +490,9 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
                 "amount_money": {"amount": 400, "currency": "USD"},
             },
         }
+        # Square's Payment.refunded_money includes pending as well as completed refunds.
         square_payment = {
-            **original, "refunded_money": {"amount": 1400, "currency": "USD"}, "refund_ids": list(remote),
+            **original, "refunded_money": {"amount": 3800, "currency": "USD"}, "refund_ids": list(remote),
         }
 
         def square(method, url, *, headers, json, **kwargs):
@@ -281,9 +513,14 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
             "payment.refund.wizard", "action_refund", self._open_refund(tx.payment_id, 10), button=True,
         )
         self._dispatch()
-        refused = tx.child_transaction_ids - child
+        refused = tx.child_transaction_ids.filtered(lambda tx: tx.state == "error")
         self.assertEqual(refused.state, "error")
         self.assertFalse(refused.square_online_dispatch_at)
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 9)
+        self.assertCountEqual(
+            (tx.child_transaction_ids - child - refused).mapped("provider_reference"),
+            ["EXTERNAL-COMPLETED", "EXTERNAL-PENDING"],
+        )
         self.assertEqual({call.args[0] for call in external.call_args_list}, {"GET"})
 
         self._call(
@@ -292,7 +529,7 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         self._dispatch()
         self.env.ref("payment.cron_post_process_payment_tx").method_direct_trigger()
         self.env.invalidate_all()
-        completed = tx.child_transaction_ids - child - refused
+        completed = tx.child_transaction_ids.filtered(lambda tx: tx.provider_reference == "AVAILABLE-BALANCE")
         self.assertEqual(completed.provider_reference, "AVAILABLE-BALANCE")
         self.assertEqual(completed.payment_id.amount, 9)
         self.assertEqual(completed.payment_id.move_id.state, "posted")
@@ -320,7 +557,7 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         self.assertEqual(refund.state, "error")
         self.assertFalse(refund.payment_id)
         self.assertEqual([call.args[0] for call in external.call_args_list], ["GET", "POST", "GET", "GET"])
-        self.assertEqual(tx.payment_id.amount_available_for_refund, 47)
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 15)
 
     @patch(square_boundary)
     def test_manager_full_refund_posts_native_outbound_payment(self, external):

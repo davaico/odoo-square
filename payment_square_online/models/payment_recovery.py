@@ -57,8 +57,8 @@ class PaymentTransaction(models.Model):
             )
         ):
             raise AccessError(_("Only accounting managers and administrators can refresh Square payments."))
-        if self.provider_code != "square_online" or not self.square_online_dispatch_at:
-            raise AccessError(_("Only dispatched Square operations can be refreshed."))
+        if not self.filtered_domain(self._square_online_refreshable_domain()):
+            raise AccessError(_("Only operations submitted to Square can be refreshed."))
         self.sudo()._square_online_refresh_status()
         return {"type": "ir.actions.client", "tag": "reload"}
 
@@ -90,7 +90,7 @@ class PaymentTransaction(models.Model):
             return False
         if self.provider_reference:
             payment = connection._square_online_get_payment(self.provider_reference)
-            return self._square_online_apply_payment(payment, connection)
+            return self._square_online_recover_payment(payment, connection)
 
         # ListPayments is eventually consistent. An absent item cannot release the pending claim.
         start = fields.Datetime.subtract(self.square_online_dispatch_at, minutes=5)
@@ -110,21 +110,33 @@ class PaymentTransaction(models.Model):
                     isinstance(payment, dict)
                     and self._square_online_matches_payment(payment, connection)
                 ):
-                    return self._square_online_apply_payment(payment, connection)
+                    return self._square_online_recover_payment(payment, connection)
             cursor = page.get("cursor")
             if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
                 return False
             seen_cursors.add(cursor)
             params = {**params, "cursor": cursor}
 
+    def _square_online_recover_payment(self, payment, connection):
+        if not self._square_online_apply_payment(payment, connection):
+            return False
+        if payment["status"] == "COMPLETED":
+            self._square_online_recover_linked_refunds(payment, connection)
+        return True
+
     @api.model
-    def _square_online_recovery_domain(self):
+    def _square_online_refreshable_domain(self):
         return Domain([
             ("provider_code", "=", "square_online"),
             ("square_online_dispatch_at", "!=", False),
-        ]) & (
+        ])
+
+    @api.model
+    def _square_online_recovery_domain(self):
+        return self._square_online_refreshable_domain() & (
             Domain("state", "=", "pending")
             | Domain([("state", "=", "done"), ("is_post_processed", "=", False)])
+            | Domain([("state", "=", "done"), ("square_online_unattributed_refund_minor", ">", 0)])
         )
 
     @api.model
@@ -143,7 +155,7 @@ class PaymentTransaction(models.Model):
         for tx in transactions:
             tx = tx.with_prefetch()
             if tx.filtered_domain(domain):
-                if tx.state == "pending":
+                if tx.state == "pending" or tx.square_online_unattributed_refund_minor:
                     tx._square_online_refresh_status()
                 if tx.state == "done" and not tx.is_post_processed:
                     # Keep the authoritative status even if Odoo accounting needs attention.
