@@ -24,9 +24,9 @@ If authorization is rejected or expires, return to the provider form and choose 
 
 ## Make a Sandbox checkout payment
 
-1. Open the storefront you configured using HTTPS. If your reverse proxy sets a Content Security Policy, allow the Sandbox Web Payments SDK, its secure card frame, and its network endpoints using [Square's CSP instructions](https://developer.squareup.com/docs/web-payments/content-security-policy). Apply the Production domains when you switch to Production.
+1. Open the storefront you configured using HTTPS. For a local Sandbox test on the Odoo host, use `http://localhost:8069` or the port you assigned. If your reverse proxy sets a Content Security Policy, allow the Sandbox Web Payments SDK, its secure card frame, and its network endpoints using [Square's CSP instructions](https://developer.squareup.com/docs/web-payments/content-security-policy). Apply the Production domains when you switch to Production.
 2. Add a product to your cart, complete delivery and billing, and open **Payment**. Select **Card** under **Secured by Square Online Payments**. The selected Square location must process the order currency. Card details are entered in Square's embedded form.
-3. Enter a [Square Sandbox test card](https://developer.squareup.com/docs/devtools/sandbox/payments) and click **Pay now**. Complete the simulated verification challenge if Square asks. Use a test card that requires Strong Customer Authentication to exercise the challenge, and a decline test card to verify that checkout allows a safe retry.
+3. Enter a [Square Sandbox test card](https://developer.squareup.com/docs/devtools/sandbox/payments) and click **Pay now**. Fill in the postcode if Square displays that field. Complete the simulated verification challenge if Square asks. Use a test card that requires Strong Customer Authentication to exercise the challenge, and a decline test card to verify that checkout allows a safe retry.
 4. Compare the total on the Odoo order, the Odoo payment, and the Square Sandbox payment. Confirm that Odoo used the chosen bank journal and its normal invoice settings. Shippable items should still have an open delivery. If the checkout says Square is processing the payment, check the original order before trying again.
 
 ## Set up Square webhooks
