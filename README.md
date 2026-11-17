@@ -61,12 +61,12 @@ Edit `.env` and set a non-default `DB_PASSWORD`.
 Install **Square POS Integration** into the fresh local database, then start Odoo:
 
 ```bash
-docker compose build odoo
-docker compose run --rm odoo odoo -d odoo -i odoo_square --stop-after-init
-docker compose up -d
+docker compose -p odoo-square-v18 build odoo
+docker compose -p odoo-square-v18 run --rm odoo odoo -d odoo_square_v18 -i odoo_square --stop-after-init
+docker compose -p odoo-square-v18 up -d
 ```
 
-Use the database name from `.env` in place of `odoo` if you changed `DB_NAME`. Open [http://localhost:8069](http://localhost:8069) and sign in with the fresh local administrator credentials (`admin` / `admin`).
+Use the database name from `.env` if you changed `DB_NAME`. Open [http://127.0.0.1:8069](http://127.0.0.1:8069) and sign in with the fresh local administrator credentials (`admin` / `admin`). Set `ODOO_HTTP_PORT` in `.env` if that port is already in use.
 
 ### Install on an existing Odoo 18 Community server
 
@@ -105,27 +105,27 @@ For production deployments, run Odoo behind HTTPS and keep `proxy_mode = True` i
 Start the local stack:
 
 ```bash
-docker compose up -d
+docker compose -p odoo-square-v18 up -d
 ```
 
 Follow Odoo logs:
 
 ```bash
-docker compose logs -f odoo
+docker compose -p odoo-square-v18 logs -f odoo
 ```
 
 Restart Odoo after Python changes:
 
 ```bash
-docker compose restart odoo
+docker compose -p odoo-square-v18 restart odoo
 ```
 
 Update the addon after manifest, XML, or model changes:
 
 ```bash
-docker compose stop odoo
-docker compose run --rm odoo odoo -d odoo -u odoo_square --stop-after-init
-docker compose up -d
+docker compose -p odoo-square-v18 stop odoo
+docker compose -p odoo-square-v18 run --rm odoo odoo -d odoo_square_v18 -u odoo_square --stop-after-init
+docker compose -p odoo-square-v18 up -d
 ```
 
 ## Testing

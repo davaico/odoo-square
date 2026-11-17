@@ -33,7 +33,7 @@ services:
     command:
       - odoo
       - --database=${DB_NAME:-odoo_square_v18_test}
-      - --init=odoo_square
+      - --init=${ODOO_INIT_MODULES:-odoo_square}
       - --test-tags=${ODOO_TEST_TAGS:-/odoo_square}
       - --workers=0
       - --stop-after-init
