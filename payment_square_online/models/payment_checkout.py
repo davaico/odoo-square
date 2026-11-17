@@ -9,13 +9,23 @@ from ..square_api import SquareAPIError
 # These errors reject the card operation. A reused token, an idempotency conflict, an
 # unrecognized error, or a transport failure do not prove that no funds were collected.
 _CARD_REJECTIONS = {
-    'ADDRESS_VERIFICATION_FAILURE', 'CARD_DECLINED', 'CARD_DECLINED_CALL_ISSUER',
-    'CARD_DECLINED_VERIFICATION_REQUIRED', 'CARD_EXPIRED', 'CARD_NOT_SUPPORTED',
+    'ADDRESS_VERIFICATION_FAILURE', 'ALLOWABLE_PIN_TRIES_EXCEEDED', 'BAD_EXPIRATION',
+    'CARD_DECLINED', 'CARD_DECLINED_CALL_ISSUER', 'CARD_EXPIRED', 'CARD_NOT_SUPPORTED',
     'CARD_TOKEN_EXPIRED', 'CARDHOLDER_INSUFFICIENT_PERMISSIONS', 'CVV_FAILURE',
-    'EXPIRATION_FAILURE', 'GENERIC_DECLINE', 'INSUFFICIENT_FUNDS', 'INVALID_ACCOUNT',
-    'INVALID_CARD', 'INVALID_CARD_DATA', 'INVALID_EXPIRATION', 'INVALID_POSTAL_CODE',
-    'PAN_FAILURE', 'PAYMENT_LIMIT_EXCEEDED', 'TRANSACTION_LIMIT', 'VOICE_FAILURE',
+    'CHIP_INSERTION_REQUIRED', 'EXPIRATION_FAILURE', 'GENERIC_DECLINE', 'INSUFFICIENT_FUNDS',
+    'INVALID_ACCOUNT', 'INVALID_CARD', 'INVALID_CARD_DATA', 'INVALID_EXPIRATION',
+    'INVALID_PIN', 'INVALID_POSTAL_CODE', 'MANUALLY_ENTERED_PAYMENT_NOT_SUPPORTED',
+    'PAN_FAILURE', 'TRANSACTION_LIMIT', 'VERIFY_AVS_FAILURE', 'VERIFY_CVV_FAILURE', 'VOICE_FAILURE',
 }
+_AUTHENTICATION_REJECTIONS = {'CARD_DECLINED_VERIFICATION_REQUIRED', 'VERIFY_BUYER_FAILED'}
+_AMOUNT_REJECTIONS = {'AMOUNT_TOO_HIGH', 'AMOUNT_TOO_LOW', 'PAYMENT_AMOUNT_MISMATCH', 'PAYMENT_LIMIT_EXCEEDED'}
+_UNAVAILABLE_REJECTIONS = {
+    'INSUFFICIENT_PERMISSIONS', 'INVALID_EMAIL_ADDRESS', 'INVALID_FEES', 'INVALID_LOCATION',
+    'INVALID_PHONE_NUMBER', 'PAYMENT_SOURCE_NOT_ENABLED_FOR_TARGET', 'UNSUPPORTED_CURRENCY',
+}
+_DEFINITIVE_REJECTIONS = (
+    _CARD_REJECTIONS | _AUTHENTICATION_REJECTIONS | _AMOUNT_REJECTIONS | _UNAVAILABLE_REJECTIONS
+)
 
 
 class PaymentTransaction(models.Model):
@@ -115,8 +125,17 @@ class PaymentTransaction(models.Model):
         except SquareAPIError as error:
             if error.is_authorization_error:
                 self._set_error(_("Square is unavailable. No payment was collected. Choose another payment method."))
-            elif error.status in (400, 402) and error.codes and set(error.codes) <= _CARD_REJECTIONS:
-                self._set_error(_("Square declined the payment. Check your card or use a different payment method."))
+            elif error.status in (400, 402) and error.codes and set(error.codes) <= _DEFINITIVE_REJECTIONS:
+                codes = set(error.codes)
+                if codes & _UNAVAILABLE_REJECTIONS:
+                    message = _("Square is unavailable for this payment. Choose another payment method.")
+                elif codes & _AMOUNT_REJECTIONS:
+                    message = _("Square could not accept the payment amount. Choose another payment method.")
+                elif codes & _AUTHENTICATION_REJECTIONS:
+                    message = _("Card authentication is required. Try again and complete your bank's verification.")
+                else:
+                    message = _("Square declined the payment. Check your card or use a different payment method.")
+                self._set_error(message)
         else:
             self._square_apply_payment(response.get('payment'))
 

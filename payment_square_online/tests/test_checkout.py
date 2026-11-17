@@ -593,6 +593,74 @@ class TestSquareCheckout(SquareCheckoutCase):
         self.assertEqual([call.args[0] for call in api.call_args_list],
                          ['POST', 'POST', 'GET', 'GET', 'GET', 'GET', 'GET', 'GET'])
 
+    def test_refund_discovery_retains_a_capture_waiting_for_native_accounting(self):
+        earlier_charge = self._captured_order().transaction_ids
+        earlier_charge.square_dispatched_at = fields.Datetime.now() - timedelta(days=3)
+        order = self._cart()
+        submission = self._prepare(order)['square_submission']
+        refund_time = fields.Datetime.now() - timedelta(days=2)
+        refund = {
+            'id': 'SQ-UNPOSTED-REFUND', 'payment_id': 'SQ-UNPOSTED-PAYMENT', 'status': 'COMPLETED',
+            'location_id': 'TESTNYC', 'amount_money': {'amount': 1250, 'currency': 'USD'},
+            'created_at': refund_time.isoformat() + 'Z',
+        }
+        accepted = {}
+        scan_begins = []
+
+        def square(method, url, **kwargs):
+            if method == 'POST':
+                response = self._square_response(method, url, **kwargs)
+                if url.endswith('/v2/payments'):
+                    accepted.update(response.json()['payment'], id='SQ-UNPOSTED-PAYMENT')
+                    return self._refund_response({'payment': accepted})
+                return response
+            self.assertEqual(method, 'GET')
+            if url.endswith('/v2/refunds'):
+                begin = kwargs['params']['begin_time']
+                scan_begins.append(begin)
+                return self._refund_response({'refunds': [refund] if begin < refund['created_at'] else []})
+            if url.endswith('/v2/payments/SQ-UNPOSTED-PAYMENT'):
+                return self._refund_response({'payment': {
+                    **accepted, 'refund_ids': [refund['id']], 'refunded_money': refund['amount_money'],
+                }})
+            self.assertTrue(url.endswith('/v2/refunds/SQ-UNPOSTED-REFUND'))
+            return self._refund_response({'refund': refund})
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            result = self._result('/payment/square/online/submit', **submission, source_id='cnon:unposted')
+            self.assertEqual(result['state'], 'done')
+            charge = order.transaction_ids
+            charge.square_dispatched_at = refund_time - timedelta(hours=1)
+            # The browser closed before status polling; native accounting has not run yet.
+            self.assertFalse(charge.payment_id)
+            self.assertFalse(charge.is_post_processed)
+            self.authenticate('admin', 'admin')
+            discovery = self.env.ref('payment_square_online.ir_cron_square_online_discover_refunds')
+            recovery = self.env.ref('payment_square_online.ir_cron_square_online_reconcile')
+            self._refund_button('ir.cron', 'method_direct_trigger', discovery.id)
+            self.assertFalse(charge.child_transaction_ids)
+            self.assertTrue(charge.square_linked_refunds_pending)
+            self.assertLess(scan_begins[0], refund['created_at'])
+
+            charge.square_connection_id.refund_scan_next_check = False
+            self._refund_button('ir.cron', 'method_direct_trigger', discovery.id)
+            self.assertGreater(scan_begins[1], refund['created_at'])
+            self._refund_button('ir.cron', 'method_direct_trigger', recovery.id)
+            charge.square_recovery_next_check = False
+            self._refund_button('ir.cron', 'method_direct_trigger', recovery.id)
+
+        self.assertEqual(order.state, 'sale')
+        self.assertEqual(charge.payment_id.amount, 50)
+        child = charge.child_transaction_ids
+        self.assertEqual(child.provider_reference, refund['id'])
+        self.assertEqual((child.state, child.payment_id.payment_type, child.payment_id.amount),
+                         ('done', 'outbound', 12.5))
+        self.assertEqual(child.payment_id.source_payment_id, charge.payment_id)
+        self.assertEqual(charge.payment_id.amount_available_for_refund, 37.5)
+        self.assertFalse(order.invoice_ids)
+        self.assertEqual([call.args[0] for call in api.call_args_list],
+                         ['POST', 'POST', 'GET', 'GET', 'GET', 'GET'])
+
     def test_square_amount_rejection_recovers_the_dashboard_refund_that_won_the_race(self):
         charge = self._captured_order().transaction_ids
         self.authenticate('admin', 'admin')
@@ -990,6 +1058,61 @@ class TestSquareCheckout(SquareCheckoutCase):
         self.assertEqual(order.state, 'sale')
         self.assertEqual(len(order.transaction_ids.payment_id), 1)
 
+    def test_definitive_square_rejections_release_checkout_for_a_safe_retry(self):
+        order = self._cart()
+        for code, message in (
+            ('AMOUNT_TOO_LOW', 'payment amount'),
+            ('VERIFY_BUYER_FAILED', 'authentication'),
+            ('PAYMENT_AMOUNT_MISMATCH', 'payment amount'),
+            ('INVALID_LOCATION', 'unavailable'),
+        ):
+            with self.subTest(code=code):
+                prepared = self._prepare(order)
+
+                def rejected(method, url, **kwargs):
+                    if url.endswith('/v2/payments'):
+                        return self._square_error_response(400, code)
+                    return self._square_response(method, url, **kwargs)
+
+                with patch('odoo.addons.payment_square_online.square_api.request', side_effect=rejected) as square:
+                    for _attempt in range(2):
+                        result = self._result('/payment/square/online/submit',
+                                              **prepared['square_submission'], source_id='cnon:rejected')
+                        self.assertEqual(result['state'], 'error')
+                        self.assertIn(message, result['message'])
+                    self.assertEqual(square.call_count, 2)
+                self.assertEqual(order.state, 'draft')
+                self.assertFalse(order.transaction_ids.payment_id)
+
+        prepared = self._prepare(order)
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=self._square_response):
+            self._result('/payment/square/online/submit', **prepared['square_submission'], source_id='cnon:retry')
+        self._result('/payment/status/poll')
+        self.assertEqual(order.state, 'sale')
+        self.assertEqual(len(order.transaction_ids.payment_id), 1)
+
+    def test_ambiguous_square_error_does_not_release_the_payment_reservation(self):
+        order = self._cart()
+        prepared = self._prepare(order)
+
+        def ambiguous(method, url, **kwargs):
+            if url.endswith('/v2/payments'):
+                return self._refund_response({'errors': [
+                    {'code': 'CARD_DECLINED'}, {'code': 'CARD_TOKEN_USED'},
+                ]}, status=400)
+            return self._square_response(method, url, **kwargs)
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=ambiguous) as square:
+            result = self._result('/payment/square/online/submit',
+                                  **prepared['square_submission'], source_id='cnon:ambiguous')
+            self.assertEqual(result['state'], 'pending')
+            self.assertEqual(self._result('/payment/square/online/submit',
+                                         **prepared['square_submission'], source_id='cnon:ambiguous')['state'], 'pending')
+            self.assertIn('error', self._rpc(f'/shop/payment/transaction/{order.id}', **self._prepare_params(order)))
+            self.assertEqual(square.call_count, 2)
+        self.assertEqual(order.state, 'draft')
+        self.assertFalse(order.transaction_ids.payment_id)
+
     def test_lost_payment_response_blocks_square_and_other_providers(self):
         order = self._cart()
         values = self._prepare(order)
@@ -1020,6 +1143,45 @@ class TestSquareCheckout(SquareCheckoutCase):
         self.assertEqual(self._result('/payment/status/poll')['state'], 'pending')
         self.assertIn(order.state, ('draft', 'sent'))
         self.assertFalse(order.transaction_ids.payment_id)
+
+    def test_late_payment_does_not_confirm_or_invoice_an_order_changed_by_staff(self):
+        self.env['ir.config_parameter'].set_param('sale.automatic_invoice', 'True')
+        order = self._cart()
+        prepared = self._prepare(order)
+        accepted = {}
+
+        def square(method, url, **kwargs):
+            if method == 'POST':
+                response = self._square_response(method, url, **kwargs)
+                if url.endswith('/v2/payments'):
+                    accepted.update(response.json()['payment'])
+                    raise Timeout('Square accepted the original total before the response was lost')
+                return response
+            self.assertEqual(method, 'GET')
+            self.assertTrue(url.endswith('/v2/payments'))
+            return self._refund_response({'payments': [accepted]})
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            self.assertEqual(self._result('/payment/square/online/submit',
+                                         **prepared['square_submission'], source_id='cnon:changed')['state'], 'pending')
+            self.authenticate('admin', 'admin')
+            line = order.order_line.filtered(lambda line: line.product_id == self.product)
+            self._result('/web/dataset/call_kw', model='sale.order.line', method='write',
+                         args=[line.ids, {'price_unit': 20}], kwargs={})
+            self.assertEqual(order.amount_total, 28)
+            tx = order.transaction_ids
+            self._refund_button('payment.transaction', 'action_square_refresh_status', tx.id)
+
+        self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.payment_id.amount, 50)
+        self.assertEqual(tx.payment_id.move_id.state, 'posted')
+        self.assertEqual(order.state, 'draft')
+        self.assertFalse(order.invoice_ids)
+        self.assertTrue(tx.square_paid_changed_order)
+        self.assertFalse(tx.child_transaction_ids)
+        if 'picking_ids' in order._fields:
+            self.assertFalse(order.picking_ids)
+        self.assertEqual([call.args[0] for call in api.call_args_list], ['POST', 'POST', 'GET'])
 
     def test_refresh_recovers_a_timed_out_payment_from_a_later_square_page(self):
         order = self._cart()

@@ -1,6 +1,13 @@
 {
     "name": "Square Online Payments",
     "summary": "Connect a Square account to Odoo website payments",
+    "description": (
+        "Connect your Square merchant account to a self-hosted Odoo 18 Community store. "
+        "Customers pay through the embedded Square card form, and accounting managers "
+        "can recover payments and issue refunds in Odoo. Square POS is optional.\n\n"
+        "Follow the Square Online Payments guide in the repository to configure your "
+        "Square application and test checkout in Sandbox."
+    ),
     "version": "18.0.1.0.0",
     "category": "Accounting/Payment Providers",
     "license": "AGPL-3",

@@ -41,8 +41,12 @@
             </xpath>
             <xpath expr="//group[@name='transaction_details']/.." position="before">
                 <field name="square_paid_cancelled_order" invisible="1"/>
+                <field name="square_paid_changed_order" invisible="1"/>
                 <div class="alert alert-warning" role="alert" invisible="not square_paid_cancelled_order">
                     Square collected this payment for a cancelled order. Review the payment and any refunds before resolving the order.
+                </div>
+                <div class="alert alert-warning" role="alert" invisible="not square_paid_changed_order">
+                    Square collected this payment after the order changed. Review the payment and order before confirming, invoicing, or fulfilling it.
                 </div>
             </xpath>
         </field>
@@ -60,7 +64,7 @@
 
     <template id="sale_order_portal_square_payment_mismatch" inherit_id="sale.sale_order_portal_template">
         <xpath expr="//div[@id='portal_sale_content']" position="before">
-            <div t-if="sale_order.get_portal_last_transaction().square_paid_cancelled_order"
+            <div t-if="sale_order.get_portal_last_transaction().square_paid_cancelled_order or sale_order.get_portal_last_transaction().square_paid_changed_order"
                  class="alert alert-warning d-print-none" role="alert">
                 Square collected your payment. Please contact us about this order.
             </div>

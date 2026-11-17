@@ -26,7 +26,7 @@ class SquareConnection(models.Model):
             ('square_connection_id', '=', self.id), ('square_environment', '=', self.provider_id.square_environment),
             ('square_application_id', '=', self.provider_id.square_application_id),
             ('square_merchant_id', '=', self.merchant_id), ('operation', '=', 'online_direct'),
-            ('state', '=', 'done'), ('provider_reference', '!=', False), ('payment_id', '!=', False),
+            ('state', '=', 'done'), ('provider_reference', '!=', False),
             ('square_dispatched_at', '!=', False),
         ]
 
@@ -87,6 +87,12 @@ class SquareConnection(models.Model):
                     for source in env['payment.transaction'].search([
                         *scope, ('provider_reference', 'in', list(refunds)),
                     ], order='id'):
+                        source._square_lock_for_status()
+                        if not source.payment_id:
+                            # Checkout may be captured before native post-processing creates its
+                            # payment. Retain discovery before advancing the merchant-wide cursor.
+                            source.square_linked_refunds_pending = True
+                            continue
                         for refund in refunds[source.provider_reference]:
                             source._square_ingest_refund(refund)
                     env[self._name].browse(connection_id).refund_scan_at = now

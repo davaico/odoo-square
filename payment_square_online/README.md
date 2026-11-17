@@ -43,6 +43,8 @@ If the card option is missing, check publication, company and website assignment
 
 A buyer can close checkout while a payment is processing and return to their order in the portal. Odoo uses signed Square notifications and scheduled checks to recover unresolved payments. Accounting managers and settings administrators can open **Invoicing → Configuration → Online Payments → Square Payment History** and click **Refresh status** on the original transaction or refund. The action looks up existing Square operations. If Square collects a payment for a cancelled Odoo order, review the warning and use a separate refund if the money needs to be returned.
 
+If staff change an order after payment starts, a later successful payment is recorded for its original amount. Odoo flags the mismatch and leaves confirmation and invoicing for authorized review. Check the order and payment before fulfilling the order or deciding on a refund.
+
 Square Dashboard refunds also appear against the original website payment. **Maximum Refund Allowed** on that payment accounts for both pending and completed refunds, including those from Square. A confirmed failure releases the pending amount. Each refund transaction shows its status, origin, Square reference once available, and which user requested it from Odoo, where applicable.
 
 Keep **Square Online Payments: Renew OAuth access** active under Odoo's Scheduled Actions. If **Square Connection** asks you to reconnect, click **Authorize or Reconnect with Square** and sign in with the original Square merchant. Save a replacement application secret first if you rotated it. Restore the original encryption key if Odoo reports that it cannot decrypt the credentials. Changes to the selected location apply to new checkouts. Existing payments keep their original merchant and location for recovery and refunds.
@@ -54,3 +56,26 @@ When installing or upgrading both add-ons in one database, update both together.
 Genuine Square POS sales, refunds, and exchanges continue through POS import. Website payments and refunds follow their Odoo order and accounting workflows. If Square is temporarily unavailable while POS checks whether a resource belongs to website checkout, the webhook requests another delivery. Retry manual resync after Square access recovers.
 
 For Odoo 18 regression testing with the test Compose configuration, use `ODOO_INIT_MODULES=payment_square_online,sale_stock,odoo_square` and `ODOO_TEST_TAGS=standard/payment_square_online,standard/odoo_square,square_coexistence`. To test the provider alone, use `ODOO_INIT_MODULES=payment_square_online,sale_stock` and `ODOO_TEST_TAGS=standard/payment_square_online`.
+
+CI runs separate POS-only, standalone online, combined, and concurrent-refund jobs. For local online tests, set `ODOO_TEST_DOCKERFILE=config/Dockerfile.test` before the build in the [root test commands](../README.md#testing). This test image includes pinned Chrome and its Python WebSocket dependency so the embedded card browser test runs. Check for a nonzero passing test summary and no skipped addon tests. `ODOO_TEST_IMAGE` can select an already-built compatible image.
+
+The refund concurrency fixture uses independent database connections and commits test records. Run it in its own disposable project from Bash:
+
+```bash
+(
+  set -euo pipefail
+  export DB_PASSWORD=ci_odoo_test DB_NAME=odoo_square_v18_test
+  export ODOO_TEST_DOCKERFILE=config/Dockerfile.test
+  compose=(docker compose -p "odoo-square-v18-test-race-$(date +%s)-$$" -f docker-compose.test.yml)
+  trap '"${compose[@]}" down --volumes' EXIT
+  "${compose[@]}" build odoo
+  "${compose[@]}" run --rm -T odoo odoo --database="$DB_NAME" \
+    --init=payment_square_online,sale_stock --stop-after-init --no-http
+  printf '%s\n' \
+    'from odoo.addons.payment_square_online.tests.test_refund_concurrency import run' \
+    'run(env.registry)' \
+    | "${compose[@]}" run --rm -T odoo odoo shell --database="$DB_NAME" --no-http
+)
+```
+
+The fixture must report two passing tests. These tests simulate Square responses; use the Sandbox checks above to qualify the actual Square integration.

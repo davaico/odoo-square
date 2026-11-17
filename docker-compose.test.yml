@@ -18,7 +18,10 @@ services:
       - odoo-test-net
 
   odoo:
-    build: .
+    image: ${ODOO_TEST_IMAGE:-odoo-square-v18-test}
+    build:
+      context: .
+      dockerfile: ${ODOO_TEST_DOCKERFILE:-Dockerfile}
     depends_on:
       db:
         condition: service_healthy

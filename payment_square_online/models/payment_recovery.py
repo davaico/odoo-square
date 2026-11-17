@@ -22,6 +22,7 @@ class PaymentTransaction(models.Model):
     square_recovery_next_check = fields.Datetime(readonly=True, copy=False, index=True)
     square_linked_refunds_pending = fields.Boolean(readonly=True, copy=False)
     square_paid_cancelled_order = fields.Boolean(compute='_compute_square_paid_cancelled_order')
+    square_paid_changed_order = fields.Boolean(readonly=True, copy=False)
 
     @api.depends('provider_code', 'operation', 'state', 'sale_order_ids.state')
     def _compute_square_paid_cancelled_order(self):
@@ -176,7 +177,26 @@ class PaymentTransaction(models.Model):
         for tx in square_transactions.sorted('id'):
             tx._square_lock_for_status()
             if not tx.is_post_processed:
+                if (
+                    tx.operation == 'online_direct' and tx.state == 'done'
+                    and tx.square_cart_signature and not tx.square_paid_changed_order
+                    and (len(tx.sale_order_ids) != 1
+                         or tx.sale_order_ids._square_cart_signature() != tx.square_cart_signature)
+                ):
+                    tx.square_paid_changed_order = True
+                    tx._log_message_on_linked_documents(_(
+                        "Square collected this payment after the order changed. Review the payment "
+                        "and order before confirming, invoicing, or fulfilling it."
+                    ))
                 super(PaymentTransaction, tx)._post_process()
+
+    def _check_amount_and_confirm_order(self):
+        eligible = self.filtered(lambda tx: not tx.square_paid_changed_order)
+        return super(PaymentTransaction, eligible)._check_amount_and_confirm_order()
+
+    def _invoice_sale_orders(self):
+        eligible = self.filtered(lambda tx: not tx.square_paid_changed_order)
+        return super(PaymentTransaction, eligible)._invoice_sale_orders()
 
     @api.model
     def _square_payment_recovery_domain(self):

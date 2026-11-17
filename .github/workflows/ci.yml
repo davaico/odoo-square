@@ -1,4 +1,4 @@
-# Odoo module tests: PostgreSQL + install MODULE + unittest (--test-tags).
+# Each selection installs into its own fresh database and filestore.
 name: CI
 
 on:
@@ -13,22 +13,86 @@ permissions:
 jobs:
   odoo-tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: pos
+            modules: odoo_square
+            tags: /odoo_square
+          - suite: online
+            modules: payment_square_online,sale_stock
+            tags: standard/payment_square_online
+          - suite: combined
+            modules: payment_square_online,sale_stock,odoo_square
+            tags: standard/payment_square_online,standard/odoo_square,square_coexistence
+          - suite: refund-races
+            modules: payment_square_online,sale_stock
+            tags: ''
     env:
+      COMPOSE_PROJECT_NAME: odoo-square-v18-test-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
+      ODOO_INIT_MODULES: ${{ matrix.modules }}
+      ODOO_TEST_TAGS: ${{ matrix.tags }}
+      TEST_SUITE: ${{ matrix.suite }}
       DB_PASSWORD: ci_odoo_test
-      COMPOSE_PROJECT_NAME: odoo-square-v18-test-${{ github.run_id }}-${{ github.run_attempt }}
-
+      DB_NAME: odoo_square_v18_test
+      ODOO_TEST_DOCKERFILE: config/Dockerfile.test
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Odoo 18 Community
+      - name: Build Odoo 18 with Chrome
         run: docker compose -f docker-compose.test.yml build odoo
+      - name: Install and exercise the selected workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          compose=(docker compose -f docker-compose.test.yml)
+          if [[ "$TEST_SUITE" == refund-races ]]; then
+            "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_v18_test \
+              --init="$ODOO_INIT_MODULES" --stop-after-init --no-http 2>&1 \
+              | tee test-results/install.log
+            printf '%s\n' \
+              'from odoo.addons.payment_square_online.tests.test_refund_concurrency import run' \
+              'run(env.registry)' \
+              | "${compose[@]}" run --rm -T odoo odoo shell --database=odoo_square_v18_test --no-http 2>&1 \
+              | tee test-results/refund-races.log
+            grep -Eq '^Ran 2 tests in ' test-results/refund-races.log
+            grep -Eq '^OK$' test-results/refund-races.log
+          else
+            "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_v18_test \
+              --init="$ODOO_INIT_MODULES" --test-tags="$ODOO_TEST_TAGS" \
+              --workers=0 --stop-after-init --log-level=test 2>&1 | tee test-results/odoo-tests.log
+            log=test-results/odoo-tests.log
+            grep -Eq '(^|[[:space:]])0 failed, 0 error\(s\) of [1-9][0-9]* tests when loading database' "$log"
+            if grep -Eq 'odoo\.addons\.(odoo_square|payment_square_online)\.tests\..*: skipped ' "$log"; then
+              echo 'A required addon test was skipped.' >&2
+              exit 1
+            fi
+            if [[ "$TEST_SUITE" != pos ]]; then
+              grep -Fq 'Starting TestSquareCheckout.test_mobile_browser_can_cancel_and_complete_square_authentication ' "$log"
+            fi
+            if [[ "$TEST_SUITE" != online ]]; then
+              grep -Eq 'odoo\.addons\.odoo_square\.tests\..*: Starting ' "$log"
+            fi
+            if [[ "$TEST_SUITE" == combined ]]; then
+              grep -Fq 'Starting TestSquareCoexistence.' "$log"
+            fi
+          fi
 
-      - name: Install and test Square on a fresh database
-        run: docker compose -f docker-compose.test.yml run --rm odoo
+      - name: Collect service logs
+        if: always()
+        run: |
+          mkdir -p test-results
+          docker compose -f docker-compose.test.yml logs --no-color > test-results/services.log 2>&1
 
-      - name: Logs on failure
-        if: failure()
-        run: docker compose -f docker-compose.test.yml logs
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odoo18-${{ matrix.suite }}-${{ github.run_attempt }}
+          path: test-results/
 
       - name: Cleanup
         if: always()
