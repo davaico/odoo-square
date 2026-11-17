@@ -20,7 +20,13 @@ Install **Square Online Payments** (`payment_square_online`) on an Odoo Communit
 
 Duplicate the Odoo provider to create a separate, disabled configuration. Select **Production** and use your Square application's Production OAuth redirect, ID, and secret. Register an HTTPS redirect in the Console and authorize the production merchant. Select the location, website if needed, and bank journal. Set the provider to **Enabled** when it is ready to publish.
 
-If authorization is rejected or expires, return to the provider form and choose **Authorize or Reconnect with Square** using the original merchant account. Replace the application secret in Odoo if you rotate it in Square. If Odoo reports that it cannot decrypt the credentials, restore the original server encryption key. To connect a different merchant, company, application, or environment, configure a separate provider.
+## Renew or restore Square access
+
+Odoo renews access in the background using your Square application's saved credentials in the configured environment. It also tries to renew expired access before starting a payment or checking its status. Keep the **Square Online Payments: Renew OAuth access** scheduled action active.
+
+If the provider's **Square Connection** status asks you to reconnect, sign in to Odoo as a settings administrator and choose **Authorize or Reconnect with Square** using the original Square merchant account. Save the new application secret first if you rotated it in Square. If Odoo reports that it cannot decrypt the credentials, restore the original server encryption key.
+
+Changing the provider's selected location applies to future checkouts. Existing payments keep their original merchant and location for recovery and refunds. To use a different merchant, application, company, or environment, duplicate the provider and keep the original provider available for its payment history. If the original merchant's access was revoked, reconnect that merchant on the original provider before refreshing its pending payments.
 
 ## Offer Square at the intended storefronts
 
@@ -50,6 +56,6 @@ International buyers can use eligible cards, subject to Square and card issuer a
 
 A customer can close checkout while Square is processing a payment. They can return to their order in the portal to see the outcome. Odoo uses signed Square notifications and checks unresolved payments in the background. If Square has yet to confirm an outcome, the original payment stays processing and the order is protected against an accidental second charge.
 
-Accounting managers and settings administrators can open **Invoicing → Configuration → Online Payments → Square Payment History**. The transaction shows the payment status, original Square location, and any status check message. Click **Refresh status** to look up that payment at Square. A manual or scheduled status check does not issue a charge. If the original connection needs attention, use **Authorize or Reconnect with Square** on that provider and select the original merchant account, then refresh the transaction.
+Accounting managers and settings administrators can open **Invoicing → Configuration → Online Payments → Square Payment History**. The transaction shows the payment status, original Square location, and any status check message. Click **Refresh status** to look up that payment at Square. The scheduled check also resumes recovery once the original provider is connected.
 
 If Square collected payment for a cancelled Odoo order, Odoo records the incoming payment and shows a warning on the transaction and the customer's order. Review the payment and order. If the money needs to be returned, handle it as a separate refund.

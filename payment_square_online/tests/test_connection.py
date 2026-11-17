@@ -1,14 +1,18 @@
 import json
 import os
+from datetime import timedelta
 from functools import partial
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urlsplit
+from uuid import uuid4
 
 from cryptography.fernet import Fernet
 from requests import Response
 
+from odoo import SUPERUSER_ID, api, fields
 from odoo.exceptions import AccessError, ValidationError
-from odoo.tests import Form, HttpCase, new_test_user, tagged
+from odoo.service.model import retrying
+from odoo.tests import Form, HttpCase, TransactionCase, new_test_user, tagged
 
 
 @tagged('post_install', '-at_install')
@@ -268,3 +272,74 @@ class TestSquareConnection(HttpCase):
         response.status_code = 200
         response._content = json.dumps(payload).encode()
         return response
+
+
+@tagged('post_install', '-at_install')
+class TestSquareAuthorizationRace(TransactionCase):
+    def test_recovery_uses_the_grant_renewed_by_a_concurrent_scheduled_action(self):
+        merchant_id = f'SQUARE-{uuid4().hex}'
+        with patch.dict(os.environ, {'ODOO_SQUARE_ONLINE_ENCRYPTION_KEY': Fernet.generate_key().decode()}):
+            with self.registry.cursor() as cr:
+                env = api.Environment(cr, SUPERUSER_ID, {})
+                provider = env.ref('payment_square_online.payment_provider_square_online').copy({
+                    'square_application_id': 'sandbox-sq0idb-race', 'square_application_secret': 'sandbox-secret',
+                })
+                connection = env['payment.square.connection'].search([('provider_id', '=', provider.id)])
+                connection.write({
+                    'merchant_id': merchant_id, 'access_token': connection._seal('old-access-token'),
+                    'refresh_token': connection._seal('square-refresh-token'),
+                    'expires_at': fields.Datetime.now() + timedelta(days=5),
+                })
+                transaction = env['payment.transaction'].create({
+                    'provider_id': provider.id, 'payment_method_id': env.ref('payment.payment_method_card').id,
+                    'partner_id': env.ref('base.main_partner').id, 'currency_id': env.ref('base.JPY').id,
+                    'amount': 1700, 'operation': 'online_direct', 'state': 'pending',
+                    'square_connection_id': connection.id, 'square_merchant_id': merchant_id,
+                    'square_environment': 'sandbox', 'square_application_id': 'sandbox-sq0idb-race',
+                    'square_location_ref': 'SQUARETOKYO', 'square_currency_code': 'JPY', 'square_amount_minor': 1700,
+                    'square_order_reference': f'odoo-web-{uuid4().hex[:23]}', 'square_order_id': 'SQUAREORDER',
+                    'square_reserved_at': fields.Datetime.now(), 'square_dispatched_at': fields.Datetime.now(),
+                })
+                provider_id, transaction_id = provider.id, transaction.id
+            self.addCleanup(self._remove_connection_fixture, provider_id, transaction_id)
+
+            with self.registry.cursor() as stale_cr:
+                stale_env = api.Environment(stale_cr, SUPERUSER_ID, {})
+                tx = stale_env['payment.transaction'].browse(transaction_id)
+                self.assertEqual(tx.state, 'pending')  # Take the recovery snapshot before the cron commits.
+                calls = []
+
+                def square(method, url, **kwargs):
+                    self.assertTrue(url.startswith('https://connect.squareupsandbox.com/'))
+                    calls.append((method, url.rsplit('/', 1)[-1]))
+                    if method == 'POST' and url.endswith('/oauth2/token'):
+                        self.assertEqual(kwargs['json']['grant_type'], 'refresh_token')
+                        return TestSquareConnection._square_responses(method, url, merchant=merchant_id)
+                    self.assertEqual(method, 'GET')
+                    self.assertEqual(kwargs['headers']['Authorization'], 'Bearer square-access-token')
+                    response = Response()
+                    response.status_code = 200
+                    response._content = json.dumps({'payments': [{
+                        'id': 'SQUAREPAYMENT', 'status': 'PENDING', 'source_type': 'CARD',
+                        'location_id': 'SQUARETOKYO', 'order_id': 'SQUAREORDER',
+                        'reference_id': tx.square_order_reference, 'amount_money': {'amount': 1700, 'currency': 'JPY'},
+                    }]}).encode()
+                    return response
+
+                with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square):
+                    with self.registry.cursor() as winning_cr:
+                        winning_env = api.Environment(winning_cr, SUPERUSER_ID, {})
+                        cron = winning_env.ref('payment_square_online.ir_cron_square_online_renew')
+                        cron.method_direct_trigger()
+                        cron.method_direct_trigger()
+                    retrying(tx.action_square_refresh_status, stale_env)
+                self.assertEqual(calls, [('POST', 'token'), ('GET', 'payments')])
+                self.assertEqual(tx.provider_reference, 'SQUAREPAYMENT')
+                self.assertEqual(tx.state, 'pending')
+                self.assertFalse(tx.square_recovery_message)
+
+    def _remove_connection_fixture(self, provider_id, transaction_id):
+        with self.registry.cursor() as cr:
+            env = api.Environment(cr, SUPERUSER_ID, {})
+            env['payment.transaction'].browse(transaction_id).unlink()
+            env['payment.provider'].browse(provider_id).unlink()

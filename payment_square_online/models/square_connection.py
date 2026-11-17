@@ -4,8 +4,9 @@ import os
 from secrets import compare_digest, token_urlsafe
 
 from cryptography.fernet import Fernet, InvalidToken
+from psycopg2.errors import DeadlockDetected, SerializationFailure
 
-from odoo import _, fields, models
+from odoo import SUPERUSER_ID, _, api, fields, models
 from odoo.exceptions import UserError
 
 from ..const import SQUARE_ENCRYPTION_KEY_ENV, SQUARE_LOCATION_CURRENCIES
@@ -24,6 +25,7 @@ class SquareConnection(models.Model):
     access_token = fields.Char()
     refresh_token = fields.Char()
     expires_at = fields.Datetime()
+    refresh_after = fields.Datetime(index=True)
     reauthorization_required = fields.Boolean()
     authorization_result = fields.Selection([
         ('connected', 'Square authorization succeeded'),
@@ -60,6 +62,7 @@ class SquareConnection(models.Model):
     def _lock(self):
         self.ensure_one()
         self.env.cr.execute('SELECT id FROM payment_square_connection WHERE id = %s FOR NO KEY UPDATE', [self.id])
+        return bool(self.env.cr.fetchone())
 
     def _access_token_for_use(self):
         self.ensure_one()
@@ -102,6 +105,31 @@ class SquareConnection(models.Model):
     def _record_authorization_failure(self):
         self.reauthorization_required = True
         self.provider_id.invalidate_recordset(['square_connection_status'])
+
+    @api.model
+    def _cron_square_renew_authorizations(self):
+        now = fields.Datetime.now()
+        domain = [
+            ('provider_id.code', '=', 'square_online'), ('merchant_id', '!=', False),
+            ('refresh_token', '!=', False), ('application_secret', '!=', False),
+            ('reauthorization_required', '=', False),
+            '|', ('refresh_after', '=', False), ('refresh_after', '<=', now),
+        ]
+        for connection_id in self.search(domain, order='refresh_after ASC NULLS FIRST, id', limit=5).ids:
+            try:
+                with self.env.registry.cursor() as cr:
+                    connection = self.with_env(api.Environment(cr, SUPERUSER_ID, {})).browse(connection_id)
+                    if not connection._lock() or not connection.filtered_domain(domain):
+                        continue
+                    try:
+                        renewed = connection._refresh_authorization()
+                    except UserError:
+                        # A missing encryption key needs administrator attention before retrying.
+                        renewed = False
+                    if not renewed and not connection.reauthorization_required:
+                        connection.refresh_after = now + timedelta(hours=1)
+            except (SerializationFailure, DeadlockDetected):
+                continue
 
     @staticmethod
     def _digest(value):
@@ -196,6 +224,8 @@ class SquareConnection(models.Model):
             'access_token': self._seal(tokens['access_token']),
             'refresh_token': self._seal(tokens['refresh_token']),
             'expires_at': expires_at,
+            # Square recommends renewing at least every seven days, even without payments.
+            'refresh_after': min(fields.Datetime.now() + timedelta(days=6), expires_at - timedelta(hours=1)),
         }
 
     @staticmethod
