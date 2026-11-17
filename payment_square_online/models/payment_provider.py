@@ -61,7 +61,7 @@ class PaymentProvider(models.Model):
     @api.depends('code', 'square_application_id', 'square_location_id', 'company_id', 'journal_id')
     def _compute_square_connection_status(self):
         for provider in self:
-            connection = provider._origin._square_get_connection()
+            connection = (provider._origin or provider)._square_get_connection()
             provider.square_has_application_secret = bool(connection.application_secret)
             provider.square_merchant_id = connection.merchant_id
             provider.square_authorization_result = connection.authorization_result
@@ -103,7 +103,7 @@ class PaymentProvider(models.Model):
     def _square_has_eligible_journal(self):
         self.ensure_one()
         journal = self.journal_id.sudo()
-        return journal.type == 'bank' and journal.company_id == self.company_id
+        return journal.active and journal.type == 'bank' and journal.company_id == self.company_id
 
     @api.constrains('code', 'company_id', 'website_id', 'square_location_id')
     def _check_square_ownership(self):

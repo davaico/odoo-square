@@ -38,6 +38,7 @@ class TestSquareConnection(HttpCase):
         with self.assertRaises(ValidationError):
             with Form(provider) as form:
                 form.state = 'test'
+        self.assertFalse(Form(self.env['payment.provider']).square_connection_status)
 
     def test_authorizes_sandbox_and_selects_owned_location_and_journal(self):
         provider = self.env.ref('payment_square_online.payment_provider_square_online')
@@ -82,6 +83,13 @@ class TestSquareConnection(HttpCase):
             ))
             self.assertEqual(provider.state, 'test')
             self.assertEqual(provider.square_connection_status, 'ready')
+            with self.assertRaises(AccessError):
+                self.env['payment.square.connection'].with_user(self.env.ref('base.user_admin')).search_read(
+                    [], ['access_token', 'refresh_token'],
+                )
+            journal.active = False
+            provider.invalidate_recordset(['square_connection_status'])
+            self.assertEqual(provider.square_connection_status, 'select_journal')
 
     def test_denied_callback_consumes_real_state_only_once(self):
         provider = self.env.ref('payment_square_online.payment_provider_square_online')
