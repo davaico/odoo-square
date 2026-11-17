@@ -21,6 +21,7 @@ services:
       - HOST=${DB_HOST:-db}
       - USER=${DB_USER:-odoo}
       - PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required}
+      - ODOO_SQUARE_ONLINE_ENCRYPTION_KEY=${ODOO_SQUARE_ONLINE_ENCRYPTION_KEY:-}
     volumes:
       - odoo_data:/var/lib/odoo
       - ./config:/etc/odoo
