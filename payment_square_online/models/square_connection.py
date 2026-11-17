@@ -20,6 +20,7 @@ class SquareConnection(models.Model):
     provider_id = fields.Many2one('payment.provider', required=True, ondelete='cascade')
     merchant_id = fields.Char(index=True)
     application_secret = fields.Char()
+    webhook_signature_key = fields.Char()
     access_token = fields.Char()
     refresh_token = fields.Char()
     expires_at = fields.Datetime()
