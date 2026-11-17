@@ -279,6 +279,7 @@ class PaymentTransaction(models.Model):
         if self.state == "pending" and target in _TERMINAL_STATES:
             self._process("square_online", {"square_online_payment": payment})
         if self.state == "done" and not self.is_post_processed:
+            self._square_online_record_order_mismatch()
             self.env.ref("payment.cron_post_process_payment_tx")._trigger()
         return True
 
@@ -348,17 +349,24 @@ class PaymentTransaction(models.Model):
             tx._square_online_lock_payment()
             if tx.is_post_processed:
                 continue
-            if tx.state == "done" and (
-                tx.sale_order_ids != tx.square_online_order_id
-                or tx.square_online_order_id.state == "cancel"
-                or tx.square_online_order_id._square_online_cart_snapshot() != tx.square_online_cart_snapshot
-            ):
-                tx.square_online_has_order_mismatch = True
-                tx.square_online_order_id.message_post(body=_(
-                    "Square collected this payment after the order changed. Review the payment "
-                    "and the order before fulfilling it."
-                ))
+            if tx.state == "done":
+                # The order may have changed between verified ingestion and accounting.
+                tx._square_online_record_order_mismatch()
             super(PaymentTransaction, tx)._post_process()
+
+    def _square_online_record_order_mismatch(self):
+        self.ensure_one()
+        order = self.square_online_order_id
+        if not self.square_online_has_order_mismatch and (
+            self.sale_order_ids != order
+            or order.state == "cancel"
+            or order._square_online_cart_snapshot() != self.square_online_cart_snapshot
+        ):
+            self.square_online_has_order_mismatch = True
+            order.message_post(body=_(
+                "Square collected this payment after the order changed. Review the payment "
+                "and the order before fulfilling it."
+            ))
 
     def _check_amount_and_confirm_order(self):
         eligible = self.filtered(lambda tx: not tx.square_online_has_order_mismatch)

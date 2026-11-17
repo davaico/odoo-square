@@ -10,8 +10,7 @@ from odoo.tests import HttpCase, tagged
 from odoo.tests.common import JsonRpcException, new_test_user
 
 
-@tagged("post_install", "-at_install")
-class TestSquareOnlineCheckout(HttpCase):
+class SquareOnlineCheckoutCase(HttpCase):
     square_boundary = "odoo.addons.payment_square_online.square_api.requests.request"
     submit_route = "/payment/square_online/submit"
 
@@ -144,6 +143,11 @@ class TestSquareOnlineCheckout(HttpCase):
             "amount_money": json["amount_money"],
             "order_id": "SQUARE-ORDER-TEST",
         }})
+
+
+@tagged("post_install", "-at_install")
+class TestSquareOnlineCheckout(SquareOnlineCheckoutCase):
+    square_boundary = SquareOnlineCheckoutCase.square_boundary
 
     @patch(square_boundary)
     def test_native_website_checkout_captures_and_accounts_once(self, external):

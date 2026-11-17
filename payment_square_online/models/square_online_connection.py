@@ -1,10 +1,12 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
+import base64
 import hashlib
+import hmac
 import os
 import re
 import secrets
 from datetime import UTC, datetime
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -18,6 +20,7 @@ from ..square_api import (
     OAUTH_CALLBACK_PATH,
     OAUTH_SCOPES,
     SQUARE_HOSTS,
+    SQUARE_ONLINE_WEBHOOK_PATH,
     SquareAPIError,
     square_request,
 )
@@ -33,6 +36,7 @@ _OAUTH_FIELDS = {
 _SYSTEM_FIELDS = {
     **_OAUTH_FIELDS,
     "application_secret_encrypted": False,
+    "webhook_signature_key_encrypted": False,
     "access_token": False,
     "refresh_token": False,
     "merchant_id": False,
@@ -96,6 +100,18 @@ class SquareOnlineConnection(models.Model):
     oauth_expires_at = fields.Datetime(copy=False, groups="base.group_system")
     redirect_uri = fields.Char(string="OAuth Redirect URL", compute="_compute_redirect_uri")
 
+    webhook_notification_url = fields.Char(
+        string="Webhook Notification URL", copy=False, groups="base.group_system",
+        help="The exact public HTTPS notification URL configured in the Square Developer Console.",
+    )
+    webhook_signature_key = fields.Char(
+        string="Webhook Signature Key", compute="_compute_webhook_signature_key",
+        inverse="_inverse_webhook_signature_key", groups="base.group_system",
+        help="Enter the signature key for this subscription from the Square Developer Console.",
+    )
+    webhook_signature_key_encrypted = fields.Char(copy=False, groups="base.group_system")
+    webhook_route = fields.Char(string="Webhook Route", compute="_compute_webhook_route")
+
     @api.model
     def _square_online_encrypt(self, value):
         return _credential_cipher().encrypt(value.encode()).decode()
@@ -118,6 +134,47 @@ class SquareOnlineConnection(models.Model):
                 **_OAUTH_FIELDS, "application_secret_encrypted": encrypted,
             })
             connection.invalidate_recordset(["application_secret"])
+
+    def _compute_webhook_route(self):
+        for connection in self:
+            connection.webhook_route = (
+                f"{SQUARE_ONLINE_WEBHOOK_PATH}/{connection.id}" if connection.id else False
+            )
+
+    @api.constrains("webhook_notification_url")
+    def _check_webhook_notification_url(self):
+        for connection in self.filtered("webhook_notification_url"):
+            try:
+                url = urlsplit(connection.webhook_notification_url)
+                valid = (
+                    url.scheme == "https" and url.hostname and not url.username and not url.password
+                    and not url.fragment and url.path == connection.webhook_route
+                )
+            except ValueError:
+                valid = False
+            if not valid:
+                raise ValidationError(_("Enter a public HTTPS webhook URL ending with this connection's route."))
+
+    def _compute_webhook_signature_key(self):
+        self.webhook_signature_key = False
+
+    def _inverse_webhook_signature_key(self):
+        for connection in self.filtered("webhook_signature_key"):
+            encrypted = self._square_online_encrypt(connection.webhook_signature_key)
+            super(SquareOnlineConnection, connection).write({"webhook_signature_key_encrypted": encrypted})
+            connection.invalidate_recordset(["webhook_signature_key"])
+
+    def _square_online_webhook_authenticated(self, signature, body):
+        self.ensure_one()
+        if not self.webhook_notification_url or not self.webhook_signature_key_encrypted:
+            return False
+        try:
+            key = self._square_online_decrypt(self.webhook_signature_key_encrypted)
+        except UserError:
+            return False
+        signed = self.webhook_notification_url.encode() + body
+        expected = base64.b64encode(hmac.digest(key.encode(), signed, "sha256"))
+        return hmac.compare_digest(expected, signature.encode())
 
     @api.depends("location_id")
     def _compute_location_locked(self):
@@ -397,3 +454,11 @@ class SquareOnlineConnection(models.Model):
         return square_request(
             self.environment, method, path, token=token, payload=payload, params=params,
         )
+
+    def _square_online_get_payment(self, payment_id):
+        self.ensure_one()
+        if not isinstance(payment_id, str) or not payment_id or payment_id in (".", ".."):
+            return False
+        result = self._square_online_request("GET", "/v2/payments/" + quote(payment_id, safe=""))
+        payment = result.get("payment")
+        return payment if isinstance(payment, dict) and payment.get("id") == payment_id else False

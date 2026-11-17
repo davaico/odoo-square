@@ -11,6 +11,7 @@ SQUARE_HOSTS = {
     "production": "https://connect.squareup.com",
 }
 OAUTH_CALLBACK_PATH = "/payment/square_online/oauth/callback"
+SQUARE_ONLINE_WEBHOOK_PATH = "/payment/square_online/webhook"
 OAUTH_SCOPES = ("MERCHANT_PROFILE_READ", "PAYMENTS_READ", "PAYMENTS_WRITE")
 CURRENCY_BY_COUNTRY = {
     "AU": "AUD",

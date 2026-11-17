@@ -55,3 +55,22 @@ Square processes in the location's currency and the checkout currency must match
 Square requires a Content Security Policy on the checkout page. Configure the checkout host to allow the selected environment's Square SDK and its frame, network, stylesheet, and font origins. Check that the policy also allows your Odoo assets. [Square Web Payments SDK security policy](https://developer.squareup.com/docs/web-payments/content-security-policy)
 
 The automated checkout tests simulate Square's SDK and API. Use Square Sandbox to qualify your store's actual card form, authentication, and capture.
+
+## Set up Square webhooks
+
+1. Open a saved Square connection in Odoo. Copy its **Webhook Route** and add the public HTTPS origin that routes to this Odoo database. For example, join `https://shop.example.com` with `/payment/square_online/webhook/1`.
+2. In the Square Developer Console, select the application's environment and open **Webhooks → Subscriptions**. Create a subscription with that notification URL in the same Sandbox or Production environment as the connection. Choose Square API version `2026-09-16` and select `payment.created` and `payment.updated`.
+3. Enter the exact subscription URL in Odoo's **Webhook Notification URL** field and paste the subscription's **Webhook Signature Key**. Save the connection. Odoo checks the signature against that exact URL and the unmodified request body, so preserve the POST body through the reverse proxy. Copy the replacement key to Odoo when rotating the subscription key.
+4. Complete a Sandbox checkout and verify both the event delivery in Square and the corresponding transaction in Odoo. Keep the subscriptions for historical connections while their transactions may still need reconciliation. To turn off an endpoint in Odoo, clear its notification URL.
+
+[Square webhook subscriptions](https://developer.squareup.com/docs/webhooks/step2subscribe) · [Square notification signatures](https://developer.squareup.com/docs/webhooks/step3validate)
+
+## Recover and review online payments
+
+A processing payment can complete after the shopper closes the page. Odoo records the original attempt before contacting Square. A signed Square notification can update it, and a scheduled check runs every five minutes. A payment stays processing if Odoo cannot verify its outcome. The shopper can check the payment status in their checkout session or on their own portal order.
+
+Accounting managers and administrators can open **Invoicing → Configuration → Online Payments → Square Payment History** for their companies. Open a transaction to see the order, captured amount, payment status, and latest status check. Use **Refresh status** to look up the existing payment with its original Square connection and location. Refresh and the scheduled check only retrieve payment data from Square. If the check requests reauthorization, use **Authorize with Square** on the original connection for the same merchant, then refresh again.
+
+If Square captured the payment after the Odoo order was cancelled or changed, Odoo records the incoming payment and flags the transaction and order for review. Leave fulfillment on hold while reviewing the payment and order. Resolve the amount collected with the shopper and, if money needs to be returned, handle that as a separate refund.
+
+The deterministic recovery tests simulate Square API responses and sign representative notifications with a test key. Use a Square Sandbox account and the public HTTPS endpoint to verify actual checkout and webhook delivery.
