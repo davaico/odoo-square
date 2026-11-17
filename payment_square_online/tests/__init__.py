@@ -5,3 +5,4 @@ from . import test_oauth_concurrency
 
 from . import test_checkout
 from . import test_recovery
+from . import test_markets

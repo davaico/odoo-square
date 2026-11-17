@@ -31,11 +31,19 @@ Use the same key for all Odoo processes serving the database. Back it up private
 
 ## Configure the payment provider
 
-1. Return to **Square Online → Credentials** and choose your **Sandbox Connection**. Under **Configuration**, choose a bank **Payment Journal** from the same Odoo company. If the journal has a fixed currency, it must match the location. You can also use a journal with no fixed currency.
+1. Return to **Square Online → Credentials** and choose your **Sandbox Connection**. Under **Configuration**, choose a bank **Payment Journal** from the same Odoo company. Follow the currency rules below when selecting the journal.
 2. Set the provider to **Test Mode**. Select a **Website** beside the provider state if the provider should only appear on that website. Odoo shows this field when the user has multi-website access. Use the normal Odoo **Published** control to make the provider available to shoppers.
 3. When ready to use live payments, configure the application's **Production** OAuth settings separately with an HTTPS URL and production credentials. Create a separate **Production** connection, authorize the production seller, choose its location, and assign it as the provider's **Production Connection**. Review the company, journal, website, and location before switching the provider to **Enabled**. To stop offering Square, set the provider to **Disabled**.
 
-Square processes in the location's currency and the checkout currency must match. Square's card-processing markets are Australia (AUD), Canada (CAD), France, Ireland and Spain (EUR), Japan (JPY), the United Kingdom (GBP), and the United States (USD). Card approval for international shoppers depends on Square and their card issuers. [Square international development](https://developer.squareup.com/docs/international-development)
+## Companies, websites, and currencies
+
+For another company or a website that needs a different Square location, open an existing **Square Online** provider and choose **Duplicate** from the action menu. Set the duplicate's **Company** and **Website** before assigning its connection and journal. The connection and journal must belong to the same company as the provider. Leave **Website** blank to allow eligible checkouts across that company's websites, or select one website to restrict the provider to it.
+
+Square supports card processing for sellers in Australia (AUD), Canada (CAD), France, Ireland and Spain (EUR), Japan (JPY), the United Kingdom (GBP), and the United States (USD). Buyers can shop internationally using cards accepted by Square and approved by their issuer. Leave the provider's **Countries** field blank to offer Square to eligible buyers regardless of billing country. [Square international development](https://developer.squareup.com/docs/international-development)
+
+Square charges the full checkout total, including tax and shipping, in the location's processing currency. Activate that currency in Odoo and use a website pricelist that uses it. Checkout hides Square when the cart currency differs from the selected location's currency. Customers can use a compatible pricelist or choose another payment method. If the currency matches and Square is still missing, check that the provider is published, active for the correct environment, and available on the shopper’s website and its Odoo company.
+
+A bank journal with a fixed currency requires that currency to match the Square location. Leave the journal currency blank if it will handle multiple active currencies. The Odoo company can keep a different base currency. Odoo records the original payment currency and converts balances into the company's base currency using its configured exchange rates. [Odoo multi-currency accounting](https://www.odoo.com/documentation/19.0/applications/finance/accounting/get_started/multi_currency.html)
 
 ## Renew and reconnect Square authorization
 

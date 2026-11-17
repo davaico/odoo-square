@@ -1,5 +1,5 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
-from odoo import _, api, fields, models
+from odoo import _, api, Command, fields, models
 from odoo.exceptions import AccessError, ValidationError
 from odoo.http import request
 
@@ -27,6 +27,35 @@ class PaymentProvider(models.Model):
         "square.online.connection", string="Production Connection", check_company=True,
         groups="base.group_system", copy=False, ondelete="restrict",
     )
+
+    def copy_data(self, default=None):
+        values_list = super().copy_data(default=default)
+        if not default or "payment_method_ids" not in default:
+            for provider, values in zip(self.with_context(active_test=False), values_list):
+                if values is not None and provider.code == "square_online":
+                    # Card may still be inactive when an administrator duplicates the provider.
+                    methods = provider.payment_method_ids._filtered_access("read")
+                    values["payment_method_ids"] = [Command.set(methods.ids)]
+        return values_list
+
+    def write(self, vals):
+        # Odoo resets provider codes during module removal, before the registry is ready.
+        if self.env.registry.ready and {"company_id", "code"} & vals.keys():
+            changing = self.filtered(lambda provider: provider.code == "square_online" and (
+                vals.get("company_id", provider.company_id.id) != provider.company_id.id
+                or vals.get("code", provider.code) != provider.code
+            ))
+            if changing:
+                changing.check_access("write")
+                if self.env["payment.transaction"].sudo().search_count([
+                    ("provider_id", "in", changing.ids),
+                    ("square_online_connection_id", "!=", False),
+                ], limit=1):
+                    raise ValidationError(_(
+                        "A Square provider with payment transactions must keep its company and provider type. "
+                        "Duplicate the provider to configure a different company."
+                    ))
+        return super().write(vals)
 
     def _get_default_payment_method_codes(self):
         self.ensure_one()
