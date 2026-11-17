@@ -45,11 +45,14 @@ Square charges the full checkout total, including tax and shipping, in the locat
 
 A bank journal with a fixed currency requires that currency to match the Square location. Leave the journal currency blank if it will handle multiple active currencies. The Odoo company can keep a different base currency. Odoo records the original payment currency and converts balances into the company's base currency using its configured exchange rates. [Odoo multi-currency accounting](https://www.odoo.com/documentation/19.0/applications/finance/accounting/get_started/multi_currency.html)
 
-## Troubleshoot authorization
+## Renew and reconnect Square authorization
 
-- An invalid or expired link requires a new **Authorize with Square** attempt. Complete it in the same Odoo administrator session that started it.
-- If Square denies authorization or the account has no eligible location, review the result in the connection form. In Sandbox, open the test seller dashboard before starting the authorization.
-- To authorize the same merchant again, open the existing connection and select **Authorize with Square**. Create a new connection for a different merchant, application, environment, or location.
+Odoo renews the merchant's OAuth access automatically, generally every seven days, and checks again when it needs a Square API token. This works independently for Sandbox and Production, including connections kept for historical payments. A temporary Square outage can delay renewal. Odoo keeps using the current access token while it is valid.
+
+- In **Manage Square Connections**, check **Authorization Status** and **Token Expires At**. If Odoo shows **Reauthorization required**, open that connection, select **Authorize with Square**, and sign in as its original merchant in the same environment. An expired authorization link requires a new attempt in the same Odoo administrator session that started it.
+- A different merchant, application, environment, or location needs a new connection. Assign it to the provider for future checkout. Keep the original connection and access to its Square merchant for past payments, status checks, and refunds. A payment already processing stays tied to the original connection and location.
+- If you no longer have access to the original merchant, ask that merchant's administrator to restore authorization on the original connection. Use **Refresh status** on the existing payment once access is restored. A new connection cannot retrieve operations for the previous merchant.
+- If Square denies authorization or the account has no eligible location, review **Last authorization result** in the connection form. In Sandbox, open the test seller dashboard before starting authorization.
 - Configure reverse proxies and external request loggers to omit query strings for the OAuth callback path. Odoo redacts that path's query string from its Werkzeug access log. Use normal production log levels to keep RPC inputs and credentials out of diagnostics.
 
 ## Make a sandbox payment
@@ -67,7 +70,7 @@ The automated checkout tests simulate Square's SDK and API. Use Square Sandbox t
 ## Set up Square webhooks
 
 1. Open a saved Square connection in Odoo. Copy its **Webhook Route** and add the public HTTPS origin that routes to this Odoo database. For example, join `https://shop.example.com` with `/payment/square_online/webhook/1`.
-2. In the Square Developer Console, select the application's environment and open **Webhooks → Subscriptions**. Create a subscription with that notification URL in the same Sandbox or Production environment as the connection. Choose Square API version `2026-09-16` and select `payment.created`, `payment.updated`, `refund.created`, and `refund.updated`.
+2. In the Square Developer Console, select the application's environment and open **Webhooks → Subscriptions**. Create a subscription with that notification URL in the same Sandbox or Production environment as the connection. Choose Square API version `2026-09-16` and select `payment.created`, `payment.updated`, `refund.created`, `refund.updated`, and `oauth.authorization.revoked`.
 3. Enter the exact subscription URL in Odoo's **Webhook Notification URL** field and paste the subscription's **Webhook Signature Key**. Save the connection. Odoo checks the signature against that exact URL and the unmodified request body, so preserve the POST body through the reverse proxy. Copy the replacement key to Odoo when rotating the subscription key.
 4. Complete a Sandbox checkout and verify both the event delivery in Square and the corresponding transaction in Odoo. Keep the subscriptions for historical connections while their transactions may still need reconciliation. To turn off an endpoint in Odoo, clear its notification URL.
 
@@ -77,7 +80,7 @@ The automated checkout tests simulate Square's SDK and API. Use Square Sandbox t
 
 A processing payment can complete after the shopper closes the page. Odoo records the original attempt before contacting Square. A signed Square notification can update it, and a scheduled check runs every five minutes. A payment stays processing if Odoo cannot verify its outcome. The shopper can check the payment status in their checkout session or on their own portal order.
 
-Accounting managers and administrators can open **Invoicing → Configuration → Online Payments → Square Payment History** for their companies. Open a transaction to see the order, captured amount, payment status, and latest status check. Use **Refresh status** to look up the existing payment with its original Square connection and location. Refresh and the scheduled check only retrieve payment data from Square. If the check requests reauthorization, use **Authorize with Square** on the original connection for the same merchant, then refresh again.
+Accounting managers and administrators can open **Invoicing → Configuration → Online Payments → Square Payment History** for their companies. Open a transaction to see the order, captured amount, payment status, and latest status check. Use **Refresh status** to look up the existing payment with its original Square connection and location. Refresh and the scheduled check retrieve existing payment data. They can renew OAuth access to perform those reads. If the check requests reauthorization, use **Authorize with Square** on the original connection for the same merchant, then refresh again.
 
 If Square captured the payment after the Odoo order was cancelled or changed, Odoo records the incoming payment and flags the transaction and order for review. Leave fulfillment on hold while reviewing the payment and order. Resolve the amount collected with the shopper and, if money needs to be returned, handle that as a separate refund.
 
@@ -89,7 +92,7 @@ Accounting managers and administrators can refund captured Square payments in th
 
 1. In Odoo Accounting, open the posted customer payment for the website order and select **Refund**. The wizard shows the full available amount after completed and pending refunds.
 2. Confirm **Refund**, then open **Square Payment History** and select the linked refund transaction. The history shows the refund amount, the original transaction, who requested the refund, its status, and the Square refund ID once verified.
-3. While queued, the refund reserves the amount. The scheduled dispatch sends it through the original Square connection against the original payment, even if the provider was disabled or reconfigured. If the outcome remains pending, use **Refresh status** to check the existing request. If Odoo requests reauthorization, reconnect the original Square account.
+3. While queued, the refund reserves the amount. The scheduled dispatch sends it through the original Square connection against the original payment, even if the provider was disabled or reconfigured. After dispatch, if the outcome remains pending, use **Refresh status** to check the existing request. If Odoo requests reauthorization, reconnect the original Square account.
 4. A completed refund creates a posted outbound customer payment in the original journal and currency. Confirm the refund in Square Sandbox and check the related outbound payment in Odoo. Create and reconcile any required credit note separately in Accounting. Process any return of goods separately in Inventory.
 
 Cancelling an order leaves any decision to refund with Accounting.

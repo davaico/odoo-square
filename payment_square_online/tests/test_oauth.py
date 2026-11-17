@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+from odoo import fields
 from odoo.exceptions import AccessError, ValidationError
 from odoo.tests import Form, HttpCase, tagged
 from odoo.tests.common import new_test_user
@@ -252,6 +253,83 @@ class TestSquareOnlineOAuth(HttpCase):
         self.assertEqual(provider.state, "enabled")
         provider.state = "disabled"
         self.assertEqual(provider.state, "disabled")
+
+    @patch(square_boundary)
+    def test_scheduled_renewal_isolates_environments_and_preserves_usable_access(self, external):
+        sandbox = self._create_connection()
+        production = self._create_connection("production")
+        _, sandbox_state = self._start(sandbox)
+        _, production_state = self._start(production)
+        production_merchant = "PRODUCTION_MERCHANT"
+        external.side_effect = [
+            self._square_response(self._token()),
+            self._square_response(self._locations()),
+            self._square_response({
+                **self._token(production_merchant),
+                "access_token": "production-original", "refresh_token": "production-refresh",
+            }),
+            self._square_response({
+                "client_id": production.application_id,
+                "merchant_id": production_merchant,
+                "scopes": ["MERCHANT_PROFILE_READ", "PAYMENTS_READ", "PAYMENTS_WRITE"],
+            }),
+            self._square_response(self._locations(production_merchant)),
+        ]
+        self.assertEqual(self._callback(state=sandbox_state, code="sandbox-code").status_code, 303)
+        self.assertEqual(self._callback(state=production_state, code="production-code").status_code, 303)
+        sandbox.location_id = sandbox.available_location_ids
+        production.location_id = production.available_location_ids
+        sandbox_before, production_before = sandbox.access_token, production.access_token
+        expiry = fields.Datetime.subtract(fields.Datetime.now(), minutes=1)
+        self.env.flush_all()
+        self.env.cr.execute(
+            "UPDATE square_online_connection SET oauth_refresh_after = %s WHERE id IN %s",
+            (expiry, (sandbox.id, production.id)),
+        )
+        self.env.invalidate_all()
+        external.reset_mock()
+
+        def renew(method, url, *, json, **kwargs):
+            self.assertEqual(method, "POST")
+            if url == f"{self.sandbox_host}/oauth2/token":
+                self.assertEqual(json["client_id"], sandbox.application_id)
+                self.assertEqual(json["client_secret"], "square-sandbox-application-secret")
+                self.assertEqual(json["refresh_token"], "square-test-refresh-token")
+                return self._square_response({**self._token(), "access_token": "sandbox-renewed"})
+            self.assertEqual(url, f"{self.production_host}/oauth2/token")
+            self.assertEqual(json["client_id"], production.application_id)
+            self.assertEqual(json["client_secret"], "square-production-application-secret")
+            self.assertEqual(json["refresh_token"], "production-refresh")
+            return self._square_response({"error": "invalid_grant", "error_description": "private"}, 400)
+
+        external.side_effect = renew
+        self.env.ref("payment_square_online.cron_square_online_renew_access").method_direct_trigger()
+        self.env.invalidate_all()
+        self.assertEqual(external.call_count, 2)
+        self.assertNotEqual(sandbox.access_token, sandbox_before)
+        self.assertEqual(sandbox.oauth_health, "authorized")
+        self.assertEqual(production.access_token, production_before)
+        self.assertEqual(production.merchant_id, production_merchant)
+        self.assertEqual(production.oauth_health, "reconnect")
+        self.assertGreater(production.token_expires_at, fields.Datetime.now())
+
+        # A connection marked for reauthorization must still stop accepting payments
+        # when its last usable token reaches expiry.
+        self.env.cr.execute(
+            "UPDATE square_online_connection SET token_expires_at = %s WHERE id = %s",
+            (expiry, production.id),
+        )
+        self.env.invalidate_all()
+        provider = self.env.ref("payment_square_online.payment_provider_square_online")
+        journal = self.env["account.journal"].search([
+            ("company_id", "=", provider.company_id.id), ("type", "=", "bank"),
+        ], limit=1)
+        with self.assertRaises(ValidationError), self.env.cr.savepoint():
+            provider.write({
+                "square_online_production_connection_id": production.id,
+                "journal_id": journal.id,
+                "state": "enabled",
+            })
 
     def test_direct_setup_and_credentials_require_an_administrator_in_the_owner_company(self):
         other_company = self.env["res.company"].create({"name": "Separate Merchant"})

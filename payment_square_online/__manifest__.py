@@ -19,6 +19,7 @@
         "data/payment_provider_data.xml",
         "data/payment_recovery_data.xml",
         "data/payment_refund_data.xml",
+        "data/square_online_connection_data.xml",
     ],
     "assets": {
         "web.assets_frontend": [

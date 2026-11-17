@@ -38,6 +38,11 @@ class SquareOnlineWebhook(Controller):
             return request.make_response("")
         data = event.get("data")
         object_data = data.get("object") if isinstance(data, dict) else None
+        if event["type"] == "oauth.authorization.revoked":
+            revocation = object_data.get("revocation") if isinstance(object_data, dict) else None
+            if isinstance(revocation, dict) and data.get("type") == "revocation" and data.get("id"):
+                connection._square_online_authorization_revoked(revocation.get("revoked_at"))
+            return request.make_response("")
         resource_type = event["type"].partition(".")[0]
         resource = object_data.get(resource_type) if isinstance(object_data, dict) else None
         if isinstance(resource, dict) and resource.get("id") and resource["id"] == data.get("id"):

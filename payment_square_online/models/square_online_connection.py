@@ -9,9 +9,11 @@ from datetime import UTC, datetime
 from urllib.parse import quote, urlencode, urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
+from psycopg2.errors import SerializationFailure
 
-from odoo import _, api, fields, models
+from odoo import SUPERUSER_ID, _, api, fields, models
 from odoo.exceptions import AccessError, UserError, ValidationError
+from odoo.fields import Domain
 from odoo.http import request
 from odoo.tools import SQL
 
@@ -42,6 +44,10 @@ _SYSTEM_FIELDS = {
     "merchant_id": False,
     "token_expires_at": False,
     "oauth_status_message": False,
+    "oauth_authorized_at": False,
+    "oauth_refresh_after": False,
+    "oauth_refresh_retry_at": False,
+    "oauth_reconnect_required": False,
 }
 _IDENTITY_FIELDS = ("company_id", "environment", "application_id")
 
@@ -94,6 +100,19 @@ class SquareOnlineConnection(models.Model):
     location_country_code = fields.Char(related="location_id.country_code")
     location_currency_code = fields.Char(related="location_id.currency_code")
     oauth_status_message = fields.Char(string="Last authorization result", copy=False, readonly=True)
+    oauth_health = fields.Selection(
+        [
+            ("not_connected", "Not authorized"),
+            ("authorized", "Authorized"),
+            ("expired", "Access expired — renewal pending"),
+            ("reconnect", "Reauthorization required"),
+        ],
+        string="Authorization Status", compute="_compute_oauth_health",
+    )
+    oauth_authorized_at = fields.Datetime(copy=False, groups="base.group_system")
+    oauth_refresh_after = fields.Datetime(copy=False)
+    oauth_refresh_retry_at = fields.Datetime(copy=False)
+    oauth_reconnect_required = fields.Boolean(copy=False, readonly=True)
     oauth_state_hash = fields.Char(copy=False, groups="base.group_system", index=True)
     oauth_user_id = fields.Many2one("res.users", copy=False, groups="base.group_system")
     oauth_session_hash = fields.Char(copy=False, groups="base.group_system")
@@ -180,6 +199,19 @@ class SquareOnlineConnection(models.Model):
     def _compute_location_locked(self):
         for connection in self:
             connection.location_locked = bool(connection._origin.location_id)
+
+    @api.depends("merchant_id", "token_expires_at", "oauth_reconnect_required")
+    def _compute_oauth_health(self):
+        now = fields.Datetime.now()
+        for connection in self:
+            if connection.oauth_reconnect_required:
+                connection.oauth_health = "reconnect"
+            elif not connection.merchant_id:
+                connection.oauth_health = "not_connected"
+            elif not connection.token_expires_at or connection.token_expires_at <= now:
+                connection.oauth_health = "expired"
+            else:
+                connection.oauth_health = "authorized"
 
     def _compute_redirect_uri(self):
         base_url = self.env["ir.config_parameter"].sudo().get_param("web.base.url", "")
@@ -282,10 +314,7 @@ class SquareOnlineConnection(models.Model):
             return connection
 
         # Serialize callback consumption so only one request can exchange the code.
-        self.env.cr.execute(SQL(
-            "SELECT id FROM %s WHERE id = %s FOR UPDATE",
-            SQL.identifier(self._table), connection.id,
-        ))
+        connection._square_online_lock_credentials()
         connection.invalidate_recordset(list(_OAUTH_FIELDS))
         if (
             connection.oauth_state_hash != state_hash
@@ -307,6 +336,7 @@ class SquareOnlineConnection(models.Model):
         return connection
 
     def _square_online_authorize(self, code):
+        authorized_at = datetime.now(UTC).replace(tzinfo=None)
         try:
             token = square_request(self.environment, "POST", "/oauth2/token", payload={
                 "grant_type": "authorization_code",
@@ -326,7 +356,11 @@ class SquareOnlineConnection(models.Model):
 
         selected_location = self.location_id
         self._square_online_store_locations(locations)
-        super().write(token_values)
+        super().write({
+            **token_values,
+            "oauth_authorized_at": authorized_at,
+            "oauth_reconnect_required": False,
+        })
         if selected_location and not selected_location.available_for_payment:
             return _("Square authorized the merchant. The selected location is unavailable for card payments.")
         if not self.available_location_ids.filtered("available_for_payment"):
@@ -350,11 +384,17 @@ class SquareOnlineConnection(models.Model):
             or not all(isinstance(value, str) and value for value in (merchant_id, access_token, refresh_token))
         ):
             raise SquareAPIError()
+        expires_at = expires_at.astimezone(UTC).replace(tzinfo=None)
         return {
             "merchant_id": merchant_id,
             "access_token": self._square_online_encrypt(access_token),
             "refresh_token": self._square_online_encrypt(refresh_token),
-            "token_expires_at": expires_at.astimezone(UTC).replace(tzinfo=None),
+            "token_expires_at": expires_at,
+            "oauth_refresh_after": min(
+                fields.Datetime.add(fields.Datetime.now(), days=7),
+                fields.Datetime.subtract(expires_at, hours=1),
+            ),
+            "oauth_refresh_retry_at": False,
         }
 
     def _square_online_check_scopes(self, merchant_id, access_token):
@@ -428,15 +468,40 @@ class SquareOnlineConnection(models.Model):
 
         (stored_locations - available_locations).write({"available_for_payment": False})
 
+    def _square_online_current_access(self, now):
+        if self.access_token and self.token_expires_at and self.token_expires_at > now:
+            try:
+                return self._square_online_decrypt(self.access_token)
+            except UserError:
+                return False
+        return False
+
+    def _square_online_can_renew(self, now):
+        return (
+            self.merchant_id and not self.oauth_reconnect_required
+            and (not self.oauth_refresh_retry_at or self.oauth_refresh_retry_at <= now)
+        )
+
+    def _square_online_needs_renewal(self, now):
+        return self._square_online_can_renew(now) and (
+            not self.oauth_refresh_after or self.oauth_refresh_after <= now
+            or not self.token_expires_at or self.token_expires_at <= now
+        )
+
     def _square_online_is_ready(self):
         self.ensure_one()
+        if not (self.merchant_id and self.location_id.available_for_payment):
+            return False
+        now = fields.Datetime.now()
+        if self._square_online_current_access(now):
+            return True
         if not (
-            self.merchant_id and self.location_id.available_for_payment and self.access_token
-            and self.token_expires_at and self.token_expires_at > fields.Datetime.now()
+            self._square_online_can_renew(now) and self.refresh_token and self.application_secret_encrypted
         ):
             return False
         try:
-            self._square_online_decrypt(self.access_token)
+            self._square_online_decrypt(self.refresh_token)
+            self._square_online_decrypt(self.application_secret_encrypted)
         except UserError:
             return False
         return True
@@ -445,15 +510,135 @@ class SquareOnlineConnection(models.Model):
         self.ensure_one()
         if not path.startswith("/v2/"):
             raise ValueError("Expected a Square v2 API path.")
-        if not self.access_token or not self.token_expires_at or self.token_expires_at <= fields.Datetime.now():
-            raise SquareAPIError(401)
+        for attempt in range(2):
+            encrypted, token = self._square_online_sync_access()
+            try:
+                return square_request(
+                    self.environment, method, path, token=token, payload=payload, params=params,
+                )
+            except SquareAPIError as error:
+                expired = "ACCESS_TOKEN_EXPIRED" in error.codes
+                if error.authorization_failed:
+                    self._square_online_sync_access(rejected_access=encrypted, expired=expired)
+                # Only a read can be repeated after Square rejects an access token.
+                if not (expired and method == "GET" and attempt == 0):
+                    raise
+
+    def _square_online_lock_credentials(self):
+        # A payment's foreign key can still reference this connection while it is locked.
+        self.env.cr.execute(SQL(
+            "SELECT id FROM %s WHERE id = %s FOR NO KEY UPDATE",
+            SQL.identifier(self._table), self.id,
+        ))
+
+    def _square_online_authorization_revoked(self, revoked_at):
+        self.ensure_one()
         try:
-            token = self._square_online_decrypt(self.access_token)
+            revoked_at = datetime.fromisoformat(revoked_at)
+        except (TypeError, ValueError):
+            return
+        if revoked_at.tzinfo is None:
+            return
+        self._square_online_lock_credentials()
+        revoked_at = revoked_at.astimezone(UTC).replace(tzinfo=None)
+        if self.oauth_authorized_at and revoked_at < self.oauth_authorized_at:
+            return  # A retry of an old notification must leave newer authorization usable.
+        if self.access_token or not self.oauth_reconnect_required:
+            self._square_online_require_reconnect(clear_access=True)
+
+    def _square_online_require_reconnect(self, *, clear_access=False):
+        values = {"oauth_reconnect_required": True, "oauth_refresh_retry_at": False}
+        if clear_access:
+            values.update({"access_token": False, "token_expires_at": False})
+        super().write(values)
+
+    def _square_online_sync_access(self, *, rejected_access=None, expired=False):
+        # Keep credential changes independent of financial requests and their savepoints.
+        for _attempt in range(3):
+            with self.env.registry.cursor() as cr:
+                connection = api.Environment(cr, SUPERUSER_ID, {})[self._name].browse(self.id).exists()
+                if not connection:
+                    raise SquareAPIError(401)
+                now = fields.Datetime.now()
+                if rejected_access or connection._square_online_needs_renewal(now):
+                    try:
+                        connection._square_online_lock_credentials()
+                    except SerializationFailure:
+                        # A concurrent update won. Read its result in a fresh snapshot.
+                        cr.rollback()
+                        continue
+                    if rejected_access:
+                        # The response belongs to the token sent, which may have since changed.
+                        if connection.access_token == rejected_access:
+                            if expired:
+                                super(SquareOnlineConnection, connection).write({
+                                    "token_expires_at": now,
+                                    "oauth_refresh_after": False,
+                                    "oauth_refresh_retry_at": False,
+                                })
+                            else:
+                                connection._square_online_require_reconnect(clear_access=True)
+                        return
+                    connection._square_online_renew_access()
+                token = connection._square_online_current_access(fields.Datetime.now())
+                if token:
+                    return connection.access_token, token
+                status_code = 503 if connection.oauth_refresh_retry_at else 401
+            raise SquareAPIError(status_code)
+        raise SquareAPIError(503)
+
+    def _square_online_renew_access(self):
+        if not (self.refresh_token and self.application_secret_encrypted):
+            self._square_online_require_reconnect()
+            return
+        try:
+            token = square_request(self.environment, "POST", "/oauth2/token", payload={
+                "grant_type": "refresh_token",
+                "client_id": self.application_id,
+                "client_secret": self._square_online_decrypt(self.application_secret_encrypted),
+                "refresh_token": self._square_online_decrypt(self.refresh_token),
+            })
+            token_values = self._square_online_token_values(token)
         except UserError:
-            raise SquareAPIError(401) from None
-        return square_request(
-            self.environment, method, path, token=token, payload=payload, params=params,
+            self._square_online_require_reconnect()
+            return
+        except SquareAPIError as error:
+            if error.status_code in (400, 401, 403):
+                self._square_online_require_reconnect(clear_access="ACCESS_TOKEN_REVOKED" in error.codes)
+            else:
+                super().write({
+                    "oauth_refresh_retry_at": fields.Datetime.add(fields.Datetime.now(), minutes=5),
+                })
+            return
+        if token_values["merchant_id"] != self.merchant_id:
+            self._square_online_require_reconnect()
+            return
+        super().write(token_values)
+
+    @api.model
+    def _cron_square_online_renew_access(self):
+        now = fields.Datetime.now()
+        domain = Domain([
+            ("merchant_id", "!=", False),
+            ("oauth_reconnect_required", "=", False),
+        ]) & (
+            Domain("oauth_refresh_retry_at", "=", False) | Domain("oauth_refresh_retry_at", "<=", now)
+        ) & (
+            Domain("oauth_refresh_after", "=", False) | Domain("oauth_refresh_after", "<=", now)
+            | Domain("token_expires_at", "=", False) | Domain("token_expires_at", "<=", now)
         )
+        cron = self.env["ir.cron"]
+        connections = self.search(domain, limit=20, order="oauth_refresh_after asc nulls first, id")
+        if not cron._commit_progress(remaining=self.search_count(domain)):
+            return
+        for connection in connections:
+            try:
+                connection._square_online_sync_access()
+            except SquareAPIError:
+                # The attempt records retry timing or guidance on this connection.
+                pass
+            if not cron._commit_progress(1):
+                break
 
     def _square_online_get_payment(self, payment_id):
         self.ensure_one()
