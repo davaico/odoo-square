@@ -232,7 +232,7 @@ class PaymentTransaction(models.Model):
             return False
         if self.state != 'pending':
             return self.provider_reference == payment_id
-        self.provider_reference = payment_id
+        self.write({'provider_reference': payment_id, 'square_recovery_message': False})
         if status == 'COMPLETED':
             self._set_done()
         elif status == 'CANCELED':

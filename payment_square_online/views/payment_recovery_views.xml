@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="payment_provider_form_square_webhooks" model="ir.ui.view">
+        <field name="name">payment.provider.form.square.webhooks</field>
+        <field name="model">payment.provider</field>
+        <field name="inherit_id" ref="payment.payment_provider_form"/>
+        <field name="arch" type="xml">
+            <group name="provider_credentials" position="inside">
+                <group string="Square Webhooks" invisible="code != 'square_online'" groups="base.group_system">
+                    <field name="square_webhook_endpoint" widget="CopyClipboardChar"/>
+                    <field name="square_webhook_url"/>
+                    <field name="square_webhook_signature_key" password="True"/>
+                    <field name="square_has_webhook_signature_key"/>
+                </group>
+            </group>
+        </field>
+    </record>
+
+    <record id="payment_transaction_form_square_recovery" model="ir.ui.view">
+        <field name="name">payment.transaction.form.square.recovery</field>
+        <field name="model">payment.transaction</field>
+        <field name="inherit_id" ref="payment.payment_transaction_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//header/field[@name='state']" position="before">
+                <field name="square_reserved_at" invisible="1"/>
+                <button name="action_square_refresh_status" type="object" string="Refresh status"
+                        invisible="provider_code != 'square_online' or not square_reserved_at"
+                        groups="account.group_account_manager,base.group_system"/>
+            </xpath>
+            <xpath expr="//group[@name='transaction_details']" position="after">
+                <group string="Square Payment Details" invisible="provider_code != 'square_online'">
+                    <field name="square_order_id"/>
+                    <field name="square_environment"/>
+                    <field name="square_merchant_id"/>
+                    <field name="square_location_ref"/>
+                    <field name="square_recovery_message" invisible="not square_recovery_message"/>
+                </group>
+            </xpath>
+            <xpath expr="//group[@name='transaction_details']/.." position="before">
+                <field name="square_paid_cancelled_order" invisible="1"/>
+                <div class="alert alert-warning" role="alert" invisible="not square_paid_cancelled_order">
+                    Square collected this payment for a cancelled order. Review the payment and any refunds before resolving the order.
+                </div>
+            </xpath>
+        </field>
+    </record>
+
+    <record id="action_square_payment_history" model="ir.actions.act_window">
+        <field name="name">Square Payment History</field>
+        <field name="res_model">payment.transaction</field>
+        <field name="view_mode">list,form</field>
+        <field name="domain">[('provider_code', '=', 'square_online'), ('square_reserved_at', '!=', False)]</field>
+    </record>
+
+    <menuitem id="square_payment_history_menu" parent="account.root_payment_menu" action="action_square_payment_history"
+              sequence="30" groups="account.group_account_manager,base.group_system"/>
+
+    <template id="sale_order_portal_square_payment_mismatch" inherit_id="sale.sale_order_portal_template">
+        <xpath expr="//div[@id='portal_sale_content']" position="before">
+            <div t-if="sale_order.get_portal_last_transaction().square_paid_cancelled_order"
+                 class="alert alert-warning d-print-none" role="alert">
+                Square collected your payment. Please contact us about this order.
+            </div>
+        </xpath>
+    </template>
+</odoo>

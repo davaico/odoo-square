@@ -149,8 +149,9 @@ class SquarePaymentPortal(PaymentPortal):
 
     @staticmethod
     def _square_lock_attempt(cr, transaction_id):
-        cr.execute('SELECT id FROM payment_transaction WHERE id = %s FOR NO KEY UPDATE', [transaction_id])
-        return api.Environment(cr, request.env.uid, request.env.context)['payment.transaction'].sudo().browse(transaction_id)
+        tx = api.Environment(cr, request.env.uid, request.env.context)['payment.transaction'].sudo().browse(transaction_id)
+        tx._square_lock_for_status()
+        return tx
 
     @staticmethod
     def _square_create_order(environment, access_token, reference, location, money):

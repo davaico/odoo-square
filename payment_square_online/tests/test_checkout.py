@@ -1,5 +1,7 @@
+import hmac
 import json
 import os
+from base64 import b64encode
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -244,6 +246,261 @@ class TestSquareCheckout(HttpCase):
         self.assertEqual(self._result('/payment/status/poll')['state'], 'pending')
         self.assertIn(order.state, ('draft', 'sent'))
         self.assertFalse(order.transaction_ids.payment_id)
+
+    def test_refresh_recovers_a_timed_out_payment_from_a_later_square_page(self):
+        order = self._cart()
+        values = self._prepare(order)
+        accepted = {}
+        now_visible = False
+
+        def square(method, url, **kwargs):
+            if method == 'POST':
+                response = self._square_response(method, url, **kwargs)
+                if url.endswith('/v2/payments'):
+                    accepted.update(response.json()['payment'])
+                    raise Timeout('Square accepted the payment before the response was lost')
+                return response
+            self.assertEqual(method, 'GET')
+            self.assertTrue(url.endswith('/v2/payments'))
+            self.assertEqual(kwargs['params']['location_id'], 'TESTNYC')
+            self.assertEqual(kwargs['headers']['Authorization'], 'Bearer test-access-token')
+            result = {'payments': [{**accepted, 'id': 'UNRELATED', 'reference_id': 'other-payment'}]}
+            if now_visible:
+                result = ({'payments': [accepted]} if kwargs['params'].get('cursor') == 'next-square-page'
+                          else {**result, 'cursor': 'next-square-page'})
+            response = Response()
+            response.status_code = 200
+            response._content = json.dumps(result).encode()
+            return response
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            self.assertEqual(self._result(
+                '/payment/square/online/submit', **values['square_submission'], source_id='cnon:timeout',
+            )['state'], 'pending')
+            tx = order.transaction_ids
+            self.assertFalse(tx.provider_reference)
+            manager = new_test_user(self.env, login='square_manager', password='square_manager',
+                                    groups='account.group_account_manager')
+            self.authenticate(manager.login, 'square_manager')
+
+            def refresh():
+                return self._result(
+                    '/web/dataset/call_button/payment.transaction/action_square_refresh_status',
+                    model='payment.transaction', method='action_square_refresh_status', args=[tx.ids], kwargs={},
+                )
+
+            refresh()
+            self.assertEqual(tx.state, 'pending')
+            self.assertFalse(tx.payment_id)
+            replacement = self.env['payment.square.location'].create({
+                'provider_id': self.provider.id, 'square_id': 'NEW_LOCATION', 'name': 'New location',
+                'country_code': 'US', 'currency_code': 'USD', 'is_available': True,
+            })
+            self.provider.square_location_id = replacement
+            now_visible = True
+            refresh()
+
+        self.assertEqual([call.args[0] for call in api.call_args_list], ['POST', 'POST', 'GET', 'GET', 'GET'])
+        self.assertEqual(order.state, 'sale')
+        self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.provider_reference, 'SQ-PAYMENT-1')
+        self.assertEqual(tx.square_location_ref, 'TESTNYC')
+        self.assertEqual(tx.payment_id.amount, 50)
+        self.assertEqual(tx.payment_id.payment_type, 'inbound')
+        self.assertEqual(tx.payment_id.journal_id, self.journal)
+
+    def test_signed_webhook_records_late_success_without_reopening_the_cancelled_order(self):
+        order = self._cart()
+        values = self._prepare(order)
+        path = f'/payment/square/online/webhook/{self.provider.id}'
+        subscription_url = 'https://checkout.example.test' + path
+        signature_key = b'test Square subscription signature key'
+        self.provider.write({
+            'square_webhook_url': subscription_url,
+            'square_webhook_signature_key': signature_key.decode(),
+        })
+        self.assertFalse(self.provider.square_webhook_signature_key)
+        accepted = {}
+
+        def square(method, url, **kwargs):
+            if method == 'POST':
+                response = self._square_response(method, url, **kwargs)
+                if url.endswith('/v2/payments'):
+                    accepted.update(response.json()['payment'])
+                    raise Timeout('Square accepted the payment before the response was lost')
+                return response
+            self.assertEqual(method, 'GET')
+            self.assertTrue(url.endswith('/v2/payments/SQ-PAYMENT-1'))
+            response = Response()
+            response.status_code = 200
+            response._content = json.dumps({'payment': accepted}).encode()
+            return response
+
+        def deliver(event_id, status, *, merchant='TESTMERCHANT', sign_url=subscription_url):
+            payload = json.dumps({
+                'event_id': event_id, 'merchant_id': merchant, 'type': 'payment.updated',
+                'data': {'id': 'SQ-PAYMENT-1', 'type': 'payment', 'object': {'payment': {**accepted, 'status': status}}},
+            }).encode()
+            signature = b64encode(hmac.digest(signature_key, sign_url.encode() + payload, 'sha256')).decode()
+            return self.url_open(path, data=payload, headers={
+                'Content-Type': 'application/json', 'x-square-hmacsha256-signature': signature,
+            })
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            self.assertEqual(self._result(
+                '/payment/square/online/submit', **values['square_submission'], source_id='cnon:late-success',
+            )['state'], 'pending')
+            tx = order.transaction_ids
+            self.authenticate('admin', 'admin')
+            self._result('/web/dataset/call_button/sale.order/action_cancel', model='sale.order',
+                         method='action_cancel', args=[order.ids], kwargs={'context': {'disable_cancel_warning': True}})
+            self.assertEqual(order.state, 'cancel')
+
+            self.assertEqual(deliver('forged', 'COMPLETED', sign_url='https://wrong.example.test' + path).status_code, 403)
+            self.assertEqual(deliver('wrong-merchant', 'COMPLETED', merchant='UNRELATED').status_code, 403)
+            cron_id = self.env.ref('payment_square_online.ir_cron_square_online_webhooks').id
+
+            def process_inbox():
+                self._result('/web/dataset/call_button/ir.cron/method_direct_trigger', model='ir.cron',
+                             method='method_direct_trigger', args=[[cron_id]], kwargs={})
+
+            accepted['location_id'] = 'OTHER_LOCATION'
+            self.assertEqual(deliver('mismatched-location', 'COMPLETED').status_code, 204)
+            process_inbox()
+            self.assertEqual(tx.state, 'pending')
+            self.assertFalse(tx.payment_id)
+            accepted['location_id'] = 'TESTNYC'
+            self.assertEqual(deliver('verified', 'COMPLETED').status_code, 204)
+            self.assertEqual(deliver('verified', 'COMPLETED').status_code, 204)
+            process_inbox()
+            first_payment = tx.payment_id
+            self.assertEqual(first_payment.amount, 50)
+            self.assertEqual(first_payment.payment_type, 'inbound')
+            self.assertEqual(tx.state, 'done')
+            self.assertEqual(order.state, 'cancel')
+            self.assertFalse(order.invoice_ids)
+
+            # Even a different event ID and a stale GET response cannot undo completion.
+            accepted['status'] = 'PENDING'
+            self.assertEqual(deliver('older-update', 'PENDING').status_code, 204)
+            process_inbox()
+
+        read = self._result('/web/dataset/call_kw/payment.transaction/read', model='payment.transaction',
+                            method='read', args=[tx.ids, ['state', 'square_paid_cancelled_order']], kwargs={})
+        self.assertEqual(read, [{'id': tx.id, 'state': 'done', 'square_paid_cancelled_order': True}])
+        self.assertEqual(order.state, 'cancel')
+        self.assertEqual(tx.payment_id, first_payment)
+        self.assertFalse(tx.child_transaction_ids)
+        self.assertEqual(self.env['account.payment'].search_count([('payment_transaction_id', '=', tx.id)]), 1)
+        self.assertEqual([call.args[0] for call in api.call_args_list], ['POST', 'POST', 'GET', 'GET', 'GET'])
+
+        self.authenticate(self.customer.login, self.customer.login)
+        portal = self.url_open(f'/my/orders/{order.id}')
+        self.assertEqual(portal.status_code, 200)
+        self.assertIn('Square collected your payment. Please contact us about this order.', portal.text)
+
+    def test_automatic_recovery_posts_the_order_invoice_and_payment_after_checkout_ends(self):
+        order = self._cart()
+        values = self._prepare(order)
+        self.env['ir.config_parameter'].set_param('sale.automatic_invoice', 'True')
+        accepted = {}
+
+        def square(method, url, **kwargs):
+            if method == 'POST':
+                response = self._square_response(method, url, status='APPROVED', **kwargs)
+                if url.endswith('/v2/payments'):
+                    accepted.update(response.json()['payment'])
+                return response
+            self.assertEqual(method, 'GET')
+            self.assertTrue(url.endswith('/v2/payments/SQ-PAYMENT-1'))
+            response = Response()
+            response.status_code = 200
+            response._content = json.dumps({'payment': {**accepted, 'status': 'COMPLETED'}}).encode()
+            return response
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            self.assertEqual(self._result(
+                '/payment/square/online/submit', **values['square_submission'], source_id='cnon:approved',
+            )['state'], 'pending')
+            self.assertIn('Square is processing your payment', self.url_open('/payment/status').text)
+            tx = order.transaction_ids
+            self.assertEqual(tx.provider_reference, 'SQ-PAYMENT-1')
+            self.assertFalse(tx.payment_id)
+            self.assertFalse(order.invoice_ids)
+            self.authenticate('admin', 'admin')
+            cron_id = self.env.ref('payment_square_online.ir_cron_square_online_reconcile').id
+            for _ in range(2):
+                self._result('/web/dataset/call_button/ir.cron/method_direct_trigger', model='ir.cron',
+                             method='method_direct_trigger', args=[[cron_id]], kwargs={})
+            self.authenticate(self.customer.login, self.customer.login)
+            portal = self.url_open(f'/my/orders/{order.id}')
+            self.assertEqual(portal.status_code, 200)
+            self.assertTrue(html.fromstring(portal.content).xpath(
+                '//*[@name="o_payment_status_alert"][contains(@class, "alert-success")]',
+            ))
+
+        self.assertEqual([call.args[0] for call in api.call_args_list], ['POST', 'POST', 'GET'])
+        self.assertEqual(order.state, 'sale')
+        self.assertEqual(len(order.invoice_ids), 1)
+        self.assertEqual(order.invoice_ids.state, 'posted')
+        self.assertEqual(order.invoice_ids.amount_residual, 0)
+        self.assertEqual(tx.payment_id.amount, 50)
+        self.assertEqual(tx.payment_id.payment_type, 'inbound')
+        self.assertFalse(tx.child_transaction_ids)
+
+    def test_payment_history_and_refresh_reject_another_customer_or_company(self):
+        order = self._cart()
+        values = self._prepare(order)
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=self._square_response):
+            self._result('/payment/square/online/submit', **values['square_submission'], source_id='cnon:sdk-token')
+        tx = order.transaction_ids
+        other_company = self.env['res.company'].create({'name': 'Different Square Company'})
+        outsiders = (
+            new_test_user(self.env, login='other_square_customer', password='password', groups='base.group_portal'),
+            new_test_user(self.env, login='other_square_manager', password='password', groups='account.group_account_manager',
+                          company_id=other_company.id, company_ids=[Command.set(other_company.ids)]),
+        )
+        with patch('odoo.addons.payment_square_online.square_api.request') as square:
+            for user in outsiders:
+                with self.subTest(user=user.login):
+                    self.authenticate(user.login, 'password')
+                    read = self._rpc('/web/dataset/call_kw/payment.transaction/read', model='payment.transaction',
+                                     method='read', args=[tx.ids, ['state', 'provider_reference']], kwargs={})
+                    refresh = self._rpc('/web/dataset/call_button/payment.transaction/action_square_refresh_status',
+                                        model='payment.transaction', method='action_square_refresh_status',
+                                        args=[tx.ids], kwargs={})
+                    for response in (read, refresh):
+                        self.assertEqual(response['error']['data']['name'], 'odoo.exceptions.AccessError')
+            square.assert_not_called()
+
+    def test_an_expired_reservation_before_dispatch_releases_the_order_without_a_charge(self):
+        order = self._cart()
+        self._prepare(order)
+        abandoned = order.transaction_ids
+        # A checkout worker reserved the order and stopped before committing dispatch.
+        abandoned._square_claim_checkout(order)
+        abandoned.square_reserved_at = fields.Datetime.now() - timedelta(minutes=6)
+
+        self.authenticate('admin', 'admin')
+        with patch('odoo.addons.payment_square_online.square_api.request') as square:
+            cron_id = self.env.ref('payment_square_online.ir_cron_square_online_reconcile').id
+            self._result('/web/dataset/call_button/ir.cron/method_direct_trigger', model='ir.cron',
+                         method='method_direct_trigger', args=[[cron_id]], kwargs={})
+            square.assert_not_called()
+        self.assertEqual(abandoned.state, 'cancel')
+        self.assertFalse(abandoned.payment_id)
+        self.assertIn('before it was sent', abandoned.state_message)
+
+        self.authenticate(self.customer.login, self.customer.login, session_extra={'sale_order_id': order.id})
+        retry = self._prepare(order)
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=self._square_response) as square:
+            self.assertEqual(self._result(
+                '/payment/square/online/submit', **retry['square_submission'], source_id='cnon:new-card',
+            )['state'], 'done')
+            self._result('/payment/status/poll')
+        self.assertEqual(square.call_count, 2)
+        self.assertEqual(order.state, 'sale')
+        self.assertEqual(len(order.transaction_ids.payment_id), 1)
 
     def test_checkout_rejects_tampered_attempt_and_stale_cart_without_contacting_square(self):
         order = self._cart()
