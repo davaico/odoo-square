@@ -86,13 +86,21 @@ If Square captured the payment after the Odoo order was cancelled or changed, Od
 
 The deterministic recovery tests simulate Square API responses and sign representative notifications with a test key. Use a Square Sandbox account and the public HTTPS endpoint to verify actual checkout and webhook delivery.
 
-## Return the full remaining payment
+## Refund a Square online payment
 
 Accounting managers and administrators can refund captured Square payments in their allowed Odoo companies. Keep the outbound **Manual** payment method available on the original bank journal and configure its outstanding payments account.
 
-1. In Odoo Accounting, open the posted customer payment for the website order and select **Refund**. The wizard shows the full available amount after completed and pending refunds.
-2. Confirm **Refund**, then open **Square Payment History** and select the linked refund transaction. The history shows the refund amount, the original transaction, who requested the refund, its status, and the Square refund ID once verified.
-3. While queued, the refund reserves the amount. The scheduled dispatch sends it through the original Square connection against the original payment, even if the provider was disabled or reconfigured. After dispatch, if the outcome remains pending, use **Refresh status** to check the existing request. If Odoo requests reauthorization, reconnect the original Square account.
-4. A completed refund creates a posted outbound customer payment in the original journal and currency. Confirm the refund in Square Sandbox and check the related outbound payment in Odoo. Create and reconcile any required credit note separately in Accounting. Process any return of goods separately in Inventory.
+1. In Odoo Accounting, open the posted customer payment for the website order and select **Refund**. The wizard shows the completed refunds and the remaining amount available after both completed and pending refunds. The refund amount defaults to the available balance. Enter a smaller positive amount for a partial refund, in the original payment currency. JPY amounts must be whole yen.
+2. Confirm **Refund**, then open **Square Payment History** and select the linked refund transaction. The history shows the amount, original transaction, requesting user, status, and verified Square refund ID as each becomes available.
+3. Odoo reserves the requested amount and checks the original payment's balance in Square before dispatch. If you need to return an additional amount, open a new wizard and check the balance shown there. If an existing refund still shows **Pending** after dispatch, use **Refresh status** on that refund to check its outcome. The reservation stays in place while the outcome is unknown and is released when failure is confirmed. If Odoo requests reauthorization, reconnect the original Square account.
+4. Each completed refund creates a posted outbound customer payment in the original journal and currency. Confirm the refund in Square Sandbox and check the related outbound payment in Odoo. Create and reconcile any required credit note separately in Accounting. Process any return of goods separately in Inventory.
 
 Cancelling an order leaves any decision to refund with Accounting.
+
+## Test refund concurrency
+
+Use a fresh, disposable Odoo 19 test database with `payment_square_online` installed, a USD company with a bank journal, and the test encryption key configured. The fixture runs two merchant actions against the same payment on separate PostgreSQL connections, then checks the posted refunds with a simulated Square API. It commits test records.
+
+```bash
+odoo shell -d odoo_square_test --no-http < payment_square_online/tests/refund_race.py
+```

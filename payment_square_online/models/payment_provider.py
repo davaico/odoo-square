@@ -59,7 +59,7 @@ class PaymentProvider(models.Model):
 
     def _compute_feature_support_fields(self):
         super()._compute_feature_support_fields()
-        self.filtered(lambda provider: provider.code == "square_online").support_refund = "full_only"
+        self.filtered(lambda provider: provider.code == "square_online").support_refund = "partial"
 
     def _get_default_payment_method_codes(self):
         self.ensure_one()

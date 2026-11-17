@@ -15,6 +15,12 @@ _REFUND_STATES = {
     "FAILED": "error",
     "REJECTED": "error",
 }
+_DEFINITIVE_REFUND_REJECTIONS = {
+    "PAYMENT_NOT_REFUNDABLE",
+    "PAYMENT_NOT_REFUNDABLE_DUE_TO_DISPUTE",
+    "REFUND_AMOUNT_INVALID",
+    "REFUND_DECLINED",
+}
 
 
 class PaymentTransaction(models.Model):
@@ -75,12 +81,18 @@ class PaymentTransaction(models.Model):
             raise ValidationError(_("There is no Square balance available to refund."))
         if amount_to_refund is None:
             return available
+        requested = self._square_online_validate_refund_amount(amount_to_refund)
+        if requested > available:
+            raise ValidationError(_("This amount exceeds the refundable Square balance. Reopen the refund wizard."))
+        return requested
+
+    def _square_online_validate_refund_amount(self, amount_to_refund):
         try:
             requested = square_amount_in_minor_units(amount_to_refund, self.square_online_currency_code)
         except ValueError:
             raise ValidationError(_("Enter an exact amount in the original Square payment currency.")) from None
-        if requested != available:
-            raise ValidationError(_("The full refundable amount changed. Reopen the refund wizard."))
+        if requested <= 0:
+            raise ValidationError(_("Enter a positive Square refund amount."))
         return requested
 
     def _get_specific_create_values(self, provider_code, values):
@@ -197,23 +209,58 @@ class PaymentTransaction(models.Model):
         original = connection._square_online_get_payment(source.provider_reference)
         if not source._square_online_matches_payment(original, connection) or original["status"] != "COMPLETED":
             raise SquareAPIError()
-        remote_refunded = original.get("refunded_money")
-        if remote_refunded is not None and not (
-            isinstance(remote_refunded, dict)
-            and remote_refunded.get("currency") == self.square_online_currency_code
-            and type(remote_refunded.get("amount")) is int
-            and 0 <= remote_refunded["amount"] <= source.square_online_amount_minor
-        ):
-            raise SquareAPIError()
+        reported_minor, refunds = source._square_online_read_refund_balance(original, connection)
         source._square_online_lock_refunds()
         if self.state != "pending" or self.square_online_dispatch_at:
             return False
-        remote_available = source.square_online_amount_minor - (remote_refunded or {}).get("amount", 0)
-        available = min(source._square_online_refundable_minor(exclude=self), remote_available)
+        available = source._square_online_refundable_minor(exclude=self)
+        available -= source._square_online_unreserved_remote_refund_minor(reported_minor, refunds)
         if self.square_online_amount_minor > available:
             self._set_error(_("The refundable Square balance changed before this refund was sent."))
             return False
         return True
+
+    def _square_online_read_refund_balance(self, payment, connection):
+        remote_refunded = payment.get("refunded_money")
+        if remote_refunded is not None and not (
+            isinstance(remote_refunded, dict)
+            and remote_refunded.get("currency") == self.square_online_currency_code
+            and type(remote_refunded.get("amount")) is int
+            and 0 <= remote_refunded["amount"] <= self.square_online_amount_minor
+        ):
+            raise SquareAPIError()
+        refund_ids = payment.get("refund_ids", [])
+        if not isinstance(refund_ids, list) or any(not isinstance(refund_id, str) for refund_id in refund_ids):
+            raise SquareAPIError()
+        refunds = []
+        for refund_id in dict.fromkeys(refund_ids):
+            refund = connection._square_online_get_refund(refund_id)
+            if not self._square_online_refund_data_matches(refund, connection):
+                raise SquareAPIError()
+            refunds.append(refund)
+        return (remote_refunded or {}).get("amount", 0), refunds
+
+    def _square_online_unreserved_remote_refund_minor(self, reported_minor, refunds):
+        completed_minor = pending_minor = overlapping_minor = 0
+        matched_children = set()
+        for refund in refunds:
+            status = refund["status"]
+            if status not in ("COMPLETED", "PENDING"):
+                continue
+            amount = refund["amount_money"]["amount"]
+            if status == "COMPLETED":
+                completed_minor += amount
+            else:
+                pending_minor += amount
+            child = self._square_online_find_refund_child(refund)
+            if child and child.state in ("done", "pending") and child.id not in matched_children:
+                if child.square_online_amount_minor != amount:
+                    raise SquareAPIError()
+                overlapping_minor += amount
+                matched_children.add(child.id)
+        # Include any additional completed amount from the Payment aggregate and
+        # subtract local overlap only for an exact Square ID or Odoo request reason.
+        return max(reported_minor, completed_minor) + pending_minor - overlapping_minor
 
     def _square_online_post_refund(self):
         self.ensure_one()
@@ -229,11 +276,24 @@ class PaymentTransaction(models.Model):
                     "currency": self.square_online_currency_code,
                 },
             })
-        except SquareAPIError:
+        except SquareAPIError as exc:
             # Balance conflicts can result from an out-of-band refund. Inspect Square
             # without generating a replacement request or releasing ambiguous funds.
+            rejected = (
+                exc.status_code in (400, 404)
+                and exc.codes
+                and _DEFINITIVE_REFUND_REJECTIONS.issuperset(exc.codes)
+            )
+            if rejected:
+                source._square_online_lock_refunds()
             self._square_online_refresh_status()
-            if self.state == "pending" and not self.square_online_recovery_message:
+            if rejected and self.state == "pending" and not self.provider_reference:
+                message = _("Square rejected this refund.")
+                if "REFUND_AMOUNT_INVALID" in exc.codes:
+                    message = _("Square rejected this amount. Review the original payment's refundable balance.")
+                self._set_error(message)
+                self.square_online_recovery_message = False
+            elif self.state == "pending" and not self.square_online_recovery_message:
                 self.square_online_recovery_message = _("Square has not confirmed the result of this refund.")
             return
         if not source._square_online_apply_refund(result.get("refund"), connection):
@@ -272,7 +332,7 @@ class PaymentTransaction(models.Model):
     def _square_online_find_refund_child(self, refund):
         self.ensure_one()
         candidates = self.child_transaction_ids.filtered(
-            lambda tx: tx.operation == "refund" and tx.square_online_dispatch_at
+            lambda tx: tx.operation == "refund" and (tx.provider_reference or tx.square_online_dispatch_at)
         )
         child = candidates.filtered(lambda tx: tx.provider_reference == refund["id"])
         if not child:

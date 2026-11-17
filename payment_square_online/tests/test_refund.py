@@ -55,6 +55,26 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         self.env.ref("payment_square_online.cron_square_online_dispatch_refunds").method_direct_trigger()
         self.env.invalidate_all()
 
+    def _make_refundable_goods_order(self):
+        goods = self.env["product.product"].create({
+            "name": "Square refundable physical goods",
+            "type": "consu",
+            "is_storable": True,
+            "list_price": 23.50,
+            "website_published": True,
+            "taxes_id": [Command.clear()],
+        })
+        order = self._make_order(goods)
+        carrier = self.env["delivery.carrier"].create({
+            "name": "Square refund shipping",
+            "product_id": self.product.id,
+            "delivery_type": "fixed",
+            "fixed_price": 0,
+            "is_published": True,
+        })
+        order._set_delivery_method(carrier)
+        return order
+
     def _refund_notification(self, refund, *, signing_key="refund-webhook-test-key"):
         path = f"/payment/square_online/webhook/{self.connection.id}"
         url = "https://shop.example.test" + path
@@ -75,26 +95,237 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         })
 
     @patch(square_boundary)
+    def test_successive_partial_refunds_and_default_remaining_amount(self, external):
+        self.env["ir.config_parameter"].set_param("sale.automatic_invoice", "True")
+        order, tx, original = self._capture(external, self._make_refundable_goods_order())
+        invoice = order.invoice_ids
+        pickings = order.picking_ids
+        self.assertTrue(invoice)
+        self.assertTrue(pickings)
+        self.authenticate(self.manager.login, self.manager.login)
+        refunds = {}
+
+        def square(method, url, *, headers, json, **kwargs):
+            if method == "GET" and url.endswith("/v2/payments/" + original["id"]):
+                return self._square_response({"payment": {
+                    **original,
+                    "refunded_money": {"amount": sum(refunded), "currency": "USD"},
+                    "refund_ids": list(refunds),
+                }})
+            if method == "GET":
+                return self._square_response({"refund": refunds[url.rsplit("/", 1)[-1]]})
+            self.assertEqual((method, url), ("POST", "https://connect.squareupsandbox.com/v2/refunds"))
+            self.assertEqual(json["payment_id"], original["id"])
+            self.assertEqual(json["amount_money"], {"amount": expected_minor, "currency": "USD"})
+            refund_id = f"PARTIAL-{len(refunds)}"
+            refunds[refund_id] = {
+                "id": refund_id, "payment_id": original["id"], "location_id": original["location_id"],
+                "reason": json["reason"], "status": "COMPLETED", "amount_money": json["amount_money"],
+            }
+            refunded.append(expected_minor)
+            return self._square_response({"refund": refunds[refund_id]})
+
+        refunded = []
+        external.side_effect = square
+        for amount, expected_minor, remaining in ((12.31, 1231, 34.69), (8.22, 822, 26.47), (None, 2647, 0)):
+            wizard_ids = self._open_refund(tx.payment_id, amount)
+            wizard, = self._call("payment.refund.wizard", "read", wizard_ids, fields=["amount_to_refund"])
+            self.assertEqual(wizard["amount_to_refund"], expected_minor / 100)
+            self._call("payment.refund.wizard", "action_refund", wizard_ids, button=True)
+            self._dispatch()
+            self.env.ref("payment.cron_post_process_payment_tx").method_direct_trigger()
+            self.env.invalidate_all()
+            self.assertEqual(tx.payment_id.amount_available_for_refund, remaining)
+        children = tx.child_transaction_ids
+        self.assertEqual(set(children.mapped("provider_reference")), set(refunds))
+        self.assertEqual(children.mapped("square_online_refund_requested_by"), self.manager)
+        self.assertEqual(sorted(children.mapped("payment_id.amount")), [8.22, 12.31, 26.47])
+        self.assertEqual(sum(children.mapped("payment_id.amount")), 47)
+        self.assertEqual(set(children.mapped("payment_id.payment_type")), {"outbound"})
+        self.assertEqual(set(children.mapped("payment_id.move_id.state")), {"posted"})
+        self.assertEqual(children.mapped("payment_id.source_payment_id"), tx.payment_id)
+        self.assertEqual(order.invoice_ids, invoice)
+        self.assertEqual(invoice.amount_residual, 0)
+        self.assertEqual(order.picking_ids, pickings)
+        self.assertTrue(all(picking.state != "done" for picking in pickings))
+
+    @patch(square_boundary)
+    def test_refund_rejects_invalid_amounts_before_native_currency_rounding(self, external):
+        _, tx, _ = self._capture(external)
+        self.authenticate(self.manager.login, self.manager.login)
+        wizard_ids = self._open_refund(tx.payment_id, 9)
+        for amount in (0, -1, 47.01, 9.001, "NaN", "Infinity"):
+            with self.subTest(amount=amount):
+                with self.assertRaises(JsonRpcException):
+                    self._open_refund(tx.payment_id, amount)
+                with self.assertRaises(JsonRpcException):
+                    self._call("payment.refund.wizard", "write", wizard_ids, vals={"amount_to_refund": amount})
+                with self.assertRaises(JsonRpcException):
+                    self._call(
+                        "payment.transaction", "action_refund", tx.ids, button=True, amount_to_refund=amount,
+                    )
+        self.env.invalidate_all()
+        self.assertFalse(tx.child_transaction_ids)
+        external.assert_called_once()
+
+    @patch(square_boundary)
+    def test_partial_timeout_leaves_remaining_amount_but_replaying_wizard_cannot_refund_again(self, external):
+        _, tx, original = self._capture(external)
+        self.authenticate(self.manager.login, self.manager.login)
+        stale_wizard_ids = self._open_refund(tx.payment_id, 40)
+        wizard_ids = self._open_refund(tx.payment_id, 20)
+        self._call("payment.refund.wizard", "action_refund", wizard_ids, button=True)
+        self.env.invalidate_all()
+        child = tx.child_transaction_ids
+
+        external.reset_mock()
+        external.side_effect = [
+            self._square_response({"payment": original}),
+            requests.Timeout,
+            self._square_response({"payment": original}),
+            self._square_response({"refunds": []}),
+        ]
+        self._dispatch()
+        self.assertEqual(child.state, "pending")
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 27)
+        self.assertEqual(external.call_args_list[1].kwargs["json"]["idempotency_key"],
+                         child.square_online_operation_key)
+        with self.assertRaises(JsonRpcException):
+            self._call("payment.refund.wizard", "action_refund", wizard_ids, button=True)
+        with self.assertRaises(JsonRpcException):
+            self._call("payment.refund.wizard", "action_refund", stale_wizard_ids, button=True)
+        self.assertEqual(len(tx.child_transaction_ids), 1)
+        self.assertEqual(external.call_count, 4)
+
+        new_wizard_ids = self._open_refund(tx.payment_id)
+        wizard, = self._call("payment.refund.wizard", "read", new_wizard_ids, fields=[
+            "amount_to_refund", "refunded_amount", "has_pending_refund",
+        ])
+        self.assertEqual(wizard["amount_to_refund"], 27)
+        self.assertEqual(wizard["refunded_amount"], 0)
+        self.assertTrue(wizard["has_pending_refund"])
+        self._call("payment.refund.wizard", "action_refund", new_wizard_ids, button=True)
+        self.env.invalidate_all()
+        self.assertEqual(sorted(tx.child_transaction_ids.mapped("amount")), [-27, -20])
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 0)
+
+        external.reset_mock()
+        external.side_effect = [
+            self._square_response({"payment": {**original, "refund_ids": ["PARTIAL-LOST"]}}),
+            self._square_response({"refund": {
+                "id": "PARTIAL-LOST", "payment_id": original["id"], "location_id": original["location_id"],
+                "reason": child.square_online_refund_reason, "status": "FAILED",
+                "amount_money": {"amount": 2000, "currency": "USD"},
+            }}),
+        ]
+        self._call("payment.transaction", "action_square_online_refresh_status", child.ids, button=True)
+        self.env.invalidate_all()
+        self.assertEqual(child.state, "error")
+        self.assertFalse(child.payment_id)
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 20)
+        self.assertEqual(self._call("payment.refund.wizard", "read", self._open_refund(tx.payment_id), fields=[
+            "amount_to_refund",
+        ])[0]["amount_to_refund"], 20)
+        self.assertEqual([call.args[0] for call in external.call_args_list], ["GET", "GET"])
+
+    @patch(square_boundary)
+    def test_dispatch_counts_disjoint_square_activity_and_pending_odoo_refunds_once(self, external):
+        _, tx, original = self._capture(external)
+        self.authenticate(self.manager.login, self.manager.login)
+        self._call(
+            "payment.refund.wizard", "action_refund", self._open_refund(tx.payment_id, 20), button=True,
+        )
+        self.env.invalidate_all()
+        child = tx.child_transaction_ids
+        base_refund = {"payment_id": original["id"], "location_id": original["location_id"]}
+        pending = {
+            **base_refund, "id": "PENDING-ODOO", "reason": child.square_online_refund_reason,
+            "status": "PENDING", "amount_money": {"amount": 2000, "currency": "USD"},
+        }
+        external.side_effect = [
+            self._square_response({"payment": original}), self._square_response({"refund": pending}),
+        ]
+        self._dispatch()
+        self.assertEqual(child.state, "pending")
+
+        remote = {
+            pending["id"]: pending,
+            "EXTERNAL-COMPLETED": {
+                **base_refund, "id": "EXTERNAL-COMPLETED", "status": "COMPLETED",
+                "amount_money": {"amount": 1400, "currency": "USD"},
+            },
+            "EXTERNAL-PENDING": {
+                **base_refund, "id": "EXTERNAL-PENDING", "status": "PENDING",
+                "amount_money": {"amount": 400, "currency": "USD"},
+            },
+        }
+        square_payment = {
+            **original, "refunded_money": {"amount": 1400, "currency": "USD"}, "refund_ids": list(remote),
+        }
+
+        def square(method, url, *, headers, json, **kwargs):
+            if method == "GET" and url.endswith("/v2/payments/" + original["id"]):
+                return self._square_response({"payment": square_payment})
+            if method == "GET":
+                return self._square_response({"refund": remote[url.rsplit("/", 1)[-1]]})
+            self.assertEqual(method, "POST")
+            self.assertEqual(json["amount_money"], {"amount": 900, "currency": "USD"})
+            return self._square_response({"refund": {
+                **base_refund, "id": "AVAILABLE-BALANCE", "status": "COMPLETED",
+                "reason": json["reason"], "amount_money": json["amount_money"],
+            }})
+
+        external.reset_mock()
+        external.side_effect = square
+        self._call(
+            "payment.refund.wizard", "action_refund", self._open_refund(tx.payment_id, 10), button=True,
+        )
+        self._dispatch()
+        refused = tx.child_transaction_ids - child
+        self.assertEqual(refused.state, "error")
+        self.assertFalse(refused.square_online_dispatch_at)
+        self.assertEqual({call.args[0] for call in external.call_args_list}, {"GET"})
+
+        self._call(
+            "payment.refund.wizard", "action_refund", self._open_refund(tx.payment_id, 9), button=True,
+        )
+        self._dispatch()
+        self.env.ref("payment.cron_post_process_payment_tx").method_direct_trigger()
+        self.env.invalidate_all()
+        completed = tx.child_transaction_ids - child - refused
+        self.assertEqual(completed.provider_reference, "AVAILABLE-BALANCE")
+        self.assertEqual(completed.payment_id.amount, 9)
+        self.assertEqual(completed.payment_id.move_id.state, "posted")
+        self.assertEqual(sum(call.args[0] == "POST" for call in external.call_args_list), 1)
+
+    @patch(square_boundary)
+    def test_square_amount_rejection_rechecks_original_payment_and_releases_attempt(self, external):
+        _, tx, original = self._capture(external)
+        self.authenticate(self.manager.login, self.manager.login)
+        self._call(
+            "payment.refund.wizard", "action_refund", self._open_refund(tx.payment_id, 40), button=True,
+        )
+        self.env.invalidate_all()
+        refund = tx.child_transaction_ids
+        external.reset_mock()
+        external.side_effect = [
+            self._square_response({"payment": original}),
+            self._square_response({"errors": [{"code": "REFUND_AMOUNT_INVALID"}]}, status=400),
+            self._square_response({"payment": {
+                **original, "refunded_money": {"amount": 3200, "currency": "USD"},
+            }}),
+            self._square_response({"refunds": []}),
+        ]
+        self._dispatch()
+        self.assertEqual(refund.state, "error")
+        self.assertFalse(refund.payment_id)
+        self.assertEqual([call.args[0] for call in external.call_args_list], ["GET", "POST", "GET", "GET"])
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 47)
+
+    @patch(square_boundary)
     def test_manager_full_refund_posts_native_outbound_payment(self, external):
         self.env["ir.config_parameter"].set_param("sale.automatic_invoice", "True")
-        goods = self.env["product.product"].create({
-            "name": "Square refundable physical goods",
-            "type": "consu",
-            "is_storable": True,
-            "list_price": 23.50,
-            "website_published": True,
-            "taxes_id": [Command.clear()],
-        })
-        order = self._make_order(goods)
-        carrier = self.env["delivery.carrier"].create({
-            "name": "Square refund shipping",
-            "product_id": self.product.id,
-            "delivery_type": "fixed",
-            "fixed_price": 0,
-            "is_published": True,
-        })
-        order._set_delivery_method(carrier)
-        order, tx, original = self._capture(external, order)
+        order, tx, original = self._capture(external, self._make_refundable_goods_order())
         invoice = order.invoice_ids
         pickings = order.picking_ids
         self.assertTrue(invoice)
@@ -103,7 +334,7 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         wizard_ids = self._open_refund(tx.payment_id)
         self.assertEqual(self._call("payment.refund.wizard", "read", wizard_ids, fields=[
             "amount_to_refund", "support_refund",
-        ]), [{"id": wizard_ids[0], "amount_to_refund": 47, "support_refund": "full_only"}])
+        ]), [{"id": wizard_ids[0], "amount_to_refund": 47, "support_refund": "partial"}])
         self._call("payment.refund.wizard", "action_refund", wizard_ids, button=True)
         self.env.invalidate_all()
         child = tx.child_transaction_ids
@@ -312,96 +543,133 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         self.assertFalse(tx.child_transaction_ids)
         external.assert_called_once()
 
-    @patch(square_boundary)
-    def test_jpy_full_refund_posts_exact_foreign_and_company_currency(self, external):
-        jpy = self.env.ref("base.JPY")
-        jpy.active = True
+    def _capture_in_market(self, external, country, code, unit_price, captured_minor):
+        currency = self.env.ref(f"base.{code}")
+        if currency == self.currency:
+            return self._capture(external)
+        currency.active = True
         self.env["res.currency.rate"].create({
-            "currency_id": jpy.id, "company_id": self.company.id,
+            "currency_id": currency.id, "company_id": self.company.id,
             "name": fields.Date.today(), "rate": 2,
         })
+        merchant = f"MERCHANT-{country}"
+        location = f"LOCATION-{country}"
+        token = f"access-{country}"
         connection = self.env["square.online.connection"].create({
-            "name": "Japan Sandbox",
+            "name": f"{country} Sandbox",
             "company_id": self.company.id,
-            "application_id": "sandbox-japan",
-            "application_secret": "test-japan-secret",
+            "application_id": f"sandbox-test-{country}",
+            "application_secret": "test-secret",
         })
         external.side_effect = [
             self._square_response({
-                "merchant_id": "MERCHANT-JP",
-                "access_token": "japan-access", "refresh_token": "japan-refresh", "token_type": "bearer",
+                "merchant_id": merchant,
+                "access_token": token, "refresh_token": "test-refresh", "token_type": "bearer",
                 "expires_at": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
             }),
             self._square_response({"locations": [{
-                "id": "LOCATION-JP", "merchant_id": "MERCHANT-JP", "name": "Japan",
-                "country": "JP", "currency": "JPY", "status": "ACTIVE",
+                "id": location, "merchant_id": merchant, "name": country,
+                "country": country, "currency": code, "status": "ACTIVE",
                 "capabilities": ["CREDIT_CARD_PROCESSING"],
             }]}),
         ]
-        connection._square_online_authorize("code-japan")
+        connection._square_online_authorize("test-oauth-code")
         connection.location_id = connection.available_location_ids
         self.provider.square_online_sandbox_connection_id = connection
         pricelist = self.env["product.pricelist"].create({
-            "name": "Japanese yen", "currency_id": jpy.id,
+            "name": f"{code} refunds", "currency_id": currency.id,
             "company_id": self.company.id, "website_id": self.website.id,
             "item_ids": [Command.create({
                 "applied_on": "1_product", "product_tmpl_id": self.product.product_tmpl_id.id,
-                "compute_price": "fixed", "fixed_price": 187,
+                "compute_price": "fixed", "fixed_price": unit_price,
             })],
         })
         order = self._make_order()
         order.pricelist_id = pricelist
-        order.order_line.price_unit = 187
+        order.order_line.price_unit = unit_price
         draft = self._prepare(order, self._open_payment_page(order))
         original = {
-            "id": "PAYMENT-JP", "source_type": "CARD", "status": "COMPLETED",
-            "reference_id": draft["reference"], "location_id": "LOCATION-JP",
-            "amount_money": {"amount": 374, "currency": "JPY"},
+            "id": f"PAYMENT-{country}", "source_type": "CARD", "status": "COMPLETED",
+            "location_id": location, "amount_money": {"amount": captured_minor, "currency": code},
         }
 
         def capture(method, url, *, headers, json, **kwargs):
             self.assertEqual(method, "POST")
             self.assertTrue(url.endswith("/v2/payments"))
-            self.assertEqual(headers["Authorization"], "Bearer japan-access")
-            self.assertEqual(json["amount_money"], {"amount": 374, "currency": "JPY"})
-            return self._square_response({"payment": {**original, "reference_id": json["reference_id"]}})
+            self.assertEqual(headers["Authorization"], f"Bearer {token}")
+            self.assertEqual(json["amount_money"], original["amount_money"])
+            original["reference_id"] = json["reference_id"]
+            return self._square_response({"payment": original})
 
         external.side_effect = capture
         self.assertEqual(self._submit(draft)["state"], "done")
-        original["reference_id"] = external.call_args.kwargs["json"]["reference_id"]
         self.assertEqual(self.make_jsonrpc_request("/payment/status/poll")["state"], "done")
         self.env.invalidate_all()
-        tx = order.transaction_ids
-        self.authenticate(self.manager.login, self.manager.login)
-        self._call(
-            "payment.refund.wizard", "action_refund", self._open_refund(tx.payment_id), button=True,
-        )
-        self.env.invalidate_all()
-        child = tx.child_transaction_ids
+        return order, order.transaction_ids, original
 
-        def refund(method, url, *, headers, json, **kwargs):
-            self.assertEqual(headers["Authorization"], "Bearer japan-access")
-            if method == "GET":
-                self.assertTrue(url.endswith("/v2/payments/PAYMENT-JP"))
-                return self._square_response({"payment": original})
-            self.assertEqual(method, "POST")
-            self.assertTrue(url.endswith("/v2/refunds"))
-            self.assertEqual(json["amount_money"], {"amount": 374, "currency": "JPY"})
-            return self._square_response({"refund": {
-                **original, "id": "REFUND-JP", "payment_id": original["id"], "reason": json["reason"],
-            }})
+    @patch(square_boundary)
+    def test_partial_refunds_preserve_minor_units_and_post_in_all_supported_currencies(self, external):
+        markets = (("US", "USD"), ("AU", "AUD"), ("CA", "CAD"), ("FR", "EUR"), ("GB", "GBP"), ("JP", "JPY"))
+        for country, code in markets:
+            with self.subTest(currency=code):
+                if code == "JPY":
+                    unit_price, captured_minor = 187, 374
+                    amounts = ((124, 124, 250), (76, 76, 174), (None, 174, 0))
+                else:
+                    unit_price, captured_minor = 23.50, 4700
+                    amounts = ((12.31, 1231, 34.69), (8.22, 822, 26.47), (None, 2647, 0))
+                order, tx, original = self._capture_in_market(external, country, code, unit_price, captured_minor)
+                self.authenticate(self.manager.login, self.manager.login)
+                if code == "JPY":
+                    with self.assertRaises(JsonRpcException):
+                        self._open_refund(tx.payment_id, 124.01)
+                refunded = {}
 
-        external.side_effect = refund
-        self._dispatch()
-        self.env.ref("payment.cron_post_process_payment_tx").method_direct_trigger()
-        self.env.invalidate_all()
-        payment = child.payment_id
-        self.assertEqual(payment.payment_type, "outbound")
-        self.assertEqual(payment.amount, 374)
-        self.assertEqual(payment.currency_id, jpy)
-        self.assertEqual(payment.journal_id, self.journal)
-        self.assertEqual(payment.move_id.state, "posted")
-        receivable = payment.move_id.line_ids.filtered(lambda line: line.account_type == "asset_receivable")
-        outstanding = payment.move_id.line_ids - receivable
-        self.assertEqual((receivable.amount_currency, receivable.balance), (374, 187))
-        self.assertEqual((outstanding.amount_currency, outstanding.balance), (-374, -187))
+                def square(method, url, *, headers, json, **kwargs):
+                    if method == "GET" and url.endswith("/v2/payments/" + original["id"]):
+                        return self._square_response({"payment": {
+                            **original, "refund_ids": list(refunded),
+                            "refunded_money": {
+                                "amount": sum(refund["amount_money"]["amount"] for refund in refunded.values()),
+                                "currency": code,
+                            },
+                        }})
+                    if method == "GET":
+                        return self._square_response({"refund": refunded[url.rsplit("/", 1)[-1]]})
+                    self.assertEqual(method, "POST")
+                    self.assertEqual(json["payment_id"], original["id"])
+                    self.assertEqual(json["amount_money"], {"amount": expected_minor, "currency": code})
+                    refund_id = f"REFUND-{country}-{len(refunded)}"
+                    refunded[refund_id] = {
+                        "id": refund_id, "payment_id": original["id"], "location_id": original["location_id"],
+                        "status": "COMPLETED", "reason": json["reason"], "amount_money": json["amount_money"],
+                    }
+                    return self._square_response({"refund": refunded[refund_id]})
+
+                external.side_effect = square
+                for amount, expected_minor, remaining in amounts:
+                    wizard_ids = self._open_refund(tx.payment_id, amount)
+                    self._call("payment.refund.wizard", "action_refund", wizard_ids, button=True)
+                    self._dispatch()
+                    self.env.ref("payment.cron_post_process_payment_tx").method_direct_trigger()
+                    self.env.invalidate_all()
+                    self.assertEqual(tx.payment_id.amount_available_for_refund, remaining)
+                refunds = tx.child_transaction_ids
+                payments = refunds.payment_id
+                self.assertEqual(set(refunds.mapped("provider_reference")), set(refunded))
+                self.assertEqual(sum(refunds.mapped("square_online_amount_minor")), captured_minor)
+                self.assertEqual(sum(payments.mapped("amount")), 374 if code == "JPY" else 47)
+                self.assertEqual(set(payments.mapped("payment_type")), {"outbound"})
+                self.assertEqual(set(payments.mapped("move_id.state")), {"posted"})
+                self.assertEqual(payments.currency_id.name, code)
+                self.assertEqual(payments.journal_id, self.journal)
+                self.assertEqual(payments.source_payment_id, tx.payment_id)
+                self.assertFalse(refunds.invoice_ids)
+                self.assertFalse(order.picking_ids)
+                if code == "JPY":
+                    receivable = payments.move_id.line_ids.filtered(lambda line: line.account_type == "asset_receivable")
+                    outstanding = payments.move_id.line_ids - receivable
+                    self.assertEqual(sum(receivable.mapped("amount_currency")), 374)
+                    self.assertEqual(sum(receivable.mapped("balance")), 187)
+                    self.assertEqual(sum(outstanding.mapped("amount_currency")), -374)
+                    self.assertEqual(sum(outstanding.mapped("balance")), -187)
