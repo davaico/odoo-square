@@ -1,10 +1,11 @@
 from uuid import uuid4
 
-from odoo import _, api, fields, models
+from odoo import SUPERUSER_ID, _, api, fields, models
 from odoo.exceptions import AccessError, UserError, ValidationError
 from odoo.http import request
 
 from odoo.addons.payment import utils as payment_utils
+from odoo.osv import expression
 
 
 _SQUARE_TRANSACTION_FIELDS = {
@@ -77,6 +78,64 @@ class PaymentTransaction(models.Model):
             if self.sudo().filtered(lambda tx: tx.provider_code == 'square_online'):
                 raise AccessError(_("Square payment records cannot be deleted manually."))
         return super().unlink()
+
+    @api.model
+    def _square_online_pos_scope_exists(self, environment):
+        """Check for a checkout that could already have created an Order at Square."""
+        domain = [
+            ('provider_code', '=', 'square_online'),
+            ('operation', '=', 'online_direct'),
+            ('square_reserved_at', '!=', False),
+        ]
+        if environment:
+            domain.append(('square_environment', '=', environment))
+        return self._square_online_pos_has_transaction(domain)
+
+    @api.model
+    def _square_online_matches_pos_resource(self, environment, kind, resource, merchant_id=None):
+        """Match an authenticated Square resource against durable website ownership."""
+        location_id = resource.get('location_id')
+        resource_id = resource.get('id')
+        if not location_id or not resource_id:
+            return False
+        domain = [
+            ('provider_code', '=', 'square_online'),
+            ('square_environment', '=', environment),
+            ('square_location_ref', '=', location_id),
+        ]
+        if merchant_id:
+            domain.append(('square_merchant_id', '=', merchant_id))
+        if kind == 'order':
+            candidates = [[('square_order_id', '=', resource_id)]]
+            if resource.get('reference_id'):
+                candidates.append([
+                    ('square_order_reference', '=', resource['reference_id']),
+                    ('square_order_id', '=', False),
+                    ('square_reserved_at', '!=', False),
+                ])
+        elif kind == 'payment':
+            domain.append(('operation', '=', 'online_direct'))
+            candidates = [[('provider_reference', '=', resource_id)]]
+            if resource.get('reference_id') and resource.get('order_id'):
+                candidates.append([
+                    ('square_order_reference', '=', resource['reference_id']),
+                    ('square_order_id', '=', resource['order_id']),
+                    ('provider_reference', '=', False),
+                    ('square_dispatched_at', '!=', False),
+                ])
+        elif kind == 'refund':
+            domain.append(('operation', '=', 'refund'))
+            candidates = [[('provider_reference', '=', resource_id)]]
+        else:
+            return False
+        return self._square_online_pos_has_transaction(expression.AND([domain, expression.OR(candidates)]))
+
+    def _square_online_pos_has_transaction(self, domain):
+        # A resync may find a new Square order after its database snapshot began.
+        # Checkout commits ownership before sending CreateOrder, so read from a fresh snapshot.
+        with self.env.registry.cursor() as cr:
+            transactions = self.with_env(api.Environment(cr, SUPERUSER_ID, {}))
+            return bool(transactions.search_count(domain, limit=1))
 
     def _square_validate_checkout(self, order):
         self.ensure_one()

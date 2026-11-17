@@ -9,6 +9,7 @@ from . import square_stock_sync
 from . import square_integration_log
 from . import square_webhook_queue
 from . import square_api_client
+from . import square_website_routing
 from . import stock_move
 from . import stock_quant
 from . import stock_picking

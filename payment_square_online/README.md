@@ -52,6 +52,14 @@ International buyers can use eligible cards, subject to Square and card issuer a
 
 [Square webhook subscriptions](https://developer.squareup.com/docs/webhooks/step2subscribe) · [Square notification signatures](https://developer.squareup.com/docs/webhooks/step3validate)
 
+## Use website payments with Square POS
+
+The two add-ons can be installed independently. For both sales channels, configure **Square Online Payments** as above and keep the **Square POS Integration** credentials, webhook subscription, journals, and warehouse mappings configured in Square POS Integration settings. You can use separate Square applications and the same merchant and location. Register the online endpoint and the existing `/square/webhook` endpoint separately, each with its own subscription signature key. The POS access token needs read access to Orders, Payments and Refunds, and Locations for that Square account.
+
+Website checkout records payments and refunds through Odoo's payment provider. Website deliveries follow Odoo's normal fulfillment workflow, and financial refunds leave any credit note and goods return to their separate Odoo workflows. The POS webhook, event replay, and manual resync use Square's order and payment records to exclude website activity. If Square is temporarily unavailable while POS checks a resource that may belong to website checkout, the webhook asks Square to retry and manual resync can be retried when access recovers. The POS integration continues to import genuine Square POS sales, refunds, exchanges, and their applicable stock movements.
+
+For Odoo 18 regression testing, initialize both add-ons with `ODOO_INIT_MODULES=payment_square_online,sale_stock,odoo_square` and select `ODOO_TEST_TAGS=standard/payment_square_online,standard/odoo_square,square_coexistence` in the test Compose configuration. The `square_coexistence` tag selects the tests that require both add-ons. For website-provider-only testing, initialize `payment_square_online,sale_stock` and select `standard/payment_square_online`.
+
 ## Recover and review online payments
 
 A customer can close checkout while Square is processing a payment. They can return to their order in the portal to see the outcome. Odoo uses signed Square notifications and checks unresolved payments in the background. If Square has yet to confirm an outcome, the original payment stays processing and the order is protected against an accidental second charge.

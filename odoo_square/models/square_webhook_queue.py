@@ -22,6 +22,7 @@ class SquareWebhookQueue(models.Model):
     webhook_event_id = fields.Char(string="Webhook Event ID", required=True, index=True)
     event_type = fields.Char(string="Event Type", required=True, index=True)
     order_data = fields.Text(string="Order Data (JSON)", required=True)
+    config_id = fields.Many2one("square.config", string="Square Configuration", readonly=True)
 
     # Retry Logic
     square_order_id = fields.Char(
@@ -66,7 +67,7 @@ class SquareWebhookQueue(models.Model):
 
     @api.model
     def queue_event(
-        self, webhook_event_id, event_type, order_data, square_order_id=None
+        self, webhook_event_id, event_type, order_data, square_order_id=None, square_config=None,
     ):
         """
         Queue a webhook event for later processing
@@ -105,6 +106,7 @@ class SquareWebhookQueue(models.Model):
             "webhook_event_id": webhook_event_id,
             "event_type": event_type,
             "order_data": json.dumps(order_data),
+            "config_id": square_config.id if square_config else False,
             "square_order_id": square_order_id,
             "order_version": order_data.get("version"),
             "next_retry_time": fields.Datetime.now() + timedelta(seconds=30),
@@ -156,67 +158,15 @@ class SquareWebhookQueue(models.Model):
             # Parse order data
             order_data = json.loads(self.order_data)
 
-            # Check if dependency is met (order exists)
-            if self.depends_on_order and self.square_order_id:
-                order_exists = (
-                    self.env["sale.order"]
-                    .sudo()
-                    .search([("square_order_id", "=", self.square_order_id)], limit=1)
-                )
-
-                if not order_exists:
-                    # Order still doesn't exist, schedule next retry with exponential backoff
-                    retry_delay = min(30 * (2**self.retry_count), 3600)  # Max 1 hour
-                    next_retry = fields.Datetime.now() + timedelta(seconds=retry_delay)
-
-                    _logger.info(
-                        f"Order {self.square_order_id} still not found for event {self.webhook_event_id}, "
-                        f"retry {self.retry_count}/{self.max_retries} scheduled in {retry_delay}s"
-                    )
-
-                    self.write(
-                        {
-                            "state": "pending",
-                            "next_retry_time": next_retry,
-                            "error_message": f"Order {self.square_order_id} not found (retry {self.retry_count})",
-                        }
-                    )
-
-                    # If max retries reached, mark as expired
-                    if self.retry_count >= self.max_retries:
-                        self.write(
-                            {
-                                "state": "expired",
-                                "error_message": f"Max retries ({self.max_retries}) reached, order still not found",
-                            }
-                        )
-                        _logger.warning(
-                            f"Event {self.webhook_event_id} expired after {self.max_retries} retries"
-                        )
-
-                    return False
-
-            # Process the event using the webhook controller
             from odoo.addons.odoo_square.controllers.square_webhook import (
                 SquareWebhookController,
             )
 
-            controller = SquareWebhookController()
-
-            # Extract order data based on event type
-            if self.event_type == "order.updated":
-                _logger.info(
-                    f"Processing queued event {self.webhook_event_id} - Order state: {order_data.get('state')}"
-                )
-                result = controller._process_order(
-                    order_data, "updated", self.webhook_event_id
-                )
-            elif self.event_type == "order.created":
-                _logger.info(
-                    f"Processing queued event {self.webhook_event_id} - Order state: {order_data.get('state')}"
-                )
-                result = controller._process_order(
-                    order_data, "created", self.webhook_event_id
+            if self.event_type in ("order.updated", "order.created"):
+                result = SquareWebhookController()._process_order(
+                    order_data, self.event_type.split(".")[1], self.webhook_event_id,
+                    env=self.env, square_config=self.config_id,
+                    requires_existing=self.depends_on_order,
                 )
             else:
                 _logger.error(
@@ -228,7 +178,20 @@ class SquareWebhookQueue(models.Model):
                 return False
 
             # Check result
-            if result.get("status") in ["success", "updated", "already_processed"]:
+            if result.get("status") == "waiting_for_order":
+                retry_delay = min(30 * (2**self.retry_count), 3600)
+                expired = self.retry_count >= self.max_retries
+                self.write({
+                    "state": "expired" if expired else "pending",
+                    "next_retry_time": fields.Datetime.now() + timedelta(seconds=retry_delay),
+                    "error_message": (
+                        f"Max retries ({self.max_retries}) reached, order still not found" if expired
+                        else f"Order {self.square_order_id} not found (retry {self.retry_count})"
+                    ),
+                })
+                return False
+
+            if result.get("status") in ("success", "updated", "already_processed", "ignored"):
                 self.write(
                     {
                         "state": "completed",

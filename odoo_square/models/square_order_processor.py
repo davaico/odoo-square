@@ -123,6 +123,14 @@ class SquareOrderProcessor(models.Model):
         Creates new orders only, keeps them in draft state
         """
         square_order_data = dict(square_order_data or {})
+        order_id = square_order_data.get("order_id") or square_order_data.get("id")
+        api_client = self.env["square.api.client"].sudo()
+        config = self.env["square.config"].sudo().search([], limit=1)
+        routing, order_payload = api_client._route_website_order(order_id, config)
+        return routing or self._process_square_order(square_order_data, order_payload=order_payload)
+
+    def _process_square_order(self, square_order_data, *, order_payload=None):
+        square_order_data = dict(square_order_data or {})
         if square_order_data.get("id") and not square_order_data.get("order_id"):
             square_order_data["order_id"] = square_order_data["id"]
 
@@ -158,7 +166,10 @@ class SquareOrderProcessor(models.Model):
 
         bot_user = self._get_square_bot_user()
         sale_orders = self.env["sale.order"].with_user(bot_user)
-        order_payload = sale_orders._fetch_square_order_payload(square_order_data)
+        if order_payload:
+            order_payload = {**order_payload, "order_id": square_order_id}
+        else:
+            order_payload = sale_orders._fetch_square_order_payload(square_order_data)
         # Exchange notifications may contain only metadata. The retrieved order
         # lets us defer the exchange to payment.updated before creating a sale.
         returns = square_order_data.get("returns") or order_payload.get("returns", [])
@@ -213,7 +224,7 @@ class SquareOrderProcessor(models.Model):
             )
 
             if square_order_state == "COMPLETED":
-                self.process_square_order_update(square_order_data, sale_order)
+                self._process_square_order_update(square_order_data, sale_order, order_payload=order_payload)
 
             return {
                 "status": "success",
@@ -262,6 +273,16 @@ class SquareOrderProcessor(models.Model):
         Only create invoice and stock moves when order state is COMPLETED
         """
         square_order_data = dict(square_order_data or {})
+        order_id = square_order_data.get("order_id") or square_order_data.get("id")
+        api_client = self.env["square.api.client"].sudo()
+        config = self.env["square.config"].sudo().search([], limit=1)
+        routing, order_payload = api_client._route_website_order(order_id, config)
+        return routing or self._process_square_order_update(
+            square_order_data, sale_order, order_payload=order_payload,
+        )
+
+    def _process_square_order_update(self, square_order_data, sale_order, *, order_payload=None):
+        square_order_data = dict(square_order_data or {})
         if square_order_data.get("id") and not square_order_data.get("order_id"):
             square_order_data["order_id"] = square_order_data["id"]
 
@@ -299,7 +320,7 @@ class SquareOrderProcessor(models.Model):
                     key in square_order_data
                     for key in ("line_items", "returns", "return_line_items")
                 ):
-                    fetched_order = self.env["square.api.client"].get_order(square_order_id)
+                    fetched_order = order_payload or self.env["square.api.client"].get_order(square_order_id)
                     if not fetched_order:
                         raise ValueError(f"Could not retrieve Square order {square_order_id}")
                     snapshot_version = sale_order._square_snapshot_version(fetched_order)

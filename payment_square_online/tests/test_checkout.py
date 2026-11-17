@@ -14,8 +14,7 @@ from odoo import Command, fields
 from odoo.tests import HttpCase, new_test_user, tagged
 
 
-@tagged('post_install', '-at_install')
-class TestSquareCheckout(HttpCase):
+class SquareCheckoutCase(HttpCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -132,20 +131,20 @@ class TestSquareCheckout(HttpCase):
         }
 
     @staticmethod
-    def _square_response(method, url, *, status='COMPLETED', **kwargs):
+    def _square_response(method, url, *, status='COMPLETED', currency='USD', **kwargs):
         if method == 'POST' and url.endswith('/v2/orders'):
             order = kwargs['json']['order']
             data = {'order': {
                 'id': 'SQ-ORDER-1', 'location_id': order['location_id'],
                 'reference_id': order['reference_id'], 'state': 'OPEN',
-                'total_money': {'amount': 5000, 'currency': 'USD'},
+                'total_money': {'amount': 5000, 'currency': currency},
             }}
         elif method == 'POST' and url.endswith('/v2/payments'):
             payment = kwargs['json']
             data = {'payment': {
                 'id': 'SQ-PAYMENT-1', 'status': status, 'source_type': 'CARD', 'location_id': payment['location_id'],
                 'reference_id': payment['reference_id'], 'order_id': payment['order_id'],
-                'amount_money': {'amount': 5000, 'currency': 'USD'},
+                'amount_money': {'amount': 5000, 'currency': currency},
             }}
         else:
             raise AssertionError(f'Unexpected Square API call: {method} {url}')
@@ -154,6 +153,9 @@ class TestSquareCheckout(HttpCase):
         response._content = json.dumps(data).encode()
         return response
 
+
+@tagged('post_install', '-at_install')
+class TestSquareCheckout(SquareCheckoutCase):
     def test_checkout_pays_the_existing_order_with_tax_and_shipping(self):
         order = self._cart()
         values = self._prepare(order)
