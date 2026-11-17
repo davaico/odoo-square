@@ -383,3 +383,32 @@ class TestSquareCheckout(HttpCase):
         self.assertEqual(square.call_args.kwargs['json']['source_id'], 'cnon:browser-verified')
         self.assertEqual(order.state, 'sale')
         self.assertEqual(order.transaction_ids.payment_id.amount, 50)
+
+    def test_staff_cannot_forge_a_square_result_or_remove_the_reservation_using_rpc(self):
+        order = self._cart()
+        values = self._prepare(order)
+        tx_id = values['square_submission']['transaction_id']
+        operator = new_test_user(
+            self.env, login='square_operator', password='square_operator',
+            groups='account.group_account_invoice,sales_team.group_sale_salesman_all_leads',
+        )
+        self.authenticate(operator.login, operator.login)
+
+        def write(model, record, updates):
+            return self._rpc(
+                f'/web/dataset/call_kw/{model}/write', model=model, method='write',
+                args=[[record], updates], kwargs={},
+            )
+
+        self.assertIn('Square payment records can only be updated', write(
+            'payment.transaction', tx_id, {'state': 'done', 'provider_reference': 'fake-square-payment'},
+        )['error']['data']['message'])
+        self.assertIn('Square payment reservations cannot be edited', write(
+            'sale.order', order.id, {'square_online_transaction_id': False},
+        )['error']['data']['message'])
+        self.assertIn('Square payment reservations cannot be edited', write(
+            'sale.order', order.id, {'transaction_ids': [Command.clear()]},
+        )['error']['data']['message'])
+        self.env.invalidate_all()
+        self.assertEqual(order.transaction_ids.state, 'draft')
+        self.assertFalse(order.transaction_ids.provider_reference)

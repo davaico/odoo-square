@@ -1,8 +1,9 @@
 import json
 from hashlib import sha256
 
-from odoo import _, fields, models
-from odoo.exceptions import UserError
+from odoo import _, api, fields, models
+from odoo.fields import Command
+from odoo.exceptions import AccessError, UserError
 
 
 class SaleOrder(models.Model):
@@ -11,6 +12,37 @@ class SaleOrder(models.Model):
     square_online_transaction_id = fields.Many2one(
         'payment.transaction', readonly=True, copy=False, ondelete='restrict',
     )
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        if not self.env.su:
+            for values in vals_list:
+                self._square_check_reservation_write(values)
+            if 'default_square_online_transaction_id' in self.env.context:
+                raise AccessError(_("Square payment reservations cannot be edited."))
+        return super().create(vals_list)
+
+    def write(self, values):
+        if not self.env.su and {'square_online_transaction_id', 'transaction_ids'}.intersection(values):
+            self.check_access('write')
+            self._square_check_reservation_write(values)
+        return super().write(values)
+
+    def _square_check_reservation_write(self, values):
+        if 'square_online_transaction_id' in values:
+            raise AccessError(_("Square payment reservations cannot be edited."))
+        if 'transaction_ids' not in values:
+            return
+        # The relationship can also be edited from a sales order. Cover both existing links
+        # and attempts to move a Square transaction onto a different order.
+        transactions = self.sudo().transaction_ids
+        for command in values['transaction_ids'] or ():
+            if command[0] == Command.LINK:
+                transactions |= transactions.browse(command[1])
+            elif command[0] == Command.SET:
+                transactions |= transactions.browse(command[2])
+        if transactions.filtered(lambda tx: tx.provider_code == 'square_online'):
+            raise AccessError(_("Square payment reservations cannot be edited."))
 
     def _square_lock_checkout(self):
         self.ensure_one()

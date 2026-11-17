@@ -1,10 +1,18 @@
 from uuid import uuid4
 
 from odoo import _, api, fields, models
-from odoo.exceptions import UserError, ValidationError
+from odoo.exceptions import AccessError, UserError, ValidationError
 from odoo.http import request
 
 from odoo.addons.payment import utils as payment_utils
+
+
+_SQUARE_TRANSACTION_FIELDS = {
+    'amount', 'currency_id', 'invoice_ids', 'is_post_processed', 'landing_route',
+    'last_state_change', 'operation', 'partner_id', 'payment_id', 'payment_method_id',
+    'provider_id', 'provider_reference', 'reference', 'sale_order_ids',
+    'source_transaction_id', 'state', 'state_message', 'token_id', 'tokenize',
+}
 
 
 class PaymentTransaction(models.Model):
@@ -36,11 +44,39 @@ class PaymentTransaction(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
+        if not self.env.su and (
+            any(key.startswith('square_') for values in vals_list for key in values)
+            or any(key.startswith('default_square_') for key in self.env.context)
+        ):
+            raise AccessError(_("Square payment records can only be created by the Square integration."))
         transactions = super().create(vals_list)
+        if not self.env.su and transactions.filtered(lambda tx: tx.provider_code == 'square_online'):
+            raise AccessError(_("Square payment records can only be created by the Square integration."))
         for tx in transactions.filtered(lambda t: t.operation and t.operation.startswith('online_')):
             for order in tx.sale_order_ids.filtered('website_id').sorted('id'):
                 order._square_lock_checkout_for_change()
         return transactions
+
+    def write(self, values):
+        if not self.env.su and (
+            _SQUARE_TRANSACTION_FIELDS.intersection(values) or any(key.startswith('square_') for key in values)
+        ):
+            self.check_access('write')
+            target = self.env['payment.provider'].sudo().browse(values.get('provider_id') or [])
+            if (
+                any(key.startswith('square_') for key in values)
+                or target.code == 'square_online'
+                or self.sudo().filtered(lambda tx: tx.provider_code == 'square_online')
+            ):
+                raise AccessError(_("Square payment records can only be updated by the Square integration."))
+        return super().write(values)
+
+    def unlink(self):
+        if not self.env.su:
+            self.check_access('unlink')
+            if self.sudo().filtered(lambda tx: tx.provider_code == 'square_online'):
+                raise AccessError(_("Square payment records cannot be deleted manually."))
+        return super().unlink()
 
     def _square_validate_checkout(self, order):
         self.ensure_one()
