@@ -4,6 +4,7 @@ import os
 from base64 import b64encode
 from datetime import timedelta
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from cryptography.fernet import Fernet
 from lxml import html
@@ -185,6 +186,82 @@ class TestSquareCheckout(HttpCase):
             self.assertFalse(order.transaction_ids.child_transaction_ids)
             square.assert_not_called()
 
+    def test_checkout_renews_an_expired_connection_before_charging(self):
+        connection = self.env['payment.square.connection'].search([('provider_id', '=', self.provider.id)])
+        connection.write({
+            'refresh_token': connection._seal('test-refresh-token'),
+            'expires_at': fields.Datetime.now() - timedelta(minutes=1),
+        })
+        self.provider.invalidate_recordset(['square_connection_status'])
+        order = self._cart()
+        values = self._prepare(order)
+        requests_sent = []
+
+        def square(method, url, **kwargs):
+            self.assertTrue(url.startswith('https://connect.squareupsandbox.com/'))
+            requests_sent.append(url.rsplit('/', 1)[-1])
+            if url.endswith('/oauth2/token'):
+                self.assertEqual(method, 'POST')
+                self.assertEqual(kwargs['json'], {
+                    'grant_type': 'refresh_token', 'client_id': 'sandbox-sq0idb-checkout-test',
+                    'client_secret': 'sandbox-secret', 'refresh_token': 'test-refresh-token',
+                })
+                return self._oauth_response()
+            self.assertEqual(kwargs['headers']['Authorization'], 'Bearer renewed-access-token')
+            return self._square_response(method, url, **kwargs)
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square):
+            result = self._result(
+                '/payment/square/online/submit', **values['square_submission'], source_id='cnon:renewed',
+            )
+        self.assertEqual(result['state'], 'done')
+        self.assertEqual(requests_sent, ['token', 'orders', 'payments'])
+        self.assertEqual(self.provider.square_merchant_id, 'TESTMERCHANT')
+        self.assertEqual(self.provider.square_connection_status, 'ready')
+        self.assertEqual(self._result('/payment/status/poll')['state'], 'done')
+        self.assertEqual(order.state, 'sale')
+        self.assertEqual(order.transaction_ids.payment_id.amount, 50)
+
+    @staticmethod
+    def _oauth_response(merchant='TESTMERCHANT'):
+        response = Response()
+        response.status_code = 200
+        response._content = json.dumps({
+            'access_token': 'renewed-access-token', 'refresh_token': 'test-refresh-token',
+            'merchant_id': merchant, 'token_type': 'bearer', 'expires_at': '2099-03-17T10:00:00Z',
+        }).encode()
+        return response
+
+    def test_checkout_rejects_revoked_access_and_shows_reconnect_to_admin(self):
+        order = self._cart()
+        values = self._prepare(order)
+
+        def square(method, url, **kwargs):
+            if method == 'POST' and url.endswith('/v2/payments'):
+                return self._square_error_response(401, 'ACCESS_TOKEN_REVOKED')
+            return self._square_response(method, url, **kwargs)
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            result = self._result(
+                '/payment/square/online/submit', **values['square_submission'], source_id='cnon:revoked',
+            )
+            self.assertEqual(result['state'], 'error')
+            self.assertNotIn('square-error-detail', result['message'])
+            self.assertNotIn('data-provider-code="square_online"', self.url_open('/shop/payment').text)
+            self.assertEqual(api.call_count, 2)
+
+        self.assertEqual(self.provider.square_connection_status, 'reconnect')
+        self.assertEqual(self.provider.square_merchant_id, 'TESTMERCHANT')
+        self.assertIn(order.state, ('draft', 'sent'))
+        self.assertFalse(order.transaction_ids.payment_id)
+
+    @staticmethod
+    def _square_error_response(status, code):
+        response = Response()
+        response.status_code = status
+        response._content = json.dumps({'errors': [{'code': code, 'detail': 'square-error-detail'}]}).encode()
+        return response
+
     def test_declined_card_leaves_the_order_payable_again(self):
         order = self._cart()
         declined = self._prepare(order)
@@ -307,6 +384,111 @@ class TestSquareCheckout(HttpCase):
         self.assertEqual(tx.square_location_ref, 'TESTNYC')
         self.assertEqual(tx.payment_id.amount, 50)
         self.assertEqual(tx.payment_id.payment_type, 'inbound')
+        self.assertEqual(tx.payment_id.journal_id, self.journal)
+
+    def test_reconnect_recovers_original_pending_payment_after_renewal_failure(self):
+        order = self._cart()
+        values = self._prepare(order)
+        accepted = {}
+
+        def initial_checkout(method, url, **kwargs):
+            result = self._square_response(method, url, **kwargs)
+            if url.endswith('/v2/payments'):
+                accepted.update(result.json()['payment'])
+                raise Timeout('Square accepted the payment before the response was lost')
+            return result
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=initial_checkout):
+            self.assertEqual(self._result(
+                '/payment/square/online/submit', **values['square_submission'], source_id='cnon:timeout',
+            )['state'], 'pending')
+
+        tx = order.transaction_ids
+        connection = self.env['payment.square.connection'].search([('provider_id', '=', self.provider.id)])
+        connection.write({
+            'refresh_token': connection._seal('test-refresh-token'),
+            'expires_at': fields.Datetime.now() - timedelta(minutes=1),
+        })
+        self.env['ir.config_parameter'].set_param('web.base.url', 'https://store.example.test')
+        self.authenticate('admin', 'admin')
+
+        def refresh():
+            self._result(
+                '/web/dataset/call_button/payment.transaction/action_square_refresh_status',
+                model='payment.transaction', method='action_square_refresh_status', args=[tx.ids], kwargs={},
+            )
+
+        with patch('odoo.addons.payment_square_online.square_api.request', return_value=self._square_error_response(
+            400, 'INVALID_GRANT',
+        )) as api:
+            refresh()
+            self.assertEqual([call.args for call in api.call_args_list], [
+                ('POST', 'https://connect.squareupsandbox.com/oauth2/token'),
+            ])
+        self.assertEqual(tx.state, 'pending')
+        self.assertFalse(tx.payment_id)
+        self.assertIn('Reconnect the original Square account', tx.square_recovery_message)
+        self.assertEqual(self.provider.square_connection_status, 'reconnect')
+
+        def reconnect(code):
+            result = self._result(
+                '/web/dataset/call_button/payment.provider/action_square_authorize', model='payment.provider',
+                method='action_square_authorize', args=[self.provider.ids], kwargs={},
+            )
+            state = parse_qs(urlsplit(result['url']).query)['state'][0]
+            query = urlencode({'state': state, 'code': code})
+            callback = self.url_open(f'/payment/square/online/oauth/callback?{query}', allow_redirects=False)
+            self.assertEqual(callback.status_code, 303)
+            self.env.invalidate_all()
+
+        with patch('odoo.addons.payment_square_online.square_api.request', return_value=self._oauth_response(
+            merchant='OTHER_ACCOUNT',
+        )) as api:
+            reconnect('different-merchant')
+            self.assertEqual(api.call_count, 1)
+        self.assertEqual(self.provider.square_merchant_id, 'TESTMERCHANT')
+        self.assertEqual(self.provider.square_authorization_result, 'merchant_mismatch')
+        self.assertEqual(self.provider.square_connection_status, 'reconnect')
+        with patch('odoo.addons.payment_square_online.square_api.request') as api:
+            refresh()
+            api.assert_not_called()
+
+        def reconnected_square(method, url, **kwargs):
+            if method == 'POST' and url.endswith('/oauth2/token'):
+                self.assertEqual(kwargs['json']['grant_type'], 'authorization_code')
+                return self._oauth_response()
+            self.assertEqual(method, 'GET')
+            self.assertEqual(kwargs['headers']['Authorization'], 'Bearer renewed-access-token')
+            response = Response()
+            response.status_code = 200
+            if url.endswith('/v2/locations'):
+                data = {'locations': [{
+                    'id': 'NEW_LOCATION', 'name': 'New location', 'merchant_id': 'TESTMERCHANT',
+                    'status': 'ACTIVE', 'country': 'US', 'currency': 'USD',
+                    'capabilities': ['CREDIT_CARD_PROCESSING'],
+                }]}
+            else:
+                self.assertTrue(url.endswith('/v2/payments'))
+                self.assertEqual(kwargs['params']['location_id'], 'TESTNYC')
+                data = {'payments': [accepted]}
+            response._content = json.dumps(data).encode()
+            return response
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=reconnected_square):
+            reconnect('original-merchant')
+            self.assertEqual(self.provider.square_authorization_result, 'connected')
+            replacement = self.env['payment.square.location'].search([
+                ('provider_id', '=', self.provider.id), ('square_id', '=', 'NEW_LOCATION'),
+            ])
+            self.provider.square_location_id = replacement
+            refresh()
+        self.assertEqual(self.provider.square_connection_status, 'ready')
+        self.assertEqual(tx.state, 'done')
+        self.assertEqual(tx.square_location_ref, 'TESTNYC')
+        self.assertEqual(tx.provider_reference, accepted['id'])
+        self.assertFalse(tx.square_recovery_message)
+        self.assertEqual(order.state, 'sale')
+        self.assertEqual(tx.payment_id.amount, 50)
         self.assertEqual(tx.payment_id.journal_id, self.journal)
 
     def test_signed_webhook_records_late_success_without_reopening_the_cancelled_order(self):

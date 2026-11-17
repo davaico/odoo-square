@@ -29,7 +29,9 @@ class PaymentProvider(models.Model):
     square_connection_status = fields.Selection([
         ('configure', 'Enter Square application credentials'),
         ('authorize', 'Authorize with Square'),
+        ('renewal_due', 'Square access token is due for automatic renewal'),
         ('expired', 'Square authorization expired. Reconnect to Square'),
+        ('reconnect', 'Square authorization is invalid. Reconnect with the original Square account'),
         ('credentials_unavailable', 'Restore the Square credential encryption key'),
         ('no_locations', 'Square returned no active locations eligible for card processing'),
         ('select_location', 'Select an eligible Square location'),
@@ -77,9 +79,12 @@ class PaymentProvider(models.Model):
         self.ensure_one()
         if not (self.square_application_id and connection.application_secret):
             return 'configure'
+        if connection.reauthorization_required:
+            return 'reconnect'
         if not connection.access_token:
             return 'authorize'
-        if not connection.expires_at or connection.expires_at <= fields.Datetime.now():
+        expired = not connection.expires_at or connection.expires_at <= fields.Datetime.now()
+        if expired and not connection.refresh_token:
             return 'expired'
         try:
             connection._unseal(connection.access_token)
@@ -93,7 +98,7 @@ class PaymentProvider(models.Model):
             return 'select_location'
         if not self._square_has_eligible_journal():
             return 'select_journal'
-        return 'ready'
+        return 'renewal_due' if expired else 'ready'
 
     def _square_has_eligible_location(self):
         self.ensure_one()
@@ -129,7 +134,7 @@ class PaymentProvider(models.Model):
             expected_state = 'test' if provider.square_environment == 'sandbox' else 'enabled'
             if provider.state != expected_state:
                 raise ValidationError(_("Use Test Mode with Square Sandbox and Enabled with Square Production."))
-            if provider._square_connection_status(provider._square_get_connection()) != 'ready':
+            if provider._square_connection_status(provider._square_get_connection()) not in ('ready', 'renewal_due'):
                 raise ValidationError(_("Connect Square and select an eligible location and bank journal before enabling it."))
 
     def write(self, values):
@@ -211,7 +216,7 @@ class PaymentProvider(models.Model):
             and (not p.website_id or p.website_id.id == kwargs.get('website_id'))
             and p.inline_form_view_id
             and currency.name == p.square_location_id.sudo().currency_code
-            and p.square_connection_status == 'ready'
+            and p.square_connection_status in ('ready', 'renewal_due')
         ))
         payment_utils.add_to_report(
             report, unavailable, available=False,

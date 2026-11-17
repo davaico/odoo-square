@@ -59,10 +59,19 @@ class PaymentTransaction(models.Model):
             or provider.square_environment != self.square_environment
             or provider.square_application_id != self.square_application_id
             or not connection.access_token
-            or not connection.expires_at or connection.expires_at <= fields.Datetime.now()
         ):
             raise UserError(_("Reconnect the original Square account to recover this transaction."))
-        return connection._unseal(connection.access_token)
+        return connection._access_token_for_use()
+
+    def _square_request(self, method, path, **kwargs):
+        access_token = self._square_recovery_credentials()
+        try:
+            return square_request(self.square_environment, method, path, access_token=access_token, **kwargs)
+        except SquareAPIError as error:
+            # The credentials lookup holds the connection row lock through the request.
+            if error.is_authorization_error:
+                self.square_connection_id._record_authorization_failure()
+            raise
 
     def _square_refresh_status(self, *, payment_id=None):
         """Read and apply an existing operation under the same lock as checkout dispatch."""
@@ -83,14 +92,14 @@ class PaymentTransaction(models.Model):
             return False
 
         try:
-            verified = self._square_refresh_payment(self._square_recovery_credentials(), payment_id=payment_id)
+            verified = self._square_refresh_payment(payment_id=payment_id)
         except UserError as error:
             self.square_recovery_message = error.args[0]
             return False
         except SquareAPIError as error:
             self.square_recovery_message = (
                 _("Reconnect the original Square account to recover this transaction.")
-                if error.status in (401, 403)
+                if error.is_authorization_error
                 else _("Odoo could not check the Square payment. Try refreshing its status again later.")
             )
             return False
@@ -103,15 +112,12 @@ class PaymentTransaction(models.Model):
         self._square_post_process_recovered_payment()
         return True
 
-    def _square_refresh_payment(self, access_token, *, payment_id=None):
+    def _square_refresh_payment(self, *, payment_id=None):
         payment_id = payment_id or self.provider_reference
         if payment_id:
             if self.provider_reference and self.provider_reference != payment_id:
                 return False
-            response = square_request(
-                self.square_environment, 'GET', f'/v2/payments/{quote(payment_id, safe="")}',
-                access_token=access_token,
-            )
+            response = self._square_request('GET', f'/v2/payments/{quote(payment_id, safe="")}')
             payment = response.get('payment')
             return isinstance(payment, dict) and payment.get('id') == payment_id and self._square_apply_payment(payment)
 
@@ -121,9 +127,7 @@ class PaymentTransaction(models.Model):
         params = {'location_id': self.square_location_ref, 'begin_time': earliest.isoformat() + 'Z', 'sort_order': 'ASC'}
         cursors = set()
         while True:
-            response = square_request(
-                self.square_environment, 'GET', '/v2/payments', access_token=access_token, params=params,
-            )
+            response = self._square_request('GET', '/v2/payments', params=params)
             payments = response.get('payments', [])
             if not isinstance(payments, list):
                 return False

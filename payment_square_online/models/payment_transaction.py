@@ -193,11 +193,9 @@ class PaymentTransaction(models.Model):
         ):
             raise UserError(_("Another payment has already started for this order."))
 
-        access_token = connection._unseal(connection.access_token)
         order.square_online_transaction_id = self
         self.square_reserved_at = fields.Datetime.now()
         self._set_pending(state_message=_("Square is processing your payment. Please do not pay again."))
-        return access_token
 
     def _square_money(self):
         self.ensure_one()

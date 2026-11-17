@@ -9,6 +9,10 @@ class SquareAPIError(Exception):
         self.status = status
         self.codes = codes
 
+    @property
+    def is_authorization_error(self):
+        return self.status in (401, 403)
+
 
 def square_request(environment, method, path, *, access_token=None, payload=None, params=None):
     headers = {'Square-Version': SQUARE_API_VERSION, 'Accept': 'application/json'}

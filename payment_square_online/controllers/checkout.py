@@ -2,7 +2,7 @@ import math
 import re
 
 from odoo import _, api, fields
-from odoo.exceptions import ValidationError
+from odoo.exceptions import UserError, ValidationError
 from odoo.http import request, route
 
 from odoo.addons.payment import utils as payment_utils
@@ -10,7 +10,7 @@ from odoo.addons.payment.controllers.post_processing import PaymentPostProcessin
 from odoo.addons.website_sale.controllers.main import WebsiteSale
 from odoo.addons.website_sale.controllers.payment import PaymentPortal
 
-from ..square_api import SquareAPIError, square_request
+from ..square_api import SquareAPIError
 
 
 # These errors reject the card operation. A reused token, an idempotency conflict, an
@@ -94,48 +94,48 @@ class SquarePaymentPortal(PaymentPortal):
             if order.id != request.session.get('sale_order_id'):
                 raise ValidationError(_("This cart is no longer current. Please refresh checkout."))
 
-            access_token = tx._square_claim_checkout(order)
-            environment = tx.square_environment
-            reference = tx.square_order_reference
-            location = tx.square_location_ref
-            money = tx._square_money()
+            tx._square_claim_checkout(order)
             order_id = order.id
 
-        payment_order_id = self._square_create_order(environment, access_token, reference, location, money)
         # Keep the Square order ID and dispatch time durable even if the worker stops immediately
         # after sending CreatePayment. A repeated browser request only reads the same attempt.
         with request.env.registry.cursor() as cr:
             tx = self._square_lock_attempt(cr, transaction_id)
             if tx.state != 'pending' or tx.square_dispatched_at:
                 return self._square_status(tx)
+            payment_order_id = self._square_create_order(tx)
             if not payment_order_id:
                 tx._set_error(_("Could not start the Square payment. No payment was sent. Please try again."))
                 return self._square_status(tx)
             tx.write({'square_order_id': payment_order_id, 'square_dispatched_at': fields.Datetime.now()})
 
         self._square_monitor(transaction_id, order_id)
-        try:
-            response = square_request(environment, 'POST', '/v2/payments', access_token=access_token, payload={
-                'idempotency_key': f'pay-{reference}',
-                'reference_id': reference,
-                'source_id': source_id,
-                'location_id': location,
-                'order_id': payment_order_id,
-                'amount_money': money,
-                'autocomplete': True,
-                'accept_partial_authorization': False,
-            })
-        except SquareAPIError as error:
-            if error.status in (400, 402) and error.codes and set(error.codes) <= _CARD_REJECTIONS:
-                with request.env.registry.cursor() as cr:
-                    tx = self._square_lock_attempt(cr, transaction_id)
-                    if tx.state == 'pending' and not tx.provider_reference:
-                        tx._set_error(_("Square declined the payment. Check your card or use a different payment method."))
-                    return self._square_status(tx)
-            return {'state': 'pending'}
-
         with request.env.registry.cursor() as cr:
             tx = self._square_lock_attempt(cr, transaction_id)
+            if tx.state != 'pending' or tx.provider_reference:
+                return self._square_status(tx)
+            try:
+                response = tx._square_request('POST', '/v2/payments', payload={
+                    'idempotency_key': f'pay-{tx.square_order_reference}',
+                    'reference_id': tx.square_order_reference,
+                    'source_id': source_id,
+                    'location_id': tx.square_location_ref,
+                    'order_id': payment_order_id,
+                    'amount_money': tx._square_money(),
+                    'autocomplete': True,
+                    'accept_partial_authorization': False,
+                })
+            except UserError:
+                tx._set_error(_("Could not start the Square payment. No payment was sent. Please try again."))
+                return self._square_status(tx)
+            except SquareAPIError as error:
+                if error.is_authorization_error:
+                    tx._set_error(_("Square is unavailable. No payment was collected. Choose another payment method."))
+                    return self._square_status(tx)
+                if error.status in (400, 402) and error.codes and set(error.codes) <= _CARD_REJECTIONS:
+                    tx._set_error(_("Square declined the payment. Check your card or use a different payment method."))
+                    return self._square_status(tx)
+                return {'state': 'pending'}
             tx._square_apply_payment(response.get('payment'))
             return self._square_status(tx)
 
@@ -154,9 +154,12 @@ class SquarePaymentPortal(PaymentPortal):
         return tx
 
     @staticmethod
-    def _square_create_order(environment, access_token, reference, location, money):
+    def _square_create_order(tx):
+        reference = tx.square_order_reference
+        location = tx.square_location_ref
+        money = tx._square_money()
         try:
-            response = square_request(environment, 'POST', '/v2/orders', access_token=access_token, payload={
+            response = tx._square_request('POST', '/v2/orders', payload={
                 'idempotency_key': f'order-{reference}',
                 'order': {
                     'location_id': location,
@@ -168,7 +171,7 @@ class SquarePaymentPortal(PaymentPortal):
                     }],
                 },
             })
-        except SquareAPIError:
+        except (SquareAPIError, UserError):
             return None
         order = response.get('order')
         if (
