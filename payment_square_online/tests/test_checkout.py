@@ -265,12 +265,13 @@ class TestSquareCheckout(HttpCase):
     def _refund_button(self, model, method, record_id, **kwargs):
         return self._result('/web/dataset/call_button', model=model, method=method, args=[[record_id]], kwargs=kwargs)
 
-    def _refund_wizard(self, payment, amount):
+    def _refund_wizard(self, payment, amount=None):
         action = self._refund_button('account.payment', 'action_refund_wizard', payment.id)
         self.assertEqual(action['res_model'], 'payment.refund.wizard')
         return self._result(
             '/web/dataset/call_kw', model=action['res_model'], method='create',
-            args=[{'payment_id': payment.id, 'amount_to_refund': amount}], kwargs={},
+            args=[{'amount_to_refund': amount} if amount is not None else {}],
+            kwargs={'context': {'active_id': payment.id}},
         )
 
     def _captured_order(self):
@@ -372,6 +373,102 @@ class TestSquareCheckout(HttpCase):
         self.assertEqual(charge.payment_id.amount_available_for_refund, 50)
         self.assertFalse(refund.payment_id)
 
+    def test_accounting_manager_issues_successive_partial_refunds_and_the_remainder(self):
+        self.env['ir.config_parameter'].set_param('sale.automatic_invoice', 'True')
+        order = self._captured_order()
+        charge = order.transaction_ids
+        payment = charge.payment_id
+        credit_notes = self.env['account.move'].search([('move_type', '=', 'out_refund')])
+        if 'picking_ids' in order._fields:
+            self.assertTrue(order.picking_ids)
+            pickings = self.env['stock.picking'].search([]).read(['state'])
+            moves = self.env['stock.move'].search([]).read(['state', 'quantity', 'origin_returned_move_id'])
+        manager = new_test_user(self.env, login='square_partial_manager', password='square_partial_manager',
+                                groups='account.group_account_manager', company_id=self.company.id)
+        self.authenticate(manager.login, manager.login)
+
+        def square_refund(method, url, **kwargs):
+            self.assertEqual((method, url), ('POST', 'https://connect.squareupsandbox.com/v2/refunds'))
+            request = kwargs['json']
+            self.assertEqual(request['payment_id'], 'SQ-PAYMENT-1')
+            return self._refund_response({'refund': {
+                'id': request['idempotency_key'], 'status': 'COMPLETED', 'location_id': 'TESTNYC',
+                'payment_id': 'SQ-PAYMENT-1', 'amount_money': request['amount_money'],
+                'reason': request['reason'],
+            }})
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square_refund) as square:
+            refund_ids = []
+            for amount, available, refunded in ((10.01, 50, 0), (10.01, 39.99, 10.01), (None, 29.98, 20.02)):
+                wizard = self._refund_wizard(payment, amount)
+                summary = self._result(
+                    '/web/dataset/call_kw', model='payment.refund.wizard', method='read', args=[[wizard], [
+                        'support_refund', 'amount_available_for_refund', 'refunded_amount', 'has_pending_refund',
+                    ]], kwargs={},
+                )
+                self.assertEqual(summary, [{
+                    'id': wizard, 'support_refund': 'partial', 'amount_available_for_refund': available,
+                    'refunded_amount': refunded, 'has_pending_refund': False,
+                }])
+                action = self._refund_button('payment.refund.wizard', 'action_refund', wizard)
+                self.assertEqual(self._refund_button('payment.refund.wizard', 'action_refund', wizard), action)
+                refund_ids.append(action['res_id'])
+
+        self.assertEqual([call.kwargs['json']['amount_money'] for call in square.call_args_list], [
+            {'amount': 1001, 'currency': 'USD'}, {'amount': 1001, 'currency': 'USD'},
+            {'amount': 2998, 'currency': 'USD'},
+        ])
+        refunds = self.env['payment.transaction'].browse(refund_ids)
+        self.assertEqual(len(refunds), 3)
+        self.assertEqual(refunds.mapped('state'), ['done', 'done', 'done'])
+        self.assertEqual(refunds.mapped('amount'), [-10.01, -10.01, -29.98])
+        self.assertEqual(len(set(refunds.mapped('provider_reference'))), 3)
+        self.assertEqual(refunds.square_refund_requested_by_id, manager)
+        self.assertEqual(refunds.source_transaction_id, charge)
+        outbound = self.env['account.payment'].search([('source_payment_id', '=', payment.id)])
+        self.assertEqual(outbound, refunds.payment_id.sorted('id', reverse=True))
+        self.assertEqual(outbound.mapped('payment_type'), ['outbound', 'outbound', 'outbound'])
+        self.assertEqual(outbound.move_id.mapped('state'), ['posted', 'posted', 'posted'])
+        self.assertCountEqual(outbound.mapped('amount'), [10.01, 10.01, 29.98])
+        self.assertEqual(sum(outbound.mapped('amount')), 50)
+        self.assertEqual(payment.amount_available_for_refund, 0)
+        self.assertEqual(order.invoice_ids.amount_residual, 0)
+        self.assertEqual(self.env['account.move'].search([('move_type', '=', 'out_refund')]), credit_notes)
+        if 'picking_ids' in order._fields:
+            self.assertEqual(self.env['stock.picking'].search([]).read(['state']), pickings)
+            self.assertEqual(self.env['stock.move'].search([]).read(['state', 'quantity', 'origin_returned_move_id']), moves)
+
+    def test_refund_rejects_invalid_amounts_before_monetary_rounding(self):
+        charge = self._captured_order().transaction_ids
+        self.authenticate('admin', 'admin')
+        payment = charge.payment_id
+        wizard = self._refund_wizard(payment, 10)
+        with patch('odoo.addons.payment_square_online.square_api.request') as square:
+            for amount in (0, -1, 50.01, 1.001, 50.001):
+                with self.subTest(amount=amount):
+                    for model, method, args, kwargs in (
+                        ('payment.refund.wizard', 'create',
+                         [{'payment_id': payment.id, 'amount_to_refund': amount}], {}),
+                        ('payment.refund.wizard', 'write', [[wizard], {'amount_to_refund': amount}], {}),
+                        ('payment.transaction', 'action_refund', [charge.ids], {'amount_to_refund': amount}),
+                    ):
+                        response = self._rpc('/web/dataset/call_kw', model=model, method=method,
+                                             args=args, kwargs=kwargs)
+                        self.assertEqual(response.get('error', {}).get('data', {}).get('name'),
+                                         'odoo.exceptions.ValidationError', response)
+            response = self._rpc('/web/dataset/call_kw', model='payment.refund.wizard', method='create',
+                                 args=[{}], kwargs={'context': {
+                                     'active_id': payment.id, 'default_amount_to_refund': 1.001,
+                                 }})
+            self.assertEqual(response.get('error', {}).get('data', {}).get('name'),
+                             'odoo.exceptions.ValidationError', response)
+            response = self._rpc('/web/dataset/call_button', model='payment.transaction', method='action_refund',
+                                 args=[charge.ids], kwargs={'amount_to_refund': 10})
+            self.assertIn('Refund wizard', response['error']['data']['message'])
+            square.assert_not_called()
+        self.assertFalse(charge.child_transaction_ids)
+        self.assertEqual(payment.amount_available_for_refund, 50)
+
     def test_refund_response_loss_recovers_by_marker_and_known_id_without_another_post(self):
         charge = self._captured_order().transaction_ids
         self.authenticate('admin', 'admin')
@@ -423,6 +520,71 @@ class TestSquareCheckout(HttpCase):
         self.assertEqual(refund.payment_id.payment_type, 'outbound')
         self.assertEqual(refund.payment_id.source_payment_id, charge.payment_id)
         self.assertEqual(self.env['account.payment'].search_count([('source_payment_id', '=', charge.payment_id.id)]), 1)
+
+    def test_pending_partial_refund_reserves_only_its_amount_until_square_reports_failure(self):
+        charge = self._captured_order().transaction_ids
+        self.authenticate('admin', 'admin')
+        payment = charge.payment_id
+        stale_wizard = self._refund_wizard(payment, 40)
+        pending_wizard = self._refund_wizard(payment, 18.51)
+        accepted = {}
+        found = False
+
+        def square_refund(method, url, **kwargs):
+            self.assertEqual(url, 'https://connect.squareupsandbox.com/v2/refunds')
+            if method == 'GET':
+                return self._refund_response({'refunds': [accepted] if found else []})
+            self.assertEqual(method, 'POST')
+            request = kwargs['json']
+            data = {
+                'id': request['idempotency_key'], 'status': 'COMPLETED', 'location_id': 'TESTNYC',
+                'payment_id': 'SQ-PAYMENT-1', 'amount_money': request['amount_money'],
+                'reason': request['reason'],
+            }
+            if request['amount_money']['amount'] == 1851:
+                accepted.update({**data, 'status': 'FAILED'})
+                raise Timeout('Square accepted the refund before the response was lost')
+            return self._refund_response({'refund': data})
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square_refund) as square:
+            pending = self._refund_button('payment.refund.wizard', 'action_refund', pending_wizard)
+            refund = self.env['payment.transaction'].browse(pending['res_id'])
+            self._refund_button('payment.transaction', 'action_square_refresh_status', refund.id)
+            self.assertEqual(self._refund_button('payment.refund.wizard', 'action_refund', pending_wizard), pending)
+            self.assertEqual(refund.state, 'pending')
+            self.assertEqual(payment.amount_available_for_refund, 31.49)
+            blocked = self._rpc('/web/dataset/call_button', model='payment.refund.wizard', method='action_refund',
+                                args=[[stale_wizard]], kwargs={})
+            self.assertIn('remaining refundable balance', blocked['error']['data']['message'])
+
+            second_wizard = self._refund_wizard(payment, 10.25)
+            summary = self._result(
+                '/web/dataset/call_kw', model='payment.refund.wizard', method='read', args=[[second_wizard], [
+                    'amount_available_for_refund', 'refunded_amount', 'has_pending_refund',
+                ]], kwargs={},
+            )
+            self.assertEqual(summary, [{
+                'id': second_wizard, 'amount_available_for_refund': 31.49,
+                'refunded_amount': 0, 'has_pending_refund': True,
+            }])
+            self._refund_button('payment.refund.wizard', 'action_refund', second_wizard)
+            self.assertEqual(payment.amount_available_for_refund, 21.24)
+
+            found = True
+            self._refund_button('payment.transaction', 'action_square_refresh_status', refund.id)
+            self.assertEqual(refund.state, 'error')
+            self.assertEqual(refund.provider_reference, accepted['id'])
+            self.assertFalse(refund.payment_id)
+            self.assertEqual(payment.amount_available_for_refund, 39.75)
+            final_wizard = self._refund_wizard(payment, 39.75)
+            self._refund_button('payment.refund.wizard', 'action_refund', final_wizard)
+
+        self.assertEqual([call.args[0] for call in square.call_args_list], ['POST', 'GET', 'POST', 'GET', 'POST'])
+        self.assertEqual([call.kwargs['json']['amount_money']['amount']
+                          for call in square.call_args_list if call.args[0] == 'POST'], [1851, 1025, 3975])
+        outbound = self.env['account.payment'].search([('source_payment_id', '=', payment.id)])
+        self.assertCountEqual(outbound.mapped('amount'), [10.25, 39.75])
+        self.assertEqual(payment.amount_available_for_refund, 0)
 
     def test_square_refund_actions_deny_unauthorized_users_and_companies(self):
         charge = self._captured_order().transaction_ids

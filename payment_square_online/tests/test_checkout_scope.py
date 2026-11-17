@@ -248,43 +248,62 @@ class TestSquareCheckoutScope(HttpCase):
 
                 self.authenticate('admin', 'admin')
 
+                partial, remaining = (29, 5014) if code == 'JPY' else (0.29, 50.14)
+
                 def square_refund(method, url, **kwargs):
                     self.assertEqual(method, 'POST')
                     self.assertTrue(url.endswith('/v2/refunds'))
                     request = kwargs['json']
                     self.assertEqual(request['payment_id'], f'SQ-PAYMENT-{code}')
-                    self.assertEqual(request['amount_money'], {'amount': 5043, 'currency': code})
                     self.assertIs(type(request['amount_money']['amount']), int)
                     response = Response()
                     response.status_code = 200
                     response._content = json.dumps({'refund': {
-                        'id': f'SQ-REFUND-{code}', 'status': 'COMPLETED', 'location_id': code,
-                        'payment_id': f'SQ-PAYMENT-{code}', 'amount_money': {'amount': 5043, 'currency': code},
+                        'id': request['idempotency_key'], 'status': 'COMPLETED', 'location_id': code,
+                        'payment_id': f'SQ-PAYMENT-{code}', 'amount_money': request['amount_money'],
                         'reason': request['reason'],
                     }}).encode()
                     return response
 
                 with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square_refund) as square:
+                    wizard_values = {'payment_id': transaction.payment_id.id}
+                    if code == 'JPY':
+                        invalid = self._rpc('/web/dataset/call_kw', model='payment.refund.wizard', method='create',
+                                            args=[{**wizard_values, 'amount_to_refund': 29.01}], kwargs={})
+                        self.assertEqual(invalid.get('error', {}).get('data', {}).get('name'),
+                                         'odoo.exceptions.ValidationError', invalid)
+                        square.assert_not_called()
+                    wizard_id = self._result(
+                        '/web/dataset/call_kw', model='payment.refund.wizard', method='create',
+                        args=[{**wizard_values, 'amount_to_refund': partial}], kwargs={},
+                    )
+                    self._result('/web/dataset/call_button', model='payment.refund.wizard', method='action_refund',
+                                 args=[[wizard_id]], kwargs={})
+                    self.assertEqual(transaction.payment_id.amount_available_for_refund, remaining)
                     self._result('/web/dataset/call_button', model='payment.transaction', method='action_refund',
                                  args=[transaction.ids], kwargs={})
-                    square.assert_called_once()
-                refund = transaction.child_transaction_ids
-                self.assertEqual(refund.amount, -total)
-                self.assertEqual(refund.currency_id, currency)
-                self.assertEqual(refund.payment_id.payment_type, 'outbound')
-                self.assertEqual(refund.payment_id.currency_id, currency)
-                self.assertEqual(refund.payment_id.amount, total)
-                self.assertEqual(refund.payment_id.source_payment_id, transaction.payment_id)
-                self.assertEqual(refund.payment_id.move_id.state, 'posted')
+                self.assertEqual([call.kwargs['json']['amount_money'] for call in square.call_args_list], [
+                    {'amount': 29, 'currency': code}, {'amount': 5014, 'currency': code},
+                ])
+                refunds = transaction.child_transaction_ids
+                self.assertCountEqual(refunds.mapped('amount'), [-partial, -remaining])
+                self.assertEqual(refunds.currency_id, currency)
+                outbound = refunds.payment_id
+                self.assertEqual(outbound.mapped('payment_type'), ['outbound', 'outbound'])
+                self.assertEqual(outbound.currency_id, currency)
+                self.assertCountEqual(outbound.mapped('amount'), [partial, remaining])
+                self.assertEqual(outbound.source_payment_id, transaction.payment_id)
+                self.assertEqual(outbound.move_id.mapped('state'), ['posted', 'posted'])
+                self.assertEqual(transaction.payment_id.amount_available_for_refund, 0)
                 if code == 'CAD':
-                    receivable = refund.payment_id.move_id.line_ids.filtered(
+                    receivable = outbound.move_id.line_ids.filtered(
                         lambda line: line.account_id.account_type == 'asset_receivable',
                     )
-                    self.assertEqual(refund.payment_id.journal_id.currency_id, self.company.currency_id)
-                    self.assertEqual(receivable.amount_currency, 50.43)
-                    self.assertEqual(receivable.balance, 201.72)
-                    self.assertEqual(receivable.amount_residual_currency, 50.43)
-                    self.assertFalse(receivable.reconciled)
+                    self.assertEqual(outbound.journal_id.currency_id, self.company.currency_id)
+                    self.assertCountEqual(receivable.mapped('amount_currency'), [0.29, 50.14])
+                    self.assertCountEqual(receivable.mapped('balance'), [1.16, 200.56])
+                    self.assertCountEqual(receivable.mapped('amount_residual_currency'), [0.29, 50.14])
+                    self.assertEqual(receivable.mapped('reconciled'), [False, False])
 
     def test_checkout_cannot_bypass_native_card_availability_with_stale_form(self):
         provider = self._configure_provider(self.company, self.website, 'USA', 'US', 'USD')

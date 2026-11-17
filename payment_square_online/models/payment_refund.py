@@ -1,4 +1,5 @@
 from datetime import timedelta
+from decimal import Decimal
 from math import isfinite
 from urllib.parse import quote
 from uuid import uuid4
@@ -7,6 +8,7 @@ from odoo import _, api, fields, models
 from odoo.exceptions import AccessError, UserError, ValidationError
 
 from odoo.addons.payment import utils as payment_utils
+from odoo.addons.payment.const import CURRENCY_MINOR_UNITS
 
 from ..square_api import SquareAPIError
 from .payment_recovery import _DISPATCH_RESERVATION_TIMEOUT
@@ -75,9 +77,18 @@ class PaymentTransaction(models.Model):
         return max(self.square_amount_minor - sum(reserved.mapped('square_amount_minor')), 0)
 
     def _square_refund_amount(self, amount_minor):
-        return payment_utils.to_major_currency_units(
-            amount_minor, self.currency_id, arbitrary_decimal_number=0 if self.square_currency_code == 'JPY' else 2,
-        )
+        return payment_utils.to_major_currency_units(amount_minor, self.currency_id)
+
+    def _square_refund_minor(self, amount):
+        self.ensure_one()
+        if type(amount) not in (int, float) or (type(amount) is float and not isfinite(amount)) or amount <= 0:
+            raise ValidationError(_("The Square refund amount must be a positive number."))
+        currency = self.currency_id
+        digits = CURRENCY_MINOR_UNITS.get(currency.name, currency.decimal_places)
+        amount_minor = Decimal(str(amount)).scaleb(digits)
+        if amount_minor != amount_minor.to_integral_value():
+            raise ValidationError(_("The Square refund amount must use whole minor units of %s.", currency.name))
+        return int(amount_minor)
 
     def _send_refund_request(self, amount_to_refund=None, *, wizard_id=None):
         self.ensure_one()
@@ -127,18 +138,17 @@ class PaymentTransaction(models.Model):
         available = self._square_refundable_minor()
         if not available:
             raise UserError(_("This Square payment has no amount available to refund."))
-        if amount_to_refund is not None and (
-            type(amount_to_refund) not in (int, float)
-            or (type(amount_to_refund) is float and not isfinite(amount_to_refund))
-            or amount_to_refund != self._square_refund_amount(available)
-        ):
-            raise ValidationError(_("Refund the full remaining Square payment amount."))
+        amount_minor = available if amount_to_refund is None else self._square_refund_minor(amount_to_refund)
+        if amount_minor > available:
+            raise ValidationError(_("The Square refund amount exceeds the remaining refundable balance."))
+        if not wizard_id and amount_minor < available:
+            raise ValidationError(_("Use the payment's Refund wizard to request a partial Square refund."))
 
         # Updating the shared source makes a competing repeatable-read snapshot retry before
         # summing its children, even when that snapshot predates the new child.
         self.square_refund_revision += 1
         refund = self._square_create_refund_child(
-            available,
+            amount_minor,
             square_refund_key=f'odoo-refund-{uuid4().hex}',
             square_refund_wizard_id=wizard_id or False,
             square_refund_requested_by_id=actor_id,
