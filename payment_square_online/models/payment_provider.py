@@ -1,3 +1,4 @@
+from math import isclose, ulp
 from urllib.parse import urlencode, urlsplit
 
 from odoo import _, api, fields, models
@@ -210,9 +211,14 @@ class PaymentProvider(models.Model):
             company_id, partner_id, amount, currency_id, *args, report=report, **kwargs,
         )
         currency = self.env['res.currency'].browse(currency_id).exists()
+        has_exact_amount = False
+        if self.env.context.get('square_online_checkout') and currency and amount > 0:
+            amount_minor = payment_utils.to_minor_currency_units(amount, currency)
+            payable_amount = payment_utils.to_major_currency_units(amount_minor, currency)
+            # Allow float representation noise without applying Odoo's currency rounding.
+            has_exact_amount = amount_minor > 0 and isclose(amount, payable_amount, rel_tol=0, abs_tol=ulp(amount))
         unavailable = providers.filtered(lambda p: p.code == 'square_online' and not (
-            self.env.context.get('square_online_checkout') and amount > 0
-            and p.company_id.id == company_id
+            has_exact_amount and p.company_id.id == company_id
             and (not p.website_id or p.website_id.id == kwargs.get('website_id'))
             and p.inline_form_view_id
             and currency.name == p.square_location_id.sudo().currency_code
@@ -220,6 +226,6 @@ class PaymentProvider(models.Model):
         ))
         payment_utils.add_to_report(
             report, unavailable, available=False,
-            reason=_("Square requires a ready connection for this company, website, and currency."),
+            reason=_("Square requires a ready connection for this store and a total payable in its location currency."),
         )
         return providers - unavailable
