@@ -506,6 +506,10 @@ class TestSquareOnlineCheckout(SquareOnlineCheckoutCase):
                     throw new Error("Missing checkout element " + selector + " | " +
                         document.querySelector(".modal-dialog")?.textContent);
                 }
+                const square = await waitFor(
+                    'input[name="o_payment_radio"][data-provider-code="square_online"]'
+                );
+                square.click();
                 const card = await waitFor("#square-sdk-card");
                 const rect = card.getBoundingClientRect();
                 if (rect.width === 0 || rect.right > document.documentElement.clientWidth) {
@@ -542,7 +546,7 @@ class TestSquareOnlineCheckout(SquareOnlineCheckoutCase):
             })();
             """,
             login=self.portal.login,
-            ready="Boolean(document.querySelector('#square-sdk-card'))",
+            ready="document.body?.getAttribute('is-ready') === 'true'",
         )
         self.assertEqual(self.make_jsonrpc_request("/payment/status/poll")["state"], "done")
         self.env.invalidate_all()
