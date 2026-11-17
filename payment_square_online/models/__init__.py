@@ -3,6 +3,7 @@ from . import square_location
 from . import payment_provider
 from . import sale_order
 from . import payment_transaction
+from . import payment_checkout
 from . import payment_recovery
 from . import payment_refund
 from . import refund_recovery

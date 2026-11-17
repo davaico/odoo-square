@@ -136,7 +136,7 @@ class SquareWebhookEvent(models.Model):
     @api.model
     def _cron_square_webhooks(self):
         now = fields.Datetime.now()
-        self.search([('create_date', '<', now - timedelta(days=7))], limit=500).unlink()
+        self.search([('processed_at', '<', now - timedelta(days=7))], limit=500).unlink()
         events = self.search([('processed_at', '=', False), ('next_check_at', '<=', now)],
                              order='next_check_at, id', limit=5)
         for event_id in events.ids:

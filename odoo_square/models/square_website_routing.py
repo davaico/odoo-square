@@ -7,6 +7,13 @@ from odoo.exceptions import UserError
 class SquareWebsiteRouting(models.Model):
     _inherit = "square.api.client"
 
+    def _website_routing_config(self, config=None):
+        return config or self.env["square.config"].sudo().search([], limit=1)
+
+    def _read_pos_order(self, order_id, config=None):
+        order = self.get_order(order_id, square_config=config) if config else self.get_order(order_id)
+        return self._route_website_order(order_id, self._website_routing_config(config), order=order or {})
+
     def _website_scope_exists(self, config):
         online_scope_exists = getattr(
             self.env["payment.transaction"], "_square_online_pos_scope_exists", None
@@ -70,11 +77,21 @@ class SquareWebsiteRouting(models.Model):
             retry = retry or ownership is None
         return (self._website_routing_retry() if retry else None), order
 
-    def _route_website_refund(self, refund_id, config):
+    def _route_website_refund(self, event, config, *, signed=False):
+        refund_id = event.get("id")
         if not refund_id or not self._website_scope_exists(config):
             return None
         if not config:
             return self._website_routing_retry()
+
+        # A signed notification naming both IDs of an imported POS sale has all the
+        # evidence needed locally. Return orders and unrecognized sales still need Square.
+        order_id, payment_id = event.get("order_id"), event.get("payment_id")
+        if signed and order_id and payment_id and self.env["sale.order"].sudo().search_count([
+            ("square_order_id", "=", order_id), ("square_payment_id", "=", payment_id),
+        ], limit=1):
+            return None
+
         refund = self._read_website_routing_resource("refunds", "refund", refund_id, config)
         if not refund or not refund.get("location_id"):
             return self._website_routing_retry()

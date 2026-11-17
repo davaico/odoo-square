@@ -20,6 +20,7 @@ class PaymentTransaction(models.Model):
 
     square_recovery_message = fields.Char(string='Square Status Check', readonly=True, copy=False)
     square_recovery_next_check = fields.Datetime(readonly=True, copy=False, index=True)
+    square_linked_refunds_pending = fields.Boolean(readonly=True, copy=False)
     square_paid_cancelled_order = fields.Boolean(compute='_compute_square_paid_cancelled_order')
 
     @api.depends('provider_code', 'operation', 'state', 'sale_order_ids.state')
@@ -115,8 +116,13 @@ class PaymentTransaction(models.Model):
         if not self.square_refund_recheck_minor:
             self.square_recovery_message = False
         self._square_post_process_recovered_payment()
-        if discover_refunds and payment.get('status') == 'COMPLETED' and self._square_is_captured_payment():
-            return self._square_discover_linked_refunds(payment)
+        if (discover_refunds or self.square_linked_refunds_pending) and payment.get('status') == 'COMPLETED':
+            if self._square_is_captured_payment():
+                verified = self._square_discover_linked_refunds(payment)
+                if verified:
+                    self.square_linked_refunds_pending = False
+                if discover_refunds:
+                    return verified
         return True
 
     def _square_refresh_payment(self, *, payment_id=None):
@@ -177,7 +183,8 @@ class PaymentTransaction(models.Model):
         return [
             ('provider_code', '=', 'square_online'), ('operation', 'in', ('online_direct', 'refund')),
             ('square_reserved_at', '!=', False),
-            '|', ('state', '=', 'pending'), '&', ('state', '=', 'done'), ('is_post_processed', '=', False),
+            '|', ('state', '=', 'pending'), '&', ('state', '=', 'done'),
+            '|', ('is_post_processed', '=', False), ('square_linked_refunds_pending', '=', True),
         ]
 
     @api.model
@@ -210,7 +217,7 @@ class PaymentTransaction(models.Model):
                 continue
 
     def _square_reconcile_payment(self):
-        if self.state == 'pending':
+        if self.state == 'pending' or self.square_linked_refunds_pending:
             self._square_refresh_status()
         elif self.state == 'done' and not self.is_post_processed:
             self.square_recovery_message = False

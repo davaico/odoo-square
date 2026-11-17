@@ -266,12 +266,7 @@ class SquareManualResyncWizard(models.TransientModel):
             website_count = 0
             for order_id in sorted(missing_order_ids):
                 try:
-                    order_data = api_client.get_order(
-                        order_id, square_config=self.config_id
-                    )
-                    routing, _order = api_client._route_website_order(
-                        order_id, self.config_id, order=order_data or {},
-                    )
+                    routing, order_data = api_client._read_pos_order(order_id, self.config_id)
                     if routing and routing["status"] == "ignored":
                         website_count += 1
                         continue
@@ -353,12 +348,7 @@ class SquareManualResyncWizard(models.TransientModel):
 
             _logger.info(f"Starting resync of {len(selected_lines)} orders")
 
-            # Get webhook controller for processing
-            from odoo.addons.odoo_square.controllers.square_webhook import (
-                SquareWebhookController,
-            )
-
-            webhook_controller = SquareWebhookController()
+            order_processor = self.env["square.order.processor"]
             api_client = self.env["square.api.client"]
 
             processed_count = 0
@@ -385,15 +375,9 @@ class SquareManualResyncWizard(models.TransientModel):
                     if order_data.get("id") and not order_data.get("order_id"):
                         order_data["order_id"] = order_data["id"]
 
-                    # Build webhook-like event payload for order creation
-                    event_type = "order.created"
-                    event_data = {"object": {"order_created": order_data}}
-
-                    # Process through webhook controller with transaction isolation
                     with self.env.cr.savepoint():
-                        result = webhook_controller._process_event(
-                            event_type, event_data, env=self.env,
-                            square_config=self.config_id, verified_order=order_data,
+                        result = order_processor._process_webhook_order(
+                            order_data, "created", square_config=self.config_id, verified_order=order_data,
                         )
 
                     if result.get("status") == "ignored":
@@ -416,13 +400,9 @@ class SquareManualResyncWizard(models.TransientModel):
                         _logger.info(
                             f"Order {order_id} is COMPLETED, processing completion event"
                         )
-                        event_type_update = "order.updated"
-                        event_data_update = {"object": {"order_updated": order_data}}
-
                         with self.env.cr.savepoint():
-                            result_update = webhook_controller._process_event(
-                                event_type_update, event_data_update, env=self.env,
-                                square_config=self.config_id, verified_order=order_data,
+                            result_update = order_processor._process_webhook_order(
+                                order_data, "updated", square_config=self.config_id, verified_order=order_data,
                             )
 
                         if result_update.get("status") not in ["error"]:

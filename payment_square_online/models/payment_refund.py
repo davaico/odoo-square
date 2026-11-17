@@ -83,7 +83,7 @@ class PaymentTransaction(models.Model):
 
     def _square_refundable_minor(self, *, excluding=None):
         self.ensure_one()
-        if self.square_refund_recheck_minor or not self._square_is_captured_payment():
+        if self.square_refund_recheck_minor or self.square_linked_refunds_pending or not self._square_is_captured_payment():
             return 0
         return self._square_recorded_refund_balance(excluding=excluding)
 
@@ -240,6 +240,8 @@ class PaymentTransaction(models.Model):
         """Check the refund IDs Square reports on a verified original payment."""
         refund_ids = payment.get('refund_ids', [])
         verified = isinstance(refund_ids, list) and all(isinstance(value, str) and value for value in refund_ids)
+        if self.square_linked_refunds_pending and not refund_ids:
+            verified = False
         if verified:
             for refund_id in dict.fromkeys(refund_ids):
                 try:
@@ -259,23 +261,29 @@ class PaymentTransaction(models.Model):
         refund = response.get('refund')
         return isinstance(refund, dict) and refund.get('id') == refund_id and self._square_ingest_refund(refund)
 
+    def _square_matches_refund(self, refund, payment_id):
+        if not isinstance(refund, dict):
+            return False
+        refund_id = refund.get('id')
+        money = refund.get('amount_money')
+        return (
+            isinstance(refund_id, str) and bool(refund_id)
+            and refund.get('payment_id') == payment_id
+            and refund.get('location_id') == self.square_location_ref
+            and refund.get('status') in _REFUND_STATUSES
+            and isinstance(money, dict) and money.keys() == {'amount', 'currency'}
+            and money['currency'] == self.square_currency_code and type(money['amount']) is int
+        )
+
     def _square_ingest_refund(self, refund):
         """Record an existing Square refund retrieved with the original account's authorization."""
         self.ensure_one()
         self._square_lock_for_status()
-        if not self._square_is_captured_payment() or not isinstance(refund, dict):
+        if not self._square_is_captured_payment() or not self._square_matches_refund(refund, self.provider_reference):
             return False
-        refund_id = refund.get('id')
-        money = refund.get('amount_money')
-        if (
-            not isinstance(refund_id, str) or not refund_id
-            or refund.get('payment_id') != self.provider_reference
-            or refund.get('location_id') != self.square_location_ref
-            or refund.get('status') not in _REFUND_STATUSES
-            or not isinstance(money, dict) or money.keys() != {'amount', 'currency'}
-            or money['currency'] != self.square_currency_code
-            or type(money['amount']) is not int or not 0 < money['amount'] <= self.square_amount_minor
-        ):
+        refund_id = refund['id']
+        money = refund['amount_money']
+        if not 0 < money['amount'] <= self.square_amount_minor:
             return False
 
         children = self.child_transaction_ids.filtered(lambda tx: tx.operation == 'refund')
@@ -310,19 +318,14 @@ class PaymentTransaction(models.Model):
     def _square_apply_refund(self, refund, *, require_marker=False):
         """Apply a verified response while holding the payment and refund transaction locks."""
         self.ensure_one()
-        if not isinstance(refund, dict):
+        if not self._square_matches_refund(refund, self.source_transaction_id.provider_reference):
             return False
-        refund_id = refund.get('id')
-        status = refund.get('status')
-        money = refund.get('amount_money')
+        refund_id = refund['id']
+        status = refund['status']
         if (
-            not isinstance(refund_id, str) or not refund_id
-            or (self.provider_reference and self.provider_reference != refund_id)
-            or refund.get('payment_id') != self.source_transaction_id.provider_reference
-            or refund.get('location_id') != self.square_location_ref
-            or money != self._square_money() or type(money['amount']) is not int
+            (self.provider_reference and self.provider_reference != refund_id)
+            or refund['amount_money']['amount'] != self.square_amount_minor
             or (require_marker and (not self.square_refund_key or refund.get('reason') != self.square_refund_key))
-            or status not in _REFUND_STATUSES
         ):
             return False
         if self.state != 'pending':

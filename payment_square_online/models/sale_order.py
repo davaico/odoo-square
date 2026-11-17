@@ -63,6 +63,13 @@ class SaleOrder(models.Model):
         self.ensure_one()
         return self.square_online_transaction_id.state in ('pending', 'done')
 
+    def _square_order_matches_checkout(self, website, user):
+        self.ensure_one()
+        return (
+            self.website_id == website and self.company_id == website.company_id
+            and (user._is_public() or self.partner_id.commercial_partner_id == user.partner_id.commercial_partner_id)
+        )
+
     def _square_cart_signature(self):
         self.ensure_one()
         addresses = self.partner_invoice_id | self.partner_shipping_id

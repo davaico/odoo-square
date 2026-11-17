@@ -45,8 +45,9 @@ class SquareWebhookController(http.Controller):
             )
 
             # Validate webhook signature
+            config = request.env["square.api.client"]._website_routing_config()
             if not self._validate_webhook_signature(
-                raw_body, square_signature, notification_url
+                raw_body, square_signature, notification_url, config
             ):
                 _logger.error("Square webhook: Invalid signature")
                 return http.Response(
@@ -101,7 +102,8 @@ class SquareWebhookController(http.Controller):
             # Process different event types using unified processor with transaction isolation
             with request.env.cr.savepoint():
                 result = self._process_event(
-                    event_type, event_data, data.get("event_id")
+                    event_type, event_data, data.get("event_id"), square_config=config,
+                    signed=bool(config.square_webhook_signature_key),
                 )
 
             return http.Response(
@@ -146,7 +148,7 @@ class SquareWebhookController(http.Controller):
             )
 
     def _validate_webhook_signature(
-        self, request_body, signature_header, notification_url
+        self, request_body, signature_header, notification_url, square_config
     ):
         """
         Validate Square webhook signature manually (based on Square SDK implementation)
@@ -160,8 +162,6 @@ class SquareWebhookController(http.Controller):
             bool: True if signature is valid, False otherwise
         """
         try:
-            # Get Square configuration
-            square_config = request.env["square.config"].sudo().search([], limit=1)
             if not square_config or not square_config.square_webhook_signature_key:
                 _logger.warning(
                     "Square webhook signature key not configured - skipping validation"
@@ -208,10 +208,7 @@ class SquareWebhookController(http.Controller):
             _logger.error(f"Error validating webhook signature: {str(e)}")
             return False
 
-    def _process_event(
-        self, event_type, event_data, webhook_event_id=None, *,
-        env=None, square_config=None, verified_order=None,
-    ):
+    def _process_event(self, event_type, event_data, webhook_event_id=None, *, square_config=None, signed=False):
         """
         Unified event processor for all Square webhook events
         """
@@ -219,16 +216,14 @@ class SquareWebhookController(http.Controller):
             # Extract event data based on type
             if event_type == "order.created":
                 order_data = event_data.get("object", {}).get("order_created", {})
-                return self._process_order(
-                    order_data, "created", webhook_event_id, env=env,
-                    square_config=square_config, verified_order=verified_order,
+                return request.env["square.order.processor"]._process_webhook_order(
+                    order_data, "created", webhook_event_id, square_config=square_config,
                 )
 
             elif event_type == "order.updated":
                 order_data = event_data.get("object", {}).get("order_updated", {})
-                return self._process_order(
-                    order_data, "updated", webhook_event_id, env=env,
-                    square_config=square_config, verified_order=verified_order,
+                return request.env["square.order.processor"]._process_webhook_order(
+                    order_data, "updated", webhook_event_id, square_config=square_config,
                 )
 
             elif event_type == "payment.updated":
@@ -237,11 +232,15 @@ class SquareWebhookController(http.Controller):
 
             elif event_type == "refund.created":
                 refund_data = event_data.get("object", {}).get("refund", {})
-                return self._process_refund(refund_data, "created", webhook_event_id)
+                return self._process_refund(
+                    refund_data, "created", webhook_event_id, square_config=square_config, signed=signed,
+                )
 
             elif event_type == "refund.updated":
                 refund_data = event_data.get("object", {}).get("refund", {})
-                return self._process_refund(refund_data, "updated", webhook_event_id)
+                return self._process_refund(
+                    refund_data, "updated", webhook_event_id, square_config=square_config, signed=signed,
+                )
 
             else:
                 _logger.info(f"Square webhook: Unhandled event type: {event_type}")
@@ -257,195 +256,6 @@ class SquareWebhookController(http.Controller):
                 f"Error processing {event_type} event: {str(e)}", exc_info=True
             )
             return {"status": "error", "message": str(e)}
-
-    def _process_order(
-        self, order_data, event_type, event_id=None, *,
-        env=None, square_config=None, verified_order=None, requires_existing=False,
-    ):
-        """Process Square order with event-level deduplication."""
-        env = env if env is not None else request.env
-
-        order_data = dict(order_data or {})
-        order_id = order_data.get("order_id") or order_data.get("id")
-        if order_id:
-            order_data["order_id"] = order_id
-        order_state = order_data.get("state")
-
-        replay = env["square.order.processor"]._get_webhook_replay_result(
-            order_id, order_state, event_type, event_id
-        )
-        if replay:
-            return replay
-
-        api_client = env["square.api.client"].sudo()
-        config = square_config or env["square.config"].sudo().search([], limit=1)
-        routing, order_payload = api_client._route_website_order(order_id, config, order=verified_order)
-        if routing:
-            return routing
-
-        if requires_existing and order_id and not env["sale.order"].sudo().search_count(
-            [("square_order_id", "=", order_id)], limit=1,
-        ):
-            return {"status": "waiting_for_order"}
-
-        bot_user = None
-        try:
-            # Get bot user in separate transaction
-            with env.cr.savepoint():
-                try:
-                    bot_user = env.ref("odoo_square.user_square_bot")
-                except ValueError:
-                    bot_user = env.ref("base.user_admin")
-
-            # Main processing in separate transaction
-            try:
-                with env.cr.savepoint():
-                    square_processor = (
-                        env["square.order.processor"].sudo().with_user(bot_user)
-                    )
-
-                    # Handle the order based on event type
-                    if event_type == "created":
-                        result = square_processor._process_square_order(
-                            order_data, order_payload=order_payload
-                        )
-
-                        # After successfully creating order, process any pending queued events
-                        if result.get("status") == "success":
-                            try:
-                                env[
-                                    "square.webhook.queue"
-                                ].sudo().process_pending_for_order(order_id)
-                            except Exception as queue_error:
-                                _logger.warning(
-                                    f"Error processing queued events after order creation: {str(queue_error)}"
-                                )
-
-                    elif event_type == "updated":
-                        # For updates, we need to find the existing order first
-                        existing_order = (
-                            env["sale.order"]
-                            .sudo()
-                            .search([("square_order_id", "=", order_id)], limit=1)
-                        )
-                        if existing_order:
-                            result = square_processor._process_square_order_update(
-                                order_data, existing_order, order_payload=order_payload
-                            )
-                        elif order_state == "COMPLETED":
-                            # Square may send order.updated(COMPLETED) before order.created in tests
-                            # or without a prior Odoo record — create + complete from payload.
-                            result = square_processor._process_square_order(
-                                order_data, order_payload=order_payload
-                            )
-                        else:
-                            # Order doesn't exist yet - queue this update event for retry
-                            _logger.info(
-                                f"Order {order_id} not found for update, queueing event {event_id} for retry"
-                            )
-
-                            # Queue the event for later processing
-                            try:
-                                # Build the full event data structure for queuing
-                                env["square.webhook.queue"].sudo().queue_event(
-                                    webhook_event_id=event_id,
-                                    event_type="order.updated",
-                                    order_data=order_data,
-                                    square_order_id=order_id,
-                                    square_config=config,
-                                )
-
-                                _logger.info(
-                                    f"Event {event_id} queued for retry - will process after order {order_id} is created"
-                                )
-
-                                result = {
-                                    "status": "queued",
-                                    "order_id": order_id,
-                                    "state": order_state,
-                                    "message": "Order not found - event queued for retry",
-                                }
-                            except Exception as queue_error:
-                                _logger.error(
-                                    f"Failed to queue event {event_id}: {str(queue_error)}"
-                                )
-                                result = {
-                                    "status": "error",
-                                    "order_id": order_id,
-                                    "message": f"Order not found and failed to queue: {str(queue_error)}",
-                                }
-                    else:
-                        result = {
-                            "status": "error",
-                            "message": f"Unknown event type: {event_type}",
-                        }
-            except Exception as e:
-                # Handle transaction aborted errors gracefully
-                error_str = str(e)
-                if (
-                    "current transaction is aborted" in error_str
-                    or "InFailedSqlTransaction" in error_str
-                ):
-                    _logger.warning(
-                        f"Transaction aborted during order processing: {error_str}"
-                    )
-                    result = {
-                        "status": "error",
-                        "order_id": order_id,
-                        "message": "Database transaction error - order may be partially processed",
-                    }
-                else:
-                    raise
-
-            # Success logging in separate transaction
-            if event_id and result.get("status") in ["success", "updated"]:
-                try:
-                    with env.cr.savepoint():
-                        env["square.integration.log"].sudo().with_user(
-                            bot_user
-                        ).create(
-                            {
-                                "webhook_event_id": event_id,
-                                "square_order_id": order_id,
-                                "status": "success",
-                                "event_type": (
-                                    "order_created"
-                                    if event_type == "created"
-                                    else "order_updated"
-                                ),
-                                "title": f"Order {order_id} processed successfully (state: {order_state})",
-                                "description": f"Webhook event {event_id} processed successfully for order {order_id} with state: {order_state}",
-                            }
-                        )
-                except Exception as log_error:
-                    _logger.warning(
-                        f"Could not log successful order processing: {str(log_error)}"
-                    )
-
-            return result
-        except Exception as e:
-            # Simple error logging - just log to Python logger, don't try DB logging in failed transaction
-            _logger.error(
-                f"Square webhook processing failed for event {event_id}: {str(e)}",
-                exc_info=True,
-            )
-
-            # Check if this is a transaction aborted error
-            error_str = str(e)
-            if (
-                "current transaction is aborted" in error_str
-                or "InFailedSqlTransaction" in error_str
-            ):
-                _logger.warning(
-                    f"Transaction was aborted, this may be due to a previous database error"
-                )
-                # Don't raise the exception for transaction aborted errors
-                return {
-                    "status": "error",
-                    "message": "Database transaction error occurred",
-                }
-            else:
-                raise
 
     def _process_payment(self, payment_data, event_type, webhook_event_id=None):
         """
@@ -495,9 +305,7 @@ class SquareWebhookController(http.Controller):
 
             # Fetch full order details from Square API to check for exchanges
             api_client = request.env["square.api.client"].sudo()
-            order_data = api_client.get_order(order_id)
-            config = request.env["square.config"].sudo().search([], limit=1)
-            routing, order_data = api_client._route_website_order(order_id, config, order=order_data or {})
+            routing, order_data = api_client._read_pos_order(order_id)
             if routing:
                 return routing
 
@@ -636,7 +444,9 @@ class SquareWebhookController(http.Controller):
 
         return False
 
-    def _process_refund(self, refund_data, event_type, webhook_event_id=None, env=None):
+    def _process_refund(
+        self, refund_data, event_type, webhook_event_id=None, env=None, *, square_config=None, signed=False,
+    ):
         """Process refund data from webhook using the new refund model.
 
         ``env`` allows unit tests to call this without a bound HTTP ``request``.
@@ -651,16 +461,6 @@ class SquareWebhookController(http.Controller):
             refund_id = refund_data.get("id")
             order_id = refund_data.get("order_id")
             refund_status = refund_data.get("status")
-
-            api_client = req_env["square.api.client"].sudo()
-            config = req_env["square.config"].sudo().search([], limit=1)
-            routing = api_client._route_website_refund(refund_id, config)
-            if routing:
-                return routing
-
-            if not order_id:
-                _logger.error(f"No order ID in refund {event_type} webhook")
-                return {"status": "error", "message": "No order ID in refund"}
 
             _logger.info(
                 f"Processing Square refund {refund_id} for order {order_id} with status {refund_status}"
@@ -690,6 +490,16 @@ class SquareWebhookController(http.Controller):
                         "message": f"Refund webhook event {webhook_event_id} already processed",
                         "refund_id": refund_id,
                     }
+
+            api_client = req_env["square.api.client"].sudo()
+            config = api_client._website_routing_config(square_config)
+            routing = api_client._route_website_refund(refund_data, config, signed=signed)
+            if routing:
+                return routing
+
+            if not order_id:
+                _logger.error(f"No order ID in refund {event_type} webhook")
+                return {"status": "error", "message": "No order ID in refund"}
 
             # Find the original sale order - try multiple strategies
             sale_order = None

@@ -372,9 +372,16 @@ class TestSquareCoexistence(SquareCheckoutCase):
                 'id': refund_id, 'payment_id': sale.square_payment_id, 'order_id': sale.square_order_id,
                 'location_id': 'TESTNYC', 'status': 'COMPLETED', 'amount_money': money(amount),
             }
-            resources[f'/v2/refunds/{refund_id}'] = {'refund': refund}
+            refund_path = f'/v2/refunds/{refund_id}'
+            payment_path = f'/v2/payments/{sale.square_payment_id}'
+            payment_details = resources[payment_path]
+            resources[refund_path] = resources[payment_path] = Timeout('Square is temporarily unavailable')
             response = self._pos_event('refund.updated', f'{refund_id}-evt', refund)
             self.assertEqual(response.json()['status'], 'success', response.text)
+            replay = self._pos_event('refund.updated', f'{refund_id}-evt', refund)
+            self.assertEqual(replay.json()['status'], 'already_processed', replay.text)
+            resources[refund_path] = {'refund': refund}
+            resources[payment_path] = payment_details
             record = sale.square_refund_ids
             self.assertEqual(len(record), 1)
             self.assertEqual(record.credit_note_id.state, 'posted')

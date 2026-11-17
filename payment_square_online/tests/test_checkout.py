@@ -357,6 +357,46 @@ class TestSquareCheckout(SquareCheckoutCase):
         if 'picking_ids' in order._fields:
             self.assertFalse(order.picking_ids.filtered(lambda picking: picking.picking_type_code == 'incoming'))
 
+    def test_signed_refund_webhook_is_retried_after_seven_days(self):
+        tx = self._captured_order().transaction_ids
+        self.authenticate('admin', 'admin')
+        cron = self.env.ref('payment_square_online.ir_cron_square_online_webhooks')
+        external = {
+            'id': 'SQ-OLDER-REFUND', 'payment_id': tx.provider_reference, 'status': 'COMPLETED',
+            'amount_money': {'amount': 1250, 'currency': 'USD'}, 'location_id': 'TESTNYC',
+        }
+        self.assertEqual(self._square_refund_webhook(external, 'long-delayed-refund').status_code, 204)
+        event = self.env['payment.square.webhook.event'].search([('event_id', '=', 'long-delayed-refund')])
+        self.assertTrue(event)
+        eight_days_ago = fields.Datetime.now() - timedelta(days=8)
+        self.env.cr.execute('UPDATE payment_square_webhook_event SET create_date = %s WHERE id = %s',
+                            (eight_days_ago, event.id))
+        response = self._square_error_response(503, 'SERVICE_UNAVAILABLE')
+
+        def square(method, url, **kwargs):
+            self.assertEqual(method, 'GET')
+            self.assertTrue(url.endswith('/v2/refunds/SQ-OLDER-REFUND'))
+            return response
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square):
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+            self.assertTrue(event.exists())
+            self.assertFalse(event.processed_at)
+            self.assertFalse(tx.child_transaction_ids)
+
+            response = self._refund_response({'refund': external})
+            event.next_check_at = fields.Datetime.now() - timedelta(seconds=1)
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+            self.assertTrue(event.processed_at)
+            self.assertEqual(tx.child_transaction_ids.payment_id.amount, 12.5)
+            self.assertEqual(tx.child_transaction_ids.payment_id.payment_type, 'outbound')
+
+            event.processed_at = eight_days_ago
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+            self.assertFalse(event.exists())
+            self.assertEqual(len(tx.child_transaction_ids), 1)
+
     def test_square_refund_discovery_preserves_equal_amount_local_reservation(self):
         order = self._captured_order()
         charge = order.transaction_ids
@@ -473,6 +513,85 @@ class TestSquareCheckout(SquareCheckoutCase):
         self.assertEqual(child.payment_id.source_payment_id, charge.payment_id)
         self.assertEqual(charge.payment_id.amount_available_for_refund, 37.5)
         self.assertEqual(self.env['account.payment'].search_count([('source_payment_id', '=', charge.payment_id.id)]), 1)
+
+    def test_payment_recovery_retries_a_refund_older_than_the_global_scan_overlap(self):
+        earlier_charge = self._captured_order().transaction_ids
+        earlier_charge.square_dispatched_at = fields.Datetime.now() - timedelta(days=3)
+        order = self._cart()
+        submission = self._prepare(order)['square_submission']
+        refund_time = fields.Datetime.now() - timedelta(days=2)
+        refund = {
+            'id': 'SQ-OLDER-DASHBOARD-REFUND', 'payment_id': 'SQ-LATE-PAYMENT', 'status': 'COMPLETED',
+            'location_id': 'TESTNYC', 'amount_money': {'amount': 1250, 'currency': 'USD'},
+            'created_at': refund_time.isoformat() + 'Z',
+        }
+        accepted = {}
+        payment_visible = False
+        refund_available = False
+        scan_begins = []
+
+        def square(method, url, **kwargs):
+            if method == 'POST':
+                result = self._square_response(method, url, **kwargs)
+                if url.endswith('/v2/payments'):
+                    accepted.update(result.json()['payment'], id='SQ-LATE-PAYMENT', refund_ids=[refund['id']],
+                                    refunded_money=refund['amount_money'])
+                    raise Timeout('Square accepted the payment before losing the response')
+                return result
+            self.assertEqual(method, 'GET')
+            if url.endswith('/v2/refunds'):
+                begins = kwargs['params']['begin_time']
+                scan_begins.append(begins)
+                return self._refund_response({'refunds': [refund] if begins < refund['created_at'] else []})
+            if url.endswith('/v2/payments'):
+                return self._refund_response({'payments': [accepted] if payment_visible else []})
+            if url.endswith('/v2/payments/SQ-LATE-PAYMENT'):
+                return self._refund_response({'payment': accepted})
+            self.assertTrue(url.endswith('/v2/refunds/SQ-OLDER-DASHBOARD-REFUND'))
+            if not refund_available:
+                return self._square_error_response(503, 'SERVICE_UNAVAILABLE')
+            return self._refund_response({'refund': refund})
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            self.assertEqual(self._result(
+                '/payment/square/online/submit', **submission, source_id='cnon:late-source',
+            )['state'], 'pending')
+            charge = order.transaction_ids
+            charge.square_dispatched_at = refund_time - timedelta(hours=1)
+            self.authenticate('admin', 'admin')
+            discovery = self.env.ref('payment_square_online.ir_cron_square_online_discover_refunds')
+            recovery = self.env.ref('payment_square_online.ir_cron_square_online_reconcile')
+            self._refund_button('ir.cron', 'method_direct_trigger', discovery.id)
+            self.assertFalse(charge.provider_reference)
+            self.assertFalse(charge.child_transaction_ids)
+            self.assertLess(scan_begins[0], refund['created_at'])
+
+            earlier_charge.square_connection_id.refund_scan_next_check = False
+            self._refund_button('ir.cron', 'method_direct_trigger', discovery.id)
+            self.assertGreater(scan_begins[1], refund['created_at'])
+
+            payment_visible = True
+            self._refund_button('ir.cron', 'method_direct_trigger', recovery.id)
+            self.assertEqual(order.state, 'sale')
+            self.assertEqual(charge.payment_id.amount, 50)
+            self.assertFalse(charge.child_transaction_ids)
+            self.assertEqual(charge.payment_id.amount_available_for_refund, 0)
+
+            refund_available = True
+            charge.square_recovery_next_check = False
+            self._refund_button('ir.cron', 'method_direct_trigger', recovery.id)
+            charge.square_recovery_next_check = False
+            self._refund_button('ir.cron', 'method_direct_trigger', recovery.id)
+
+        child = charge.child_transaction_ids
+        self.assertEqual(child.provider_reference, refund['id'])
+        self.assertEqual((child.state, child.payment_id.payment_type, child.payment_id.amount),
+                         ('done', 'outbound', 12.5))
+        self.assertEqual(child.payment_id.source_payment_id, charge.payment_id)
+        self.assertEqual(charge.payment_id.amount_available_for_refund, 37.5)
+        self.assertFalse(order.invoice_ids)
+        self.assertEqual([call.args[0] for call in api.call_args_list],
+                         ['POST', 'POST', 'GET', 'GET', 'GET', 'GET', 'GET', 'GET'])
 
     def test_square_amount_rejection_recovers_the_dashboard_refund_that_won_the_race(self):
         charge = self._captured_order().transaction_ids

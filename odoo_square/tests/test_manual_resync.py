@@ -169,7 +169,7 @@ class TestSquareManualResync(TransactionCase):
         with self.assertRaises(ValidationError):
             wizard.action_validate_resync()
 
-    @patch("odoo.addons.odoo_square.controllers.square_webhook.SquareWebhookController._process_event")
+    @patch("odoo.addons.odoo_square.models.square_order_processor.SquareOrderProcessor._process_webhook_order")
     @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order")
     def test_resync_processes_selected_orders(self, mock_get_order, mock_process_event):
         """Test that resync processes selected orders through webhook pipeline"""
@@ -210,7 +210,7 @@ class TestSquareManualResync(TransactionCase):
         self.assertEqual(wizard.processed_count, 1)
         self.assertEqual(wizard.error_count, 0)
 
-    @patch("odoo.addons.odoo_square.controllers.square_webhook.SquareWebhookController._process_event")
+    @patch("odoo.addons.odoo_square.models.square_order_processor.SquareOrderProcessor._process_webhook_order")
     @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order")
     def test_resync_handles_errors(self, mock_get_order, mock_process_event):
         """Test that resync continues on error and collects error details"""
@@ -275,7 +275,7 @@ class TestSquareManualResync(TransactionCase):
             return_value={"id": "test_order", "state": "COMPLETED"},
         ):
             with patch(
-                "odoo.addons.odoo_square.controllers.square_webhook.SquareWebhookController._process_event",
+                "odoo.addons.odoo_square.models.square_order_processor.SquareOrderProcessor._process_webhook_order",
                 return_value={"status": "success"},
             ):
                 wizard.action_validate_resync()
@@ -315,7 +315,7 @@ class TestSquareManualResync(TransactionCase):
             },
         ):
             with patch(
-                "odoo.addons.odoo_square.controllers.square_webhook.SquareWebhookController._process_event",
+                "odoo.addons.odoo_square.models.square_order_processor.SquareOrderProcessor._process_webhook_order",
                 return_value={"status": "success"},
             ):
                 wizard.action_validate_resync()

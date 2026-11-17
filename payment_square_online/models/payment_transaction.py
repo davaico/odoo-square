@@ -297,6 +297,11 @@ class PaymentTransaction(models.Model):
             return self.provider_reference == payment_id
         self.write({'provider_reference': payment_id, 'square_recovery_message': False})
         if status == 'COMPLETED':
+            # The merchant refund scan may already have passed refunds for an unbound payment.
+            refunded_money = payment.get('refunded_money')
+            self.square_linked_refunds_pending = bool(payment.get('refund_ids')) or (
+                isinstance(refunded_money, dict) and bool(refunded_money.get('amount'))
+            )
             self._set_done()
         elif status == 'CANCELED':
             self._set_canceled(state_message=_("Square canceled the payment. You can try again."))

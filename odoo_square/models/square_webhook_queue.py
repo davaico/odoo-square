@@ -158,14 +158,10 @@ class SquareWebhookQueue(models.Model):
             # Parse order data
             order_data = json.loads(self.order_data)
 
-            from odoo.addons.odoo_square.controllers.square_webhook import (
-                SquareWebhookController,
-            )
-
             if self.event_type in ("order.updated", "order.created"):
-                result = SquareWebhookController()._process_order(
+                result = self.env["square.order.processor"]._process_webhook_order(
                     order_data, self.event_type.split(".")[1], self.webhook_event_id,
-                    env=self.env, square_config=self.config_id,
+                    square_config=self.config_id,
                     requires_existing=self.depends_on_order,
                 )
             else:
