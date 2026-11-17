@@ -385,7 +385,7 @@ class SquareApiClient(models.Model):
             return []
 
     @api.model
-    def get_payment(self, payment_id):
+    def get_payment(self, payment_id, square_config=None):
         """
         Retrieve payment details from Square API
 
@@ -397,7 +397,7 @@ class SquareApiClient(models.Model):
         """
         try:
             endpoint = f"/v2/payments/{payment_id}"
-            response = self._make_api_request(endpoint)
+            response = self._make_api_request(endpoint, square_config=square_config)
 
             if "payment" in response:
                 payment_data = response["payment"]

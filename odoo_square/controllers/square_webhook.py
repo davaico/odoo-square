@@ -101,7 +101,9 @@ class SquareWebhookController(http.Controller):
             # Process different event types using unified processor with transaction isolation
             with request.env.cr.savepoint():
                 result = self._process_event(
-                    event_type, event_data, data.get("event_id")
+                    event_type, event_data, data.get("event_id"),
+                    merchant_id=data.get("merchant_id"),
+                    environment=request.httprequest.headers.get("Square-Environment"),
                 )
 
             return http.Response(
@@ -208,7 +210,10 @@ class SquareWebhookController(http.Controller):
             _logger.error(f"Error validating webhook signature: {str(e)}")
             return False
 
-    def _process_event(self, event_type, event_data, webhook_event_id=None):
+    def _process_event(
+        self, event_type, event_data, webhook_event_id=None, *, merchant_id=None, environment=None,
+        square_config=None,
+    ):
         """
         Unified event processor for all Square webhook events
         """
@@ -217,29 +222,32 @@ class SquareWebhookController(http.Controller):
             if event_type == "order.created":
                 order_data = event_data.get("object", {}).get("order_created", {})
                 return request.env["square.order.processor"]._process_order_event(
-                    order_data, "created", webhook_event_id
+                    order_data, "created", webhook_event_id, merchant_id=merchant_id,
+                    environment=environment, square_config=square_config,
                 )
 
             elif event_type == "order.updated":
                 order_data = event_data.get("object", {}).get("order_updated", {})
                 return request.env["square.order.processor"]._process_order_event(
-                    order_data, "updated", webhook_event_id
+                    order_data, "updated", webhook_event_id, merchant_id=merchant_id,
+                    environment=environment, square_config=square_config,
                 )
 
             elif event_type == "payment.updated":
                 payment_data = event_data.get("object", {}).get("payment", {})
-                return self._process_payment(payment_data, "updated", webhook_event_id)
+                return self._process_payment(
+                    payment_data, "updated", webhook_event_id,
+                    merchant_id=merchant_id, environment=environment,
+                )
 
             elif event_type in ("refund.created", "refund.updated"):
                 refund_data = event_data.get("object", {}).get("refund", {})
                 if not refund_data:
                     _logger.warning("No refund data in %s webhook", event_type)
                     return {"status": "ignored", "message": "No refund data"}
-                if not refund_data.get("order_id"):
-                    _logger.error("No order ID in %s webhook", event_type)
-                    return {"status": "error", "message": "No order ID in refund"}
                 return request.env["square.refund"]._process_refund_event(
-                    refund_data, event_type.split(".")[1], webhook_event_id
+                    refund_data, event_type.split(".")[1], webhook_event_id,
+                    merchant_id=merchant_id, environment=environment,
                 )
 
             else:
@@ -257,7 +265,9 @@ class SquareWebhookController(http.Controller):
             )
             return {"status": "error", "message": str(e)}
 
-    def _process_payment(self, payment_data, event_type, webhook_event_id=None):
+    def _process_payment(
+        self, payment_data, event_type, webhook_event_id=None, *, merchant_id=None, environment=None,
+    ):
         """
         Process payment.updated webhook to detect and handle exchanges
         """
@@ -279,6 +289,14 @@ class SquareWebhookController(http.Controller):
                     "status": "ignored",
                     "message": f"Payment status {payment_status} not processed",
                 }
+
+            processor = request.env["square.order.processor"]
+            routing = processor._square_online_event_result(
+                order_id=order_id, payment_id=payment_id, location_id=payment_data.get("location_id"),
+                merchant_id=merchant_id, environment=environment,
+            )
+            if routing:
+                return routing
 
             # Check for existing processing of this payment event
             if webhook_event_id:
@@ -320,6 +338,12 @@ class SquareWebhookController(http.Controller):
             has_returns = self._detect_exchange(order_data)
 
             if has_returns:
+                routing = processor._square_online_event_result(
+                    order_id=order_id, location_id=order_data.get("location_id"),
+                    merchant_id=merchant_id, environment=environment, full_order=order_data,
+                )
+                if routing:
+                    return routing
                 _logger.info(
                     f"Exchange detected for order {order_id}, processing exchange flow"
                 )

@@ -269,6 +269,12 @@ class SquareManualResyncWizard(models.TransientModel):
                         order_id, square_config=self.config_id
                     )
                     if order_data:
+                        routing = self.env["square.order.processor"]._square_online_event_result(
+                            order_id=order_id, location_id=order_data.get("location_id"),
+                            square_config=self.config_id, full_order=order_data,
+                        )
+                        if routing and routing["status"] == "ignored":
+                            continue
                         created_at_str = order_data.get("created_at")
                         created_at = None
                         if created_at_str:
@@ -383,9 +389,11 @@ class SquareManualResyncWizard(models.TransientModel):
                     # Process through webhook controller with transaction isolation
                     with self.env.cr.savepoint():
                         result = webhook_controller._process_event(
-                            event_type, event_data, webhook_event_id=None
+                            event_type, event_data, webhook_event_id=None, square_config=self.config_id
                         )
 
+                    if result.get("status") == "ignored":
+                        continue
                     if result.get("status") in ["success", "already_processed"]:
                         processed_count += 1
                         _logger.info(
@@ -396,6 +404,8 @@ class SquareManualResyncWizard(models.TransientModel):
                         error_msg = f"Order {order_id}: {result.get('message', 'Unknown error')}"
                         error_details.append(error_msg)
                         _logger.warning(error_msg)
+                        if result.get("status") == "retry":
+                            continue
 
                     # If order is already completed, also process completion
                     order_state = order_data.get("state")
@@ -408,7 +418,8 @@ class SquareManualResyncWizard(models.TransientModel):
 
                         with self.env.cr.savepoint():
                             result_update = webhook_controller._process_event(
-                                event_type_update, event_data_update, webhook_event_id=None
+                                event_type_update, event_data_update, webhook_event_id=None,
+                                square_config=self.config_id,
                             )
 
                         if result_update.get("status") not in ["error"]:

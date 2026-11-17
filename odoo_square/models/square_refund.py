@@ -114,11 +114,24 @@ class SquareRefund(models.Model):
                 record.display_name = f"Refund - {record.status.title()}"
 
     @api.model
-    def _process_refund_event(self, refund_data, event_type, webhook_event_id=None):
+    def _process_refund_event(
+        self, refund_data, event_type, webhook_event_id=None, *, merchant_id=None, environment=None,
+    ):
         """Apply a Square refund event and record the outcome for replay."""
         refund_id = refund_data.get("id")
         order_id = refund_data.get("order_id")
         refund_status = refund_data.get("status")
+
+        routing = self.env["square.order.processor"]._square_online_event_result(
+            order_id=order_id, payment_id=refund_data.get("payment_id"), refund_id=refund_id,
+            location_id=refund_data.get("location_id"),
+            merchant_id=merchant_id, environment=environment,
+        )
+        if routing:
+            return routing
+        if not order_id:
+            _logger.error("No order ID in refund.%s webhook", event_type)
+            return {"status": "error", "message": "No order ID in refund"}
 
         try:
             _logger.info(

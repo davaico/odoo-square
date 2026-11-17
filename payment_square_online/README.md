@@ -2,7 +2,7 @@
 
 ## Install
 
-Place `payment_square_online` on the Odoo addons path, restart Odoo, update the Apps list, and install **Square Online Payments**. The addon uses Odoo eCommerce and Accounting. The Square POS integration is optional.
+Place `payment_square_online` on the Odoo addons path, restart Odoo, update the Apps list, and install **Square Online Payments**. The addon uses Odoo eCommerce and Accounting. The Square POS integration is optional. This guide is for a self-hosted Odoo 19 Community website; Odoo Online, the hosted service, does not allow deployment of this custom addon.
 
 The repository's Compose setup mounts the addon. On a fresh database, run:
 
@@ -75,6 +75,21 @@ The automated checkout tests simulate Square's SDK and API. Use Square Sandbox t
 4. Complete a Sandbox checkout and verify both the event delivery in Square and the corresponding transaction in Odoo. Keep the subscriptions for historical connections while their transactions may still need reconciliation. To turn off an endpoint in Odoo, clear its notification URL.
 
 [Square webhook subscriptions](https://developer.squareup.com/docs/webhooks/step2subscribe) · [Square notification signatures](https://developer.squareup.com/docs/webhooks/step3validate)
+
+## Run alongside Square POS
+
+Install both **Square Online Payments** and **Square POS Integration** in the same Odoo database if you need both checkout channels. Follow this guide for website payments and the [POS configuration guide](../README.md#square-configuration) for POS.
+
+| Activity | Configured in Odoo | Square notification endpoint |
+| --- | --- | --- |
+| Website checkout, website payment recovery, and refunds for website payments | **Square Online** payment provider and its merchant-authorized OAuth connection, company, website, and bank journal | `/payment/square_online/webhook/<connection_id>` |
+| Import Square POS sales, payments, refunds, exchanges, and stock activity | **Square → Configuration**, with its own Square API token, payment journal, and location-to-warehouse mappings | `/square/webhook` |
+
+Create separate subscriptions and paste each subscription's signature key into the corresponding configuration. Keep each subscription and its credentials in the same Square environment. The two addons may use the same Square merchant and location. Keep configuring their credentials separately; the POS importer's credentials need access to retrieve orders and payments for its Square merchant.
+
+The website addon records the payment against the existing Odoo order. Odoo handles website invoicing and fulfillment through its normal workflow. A website refund posts the outgoing payment; create any credit note or goods return separately. POS imports genuine Square sales, refunds, and exchanges with its usual accounting and stock effects.
+
+POS skips activity belonging to a website payment, including separate Square return orders tied to that payment. The manual POS resync excludes identified website orders. If Square can't confirm an order or payment's ownership yet, the POS webhook returns HTTP 503 for Square to retry. Check Square API access on the POS configuration if the same notification keeps retrying. For a website transaction still in doubt, open its **Square Payment History** and use **Refresh status**.
 
 ## Recover and review online payments
 

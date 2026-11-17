@@ -74,7 +74,10 @@ class SquareOrderProcessor(models.Model):
 
         return None
 
-    def _process_order_event(self, order_data, event_type, event_id=None):
+    def _process_order_event(
+        self, order_data, event_type, event_id=None, *, merchant_id=None, environment=None,
+        square_config=None,
+    ):
         """Process Square order with event-level deduplication"""
 
         if order_data:
@@ -85,6 +88,16 @@ class SquareOrderProcessor(models.Model):
         # 1. Extract event and order IDs
         # Event ID comes from the webhook root level, passed as parameter
         order_id = order_data.get("order_id") if order_data else None
+
+        # A manual resync supplies the full order it retrieved with this configuration.
+        if order_id:
+            result = self._square_online_event_result(
+                order_id=order_id, location_id=order_data.get("location_id"),
+                merchant_id=merchant_id, environment=environment, square_config=square_config,
+                full_order=order_data if square_config is not None else None,
+            )
+            if result:
+                return result
 
         # 2. Deduplication check based on order_id + state combination
         order_state = order_data.get("state")

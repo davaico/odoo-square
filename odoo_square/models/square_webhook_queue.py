@@ -213,7 +213,7 @@ class SquareWebhookQueue(models.Model):
                 return False
 
             # Check result
-            if result.get("status") in ["success", "updated", "already_processed"]:
+            if result.get("status") in ["success", "updated", "already_processed", "ignored"]:
                 self.write(
                     {
                         "state": "completed",

@@ -7,3 +7,4 @@ from . import test_checkout
 from . import test_recovery
 from . import test_markets
 from . import test_refund
+from . import test_pos_coexistence
