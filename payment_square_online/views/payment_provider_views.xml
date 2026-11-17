@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="payment_provider_form_square_online" model="ir.ui.view">
+        <field name="name">payment.provider.form.square.online</field>
+        <field name="model">payment.provider</field>
+        <field name="inherit_id" ref="payment.payment_provider_form"/>
+        <field name="arch" type="xml">
+            <group name="provider_credentials" position="inside">
+                <group string="Square Connection" invisible="code != 'square_online'" groups="base.group_system">
+                    <field name="company_id" readonly="True" groups="!base.group_multi_company"/>
+                    <field name="square_environment" required="code == 'square_online'" readonly="square_merchant_id"/>
+                    <field name="square_application_id" readonly="square_merchant_id"/>
+                    <field name="square_application_secret" password="True"/>
+                    <field name="square_has_application_secret" string="Application Secret Saved" readonly="True"/>
+                    <field name="square_callback_url" readonly="True" widget="CopyClipboardChar"/>
+                    <button name="action_square_authorize" type="object" string="Authorize or Reconnect with Square"
+                            class="btn-primary" invisible="not square_application_id or not square_has_application_secret"/>
+                    <field name="square_authorization_result" readonly="True" invisible="not square_authorization_result"/>
+                    <field name="square_connection_status" readonly="True"/>
+                    <field name="square_merchant_id" readonly="True" invisible="not square_merchant_id"/>
+                    <field name="square_location_id" invisible="not square_merchant_id"
+                           domain="[('provider_id', '=', id), ('is_available', '=', True)]"
+                           options="{'no_create': True, 'no_open': True}"/>
+                    <div class="text-muted" colspan="2">
+                        Square card payments use the selected location's currency. Supported locations
+                        are in Australia (AUD), Canada (CAD), France, Ireland and Spain (EUR), Japan
+                        (JPY), the United Kingdom (GBP), and the United States (USD).
+                    </div>
+                </group>
+            </group>
+        </field>
+    </record>
+</odoo>
