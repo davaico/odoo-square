@@ -14,7 +14,7 @@
             ref('stock.group_stock_manager')
         ])]"/>
         <field name="company_id" ref="base.main_company"/>
-        <field name="company_ids" eval="[(6, 0, [ref('base.main_company')])]"/>
+        <field name="company_ids" eval="[(4, ref('base.main_company'))]"/>
     </record>
 
     <!-- Partner for Square Bot -->

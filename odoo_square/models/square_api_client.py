@@ -3,6 +3,7 @@ import requests
 import json
 import logging
 from datetime import datetime, timezone
+from urllib.parse import quote
 from uuid import uuid4
 from odoo import models, api
 from odoo.exceptions import UserError
@@ -18,7 +19,9 @@ class SquareApiClient(models.Model):
     @api.model
     def _get_square_config(self):
         """Get Square configuration"""
-        config = self.env["square.config"].search([], limit=1)
+        config = self.env["square.config"].sudo().with_context(active_test=True).search(
+            [("company_id", "=", self.env.company.id)], limit=1,
+        )
         if not config:
             raise UserError(
                 "No Square configuration found. Please configure Square integration first."
@@ -32,8 +35,11 @@ class SquareApiClient(models.Model):
             cfg = square_config
             if not cfg:
                 raise UserError("Square configuration is missing.")
-            if cfg._name != "square.config":
+            if cfg._name != "square.config" or len(cfg) != 1:
                 raise UserError("Invalid Square configuration record.")
+            cfg = cfg.sudo()
+            if not cfg.active or cfg.company_id != self.env.company:
+                raise UserError("Square configuration is unavailable for this company.")
             return cfg
         return self._get_square_config()
 
@@ -42,18 +48,22 @@ class SquareApiClient(models.Model):
         """Get Square API base URL based on environment"""
         if environment == "production":
             return "https://connect.squareup.com"
-        else:
+        if environment == "sandbox":
             return "https://connect.squareupsandbox.com"
+        raise UserError("Invalid Square environment.")
 
     @api.model
     def _make_api_request(self, endpoint, method="GET", data=None, square_config=None):
         """Make a request to Square API"""
         config = self._config_for_request(square_config)
+        token = config.square_access_token
+        if not token or not token.isascii() or not token.isprintable() or any(c.isspace() for c in token):
+            raise UserError("Square access token is missing or invalid.")
         base_url = self._get_api_base_url(config.square_environment)
         url = f"{base_url}{endpoint}"
 
         headers = {
-            "Authorization": f"Bearer {config.square_access_token}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Square-Version": "2024-08-21",  # Latest Square API version
         }
@@ -80,7 +90,7 @@ class SquareApiClient(models.Model):
             raise UserError(f"Failed to communicate with Square API: {str(e)}")
 
     @api.model
-    def get_order(self, order_id, square_config=None):
+    def _get_order(self, order_id, square_config=None):
         """
         Retrieve a complete order from Square API
 
@@ -92,10 +102,10 @@ class SquareApiClient(models.Model):
             dict: Complete order data from Square API
         """
         try:
-            endpoint = f"/v2/orders/{order_id}"
+            endpoint = f"/v2/orders/{quote(order_id, safe='')}"
             response = self._make_api_request(endpoint, square_config=square_config)
 
-            if "order" in response:
+            if "order" in response and response["order"].get("id") == order_id:
                 order_data = response["order"]
                 return order_data
             else:
@@ -111,7 +121,7 @@ class SquareApiClient(models.Model):
             return None
 
     @api.model
-    def get_customer(self, customer_id):
+    def _get_customer(self, customer_id):
         """
         Retrieve customer details from Square API
 
@@ -122,7 +132,7 @@ class SquareApiClient(models.Model):
             dict: Customer data from Square API
         """
         try:
-            endpoint = f"/v2/customers/{customer_id}"
+            endpoint = f"/v2/customers/{quote(customer_id, safe='')}"
             response = self._make_api_request(endpoint)
 
             if "customer" in response:
@@ -161,7 +171,7 @@ class SquareApiClient(models.Model):
         return dt.strftime("%Y-%m-%dT%H:%M:%S") + frac + "Z"
 
     @api.model
-    def get_location_orders(
+    def _get_location_orders(
         self,
         location_id,
         limit=500,
@@ -176,7 +186,7 @@ class SquareApiClient(models.Model):
         When start_at/end_at are set (UTC), uses Square SearchOrders date filter
         and pagination so results match the window (not only the N latest orders).
         """
-        return self.search_orders(
+        return self._search_orders(
             start_at=start_at,
             end_at=end_at,
             states=states,
@@ -186,7 +196,7 @@ class SquareApiClient(models.Model):
         )
 
     @api.model
-    def test_connection(self):
+    def _test_connection(self):
         """
         Test the Square API connection
 
@@ -216,7 +226,7 @@ class SquareApiClient(models.Model):
             return {"success": False, "message": f"Connection failed: {str(e)}"}
 
     @api.model
-    def search_catalog_by_sku(self, product_sku):
+    def _search_catalog_by_sku(self, product_sku):
         """
         Search Square catalog for a product by SKU
 
@@ -259,7 +269,7 @@ class SquareApiClient(models.Model):
             )
             return {"success": False, "catalog_object_id": None, "not_found": False}
 
-    def get_catalog_object(self, catalog_object_id):
+    def _get_catalog_object(self, catalog_object_id):
         """
         Get catalog object details from Square
 
@@ -270,7 +280,7 @@ class SquareApiClient(models.Model):
             dict: Catalog object details including SKU
         """
         try:
-            endpoint = f"/v2/catalog/object/{catalog_object_id}"
+            endpoint = f"/v2/catalog/object/{quote(catalog_object_id, safe='')}"
             response = self._make_api_request(endpoint)
 
             if not response.get("object"):
@@ -296,7 +306,7 @@ class SquareApiClient(models.Model):
             return {"success": False, "sku": None, "not_found": False}
 
     @api.model
-    def get_inventory(self, catalog_object_id):
+    def _get_inventory(self, catalog_object_id):
         """
         Get inventory for a catalog object from Square
 
@@ -307,7 +317,7 @@ class SquareApiClient(models.Model):
             dict: Inventory data from Square API
         """
         try:
-            endpoint = f"/v2/inventory/{catalog_object_id}"
+            endpoint = f"/v2/inventory/{quote(catalog_object_id, safe='')}"
             response = self._make_api_request(endpoint)
             return response
         except Exception as e:
@@ -318,7 +328,7 @@ class SquareApiClient(models.Model):
 
 
     @api.model
-    def set_physical_count(
+    def _set_physical_count(
         self, catalog_object_id, location_id, target_quantity, product_sku
     ):
         """
@@ -371,7 +381,7 @@ class SquareApiClient(models.Model):
             return False
 
     @api.model
-    def get_locations(self):
+    def _get_locations(self, square_config=None):
         """
         Get all Square locations
 
@@ -380,14 +390,14 @@ class SquareApiClient(models.Model):
         """
         try:
             endpoint = "/v2/locations"
-            response = self._make_api_request(endpoint)
+            response = self._make_api_request(endpoint, square_config=square_config)
             return response.get("locations", [])
         except Exception as e:
             _logger.error(f"Error getting Square locations: {str(e)}")
             return []
 
     @api.model
-    def get_payment(self, payment_id):
+    def _get_payment(self, payment_id):
         """
         Retrieve payment details from Square API
 
@@ -398,7 +408,7 @@ class SquareApiClient(models.Model):
             dict: Payment data from Square API
         """
         try:
-            endpoint = f"/v2/payments/{payment_id}"
+            endpoint = f"/v2/payments/{quote(payment_id, safe='')}"
             response = self._make_api_request(endpoint)
 
             if "payment" in response:
@@ -418,7 +428,7 @@ class SquareApiClient(models.Model):
             return None
 
     @api.model
-    def get_first_active_location_id(self):
+    def _get_first_active_location_id(self):
         """
         Get the first active Square location ID
 
@@ -426,7 +436,7 @@ class SquareApiClient(models.Model):
             str: Location ID or None if not found
         """
         try:
-            locations = self.get_locations()
+            locations = self._get_locations()
 
             if not locations:
                 _logger.error("No Square locations found")
@@ -452,7 +462,7 @@ class SquareApiClient(models.Model):
             return None
 
     @api.model
-    def search_orders(
+    def _search_orders(
         self,
         start_at=None,
         end_at=None,

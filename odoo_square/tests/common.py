@@ -1,4 +1,8 @@
 # -*- coding: utf-8 -*-
+from base64 import b64encode
+from hmac import digest
+from urllib.parse import urlsplit
+
 from odoo.tests.common import HttpCase
 
 
@@ -22,6 +26,18 @@ class SquareHttpCase(HttpCase):
         )
         self.env.invalidate_all()
         return res
+
+    def post_square_webhook(self, data, headers=None):
+        route = "/square/webhook"
+        url = "https://" + urlsplit(self.base_url()).netloc + route
+        payload = data.encode("utf-8") if isinstance(data, str) else data
+        key = self.env["square.config"].sudo().search([], limit=1).square_webhook_signature_key
+        signature = b64encode(digest(key.encode(), url.encode() + payload, "sha256")).decode()
+        return self.url_open(route, data=payload, headers={
+            "Content-Type": "application/json",
+            **(headers or {}),
+            "x-square-hmacsha256-signature": signature,
+        })
 
     def pay_invoice(self, invoice, journal=None):
         values = {"journal_id": journal.id} if journal else {}

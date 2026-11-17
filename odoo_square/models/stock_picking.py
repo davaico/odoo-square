@@ -1,4 +1,7 @@
 from odoo import models
+from odoo.exceptions import AccessError
+
+from .stock_move import _SQUARE_MANAGED_PICKING
 
 
 class StockPicking(models.Model):
@@ -11,15 +14,18 @@ class StockPicking(models.Model):
             move.quantity = move.product_uom_qty
             move.picked = True
 
-    def button_validate(self):
-        """
-        Override button_validate to allow validation even with insufficient stock.
-        For Square orders, we set the completed quantity to the demand, allowing
-        negative stock if necessary.
-        """
-        if self.env.context.get("force_validate"):
-            self.filtered(
-                lambda picking: picking.picking_type_code in ("outgoing", "incoming")
-            )._force_quantity_for_square()
+    def _validate_square_picking(self, sale_order):
+        """Finish fulfillment for a verified Square sale or its return."""
+        sale_order.ensure_one()
+        if not sale_order.square_order_id or any(
+            picking.company_id != sale_order.company_id
+            or sale_order not in (picking.sale_id, picking.return_id.sale_id)
+            for picking in self
+        ):
+            raise AccessError("The picking is not linked to this Square sale.")
 
-        return super().button_validate()
+        pickings = self.with_context(square_managed_picking=_SQUARE_MANAGED_PICKING)
+        pickings.filtered(
+            lambda picking: picking.picking_type_code in ("outgoing", "incoming")
+        )._force_quantity_for_square()
+        return pickings.button_validate()

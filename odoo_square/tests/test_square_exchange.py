@@ -29,6 +29,7 @@ class TestSquareExchange(SquareHttpCase):
             {
                 "name": "Exchange Integration",
                 "square_application_id": "test_app_id",
+                "square_webhook_signature_key": "test-pos-webhook-key",
                 "square_access_token": "test_access_token",
                 "payment_journal_id": self.journal.id,
             }
@@ -115,13 +116,13 @@ class TestSquareExchange(SquareHttpCase):
             ],
         }
         orders = {order["id"]: order for order in (self.original_order, self.exchange_order)}
-        get_order = patch.object(SquareApiClient, "get_order", side_effect=orders.get)
+        get_order = patch.object(SquareApiClient, "_get_order", side_effect=orders.get)
         self.catalog = {
             "ORIGINAL-CATALOG": {"success": True, "sku": "ORIGINAL-SKU"},
             "REPLACEMENT-CATALOG": {"success": True, "sku": "REPLACEMENT-SKU"},
         }
         get_catalog = patch.object(
-            SquareApiClient, "get_catalog_object", side_effect=self.catalog.__getitem__
+            SquareApiClient, "_get_catalog_object", side_effect=self.catalog.__getitem__
         )
         get_order.start()
         self.addCleanup(get_order.stop)
@@ -129,8 +130,7 @@ class TestSquareExchange(SquareHttpCase):
         self.addCleanup(get_catalog.stop)
 
     def _send_webhook(self, event_type, event_id, data, expected_status):
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(
                 {"type": event_type, "event_id": event_id, "data": {"object": data}}
             ),

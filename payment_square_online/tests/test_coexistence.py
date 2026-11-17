@@ -237,7 +237,7 @@ class TestSquareCoexistence(SquareCheckoutCase):
         return self._result('/web/dataset/call_button', model=record._name, method=button,
                             args=[record.ids], kwargs={})
 
-    def test_pos_replay_waits_for_square_and_completes_a_legacy_website_queue_entry(self):
+    def test_pos_replay_quarantines_a_legacy_website_queue_entry(self):
         cart = self._captured_website_order()
         notice = {'order_id': 'SQ-ORDER-1', 'location_id': 'TESTNYC', 'state': 'OPEN'}
         api_path = '/v2/orders/SQ-ORDER-1'
@@ -247,6 +247,7 @@ class TestSquareCoexistence(SquareCheckoutCase):
         queue = self.env['square.webhook.queue'].create({
             'webhook_event_id': 'legacy-website-update', 'order_data': json.dumps(notice),
             'event_type': 'order.updated', 'square_order_id': 'SQ-ORDER-1',
+            'config_id': self.pos_config.id,
             'next_retry_time': fields.Datetime.now() - timedelta(minutes=1),
         })
         self.authenticate('admin', 'admin')
@@ -260,12 +261,9 @@ class TestSquareCoexistence(SquareCheckoutCase):
             response = self._pos_event('order.updated', 'retryable-website-update', notice)
             self.assertEqual(response.status_code, 503, response.text)
             replay()
-            self.assertEqual(queue.state, 'pending')
-            self.assertEqual(queue.retry_count, 1)
-            resources[api_path] = {'order': {'id': 'SQ-ORDER-1', 'location_id': 'TESTNYC', 'state': 'COMPLETED'}}
-            queue.next_retry_time = fields.Datetime.now() - timedelta(minutes=1)
-            replay()
-            self.assertEqual(queue.state, 'completed')
+            self.assertEqual(queue.state, 'failed')
+            self.assertEqual(queue.retry_count, 0)
+            self.assertEqual(queue.order_data, '{}')
         self.assertFalse(cart.square_order_id)
         self.assertEqual(self.env['sale.order'].search_count([('square_order_id', '=', 'SQ-ORDER-1')]), 0)
 

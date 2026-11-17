@@ -76,7 +76,7 @@ class TestSquareManualResync(TransactionCase):
             delta=60,
         )
 
-    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_location_orders")
+    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient._get_location_orders")
     def test_scan_missing_orders_empty(self, mock_get_location_orders):
         """Test scanning when no orders are missing"""
         mock_get_location_orders.return_value = []
@@ -96,8 +96,8 @@ class TestSquareManualResync(TransactionCase):
         self.assertEqual(wizard.square_total, 0)
         self.assertEqual(wizard.missing_total, 0)
 
-    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_location_orders")
-    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order")
+    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient._get_location_orders")
+    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient._get_order")
     def test_scan_identifies_missing_orders(self, mock_get_order, mock_get_location_orders):
         """Test scanning identifies orders missing from Odoo"""
         # Create an existing order in Odoo
@@ -170,7 +170,7 @@ class TestSquareManualResync(TransactionCase):
             wizard.action_validate_resync()
 
     @patch("odoo.addons.odoo_square.models.square_order_processor.SquareOrderProcessor._process_webhook_order")
-    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order")
+    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient._get_order")
     def test_resync_processes_selected_orders(self, mock_get_order, mock_process_event):
         """Test that resync processes selected orders through webhook pipeline"""
         # Mock order data
@@ -211,7 +211,7 @@ class TestSquareManualResync(TransactionCase):
         self.assertEqual(wizard.error_count, 0)
 
     @patch("odoo.addons.odoo_square.models.square_order_processor.SquareOrderProcessor._process_webhook_order")
-    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order")
+    @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient._get_order")
     def test_resync_handles_errors(self, mock_get_order, mock_process_event):
         """Test that resync continues on error and collects error details"""
         # Mock get_order failure
@@ -254,7 +254,7 @@ class TestSquareManualResync(TransactionCase):
 
         # Mock the scan to transition to results
         with patch(
-            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_location_orders",
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient._get_location_orders",
             return_value=[],
         ):
             wizard.action_scan_missing_orders()
@@ -271,7 +271,7 @@ class TestSquareManualResync(TransactionCase):
 
         # Mock the validate to transition to done
         with patch(
-            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order",
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient._get_order",
             return_value={"id": "test_order", "state": "COMPLETED"},
         ):
             with patch(
@@ -308,7 +308,7 @@ class TestSquareManualResync(TransactionCase):
 
         # Mock the processing
         with patch(
-            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order",
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient._get_order",
             side_effect=lambda oid, **kwargs: {
                 "id": oid,
                 "state": "COMPLETED",

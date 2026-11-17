@@ -4,7 +4,6 @@ import logging
 import base64
 import hashlib
 import hmac
-from datetime import timedelta
 from odoo import http, fields
 from odoo.http import request
 from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
@@ -30,7 +29,7 @@ class SquareWebhookController(http.Controller):
         """
         try:
             # Get raw request body for signature validation
-            raw_body = request.httprequest.data.decode("utf-8")
+            raw_body = request.httprequest.data
             square_signature = request.httprequest.headers.get(
                 "x-square-hmacsha256-signature"
             )
@@ -45,7 +44,7 @@ class SquareWebhookController(http.Controller):
             )
 
             # Validate webhook signature
-            config = request.env["square.api.client"]._website_routing_config()
+            config = request.env["square.config"].sudo().search([("active", "=", True)], limit=1)
             if not self._validate_webhook_signature(
                 raw_body, square_signature, notification_url, config
             ):
@@ -61,7 +60,10 @@ class SquareWebhookController(http.Controller):
                 request.httprequest.content_type
                 and "application/json" in request.httprequest.content_type
             ):
-                data = json.loads(raw_body)
+                try:
+                    data = json.loads(raw_body.decode("utf-8"))
+                except (UnicodeError, ValueError):
+                    return http.Response(status=400)
             else:
                 _logger.error("Square webhook: Invalid content type")
                 return http.Response(
@@ -75,7 +77,7 @@ class SquareWebhookController(http.Controller):
                     status=400,
                 )
 
-            if not data:
+            if not isinstance(data, dict) or not data:
                 _logger.error("Square webhook: No data received")
                 return http.Response(
                     json.dumps({"status": "error", "message": "No data received"}),
@@ -87,23 +89,31 @@ class SquareWebhookController(http.Controller):
             event_type = data.get("type")
             event_data = data.get("data", {})
 
-            # Log webhook reception
-            request.env["square.integration.log"].sudo().log_webhook_received(
-                event_type, event_data, data.get("event_id")
-            )
+            event_id = data.get("event_id")
+            if (
+                not isinstance(event_type, str) or not event_type
+                or not isinstance(event_data, dict)
+                or (event_id is not None and (
+                    not isinstance(event_id, str) or not event_id or len(event_id) > 255
+                ))
+            ):
+                return http.Response(status=400)
 
-            if not event_type:
-                _logger.error("Square webhook: No event type specified")
-                raise ValidationError("No event type specified in webhook data")
-
-            # NOTE: Uncomment this to print a full JSON
-            # _logger.debug(f"Square webhook data: {json.dumps(data, indent=4)}")
-
-            # Process different event types using unified processor with transaction isolation
+            # The singleton webhook configuration determines company scope, not
+            # the anonymous caller's session or selected companies.
+            bot = request.env.ref("odoo_square.user_square_bot", raise_if_not_found=False)
+            if not bot or not bot.sudo().active or config.company_id not in bot.sudo().company_ids:
+                return http.Response(status=503)
+            request.update_env(user=bot.id, context={"allowed_company_ids": config.company_id.ids}, su=True)
             with request.env.cr.savepoint():
-                result = self._process_event(
-                    event_type, event_data, data.get("event_id"), square_config=config,
-                    signed=bool(config.square_webhook_signature_key),
+                request.env["square.integration.log"]._log_webhook_received(
+                    event_type, event_id
+                )
+                result = request.env["square.webhook.event"]._apply_provider_event(
+                    config, event_id,
+                    lambda: self._process_event(
+                        event_type, event_data, event_id, square_config=config, signed=True,
+                    ),
                 )
 
             return http.Response(
@@ -131,16 +141,6 @@ class SquareWebhookController(http.Controller):
         except Exception as e:
             _logger.error(f"Square webhook error: {str(e)}", exc_info=True)
 
-            # Log error to integration dashboard
-            try:
-                request.env["square.integration.log"].sudo().log_error(
-                    title="Webhook Processing Error",
-                    error_message=str(e),
-                    technical_details=f"Event type: {event_type if 'event_type' in locals() else 'Unknown'}\nError: {str(e)}",
-                )
-            except:
-                pass  # Don't let logging errors break the webhook
-
             return http.Response(
                 json.dumps({"status": "error", "message": "Internal server error"}),
                 content_type="application/json",
@@ -162,36 +162,17 @@ class SquareWebhookController(http.Controller):
             bool: True if signature is valid, False otherwise
         """
         try:
-            if not square_config or not square_config.square_webhook_signature_key:
-                _logger.warning(
-                    "Square webhook signature key not configured - skipping validation"
-                )
-                return True
-
-            signature_key = square_config.square_webhook_signature_key
-
-            # If signature key is configured but header is missing, reject
-            if not signature_header:
-                _logger.error(
-                    "Signature header is missing but signature key is configured"
-                )
+            signature_key = square_config.square_webhook_signature_key if square_config else None
+            if (
+                not signature_key or not signature_key.isascii()
+                or not signature_key.isprintable() or any(c.isspace() for c in signature_key)
+                or not signature_header or not request_body or not notification_url
+            ):
                 return False
 
-            # Validate other inputs
-            if not request_body:
-                _logger.error("Request body is empty")
-                return False
-
-            if not notification_url:
-                _logger.error("Notification URL is empty")
-                return False
-
-            # Perform UTF-8 encoding to bytes
-            # https://github.com/square/square-python-sdk/blob/4e073b8df70daa190fcbf09e1b19423241b3e717/src/square/utils/webhooks_helper.py#L41
-            payload = notification_url + request_body
-            payload_bytes = payload.encode("utf-8")
-            signature_header_bytes = signature_header.encode("utf-8")
-            signature_key_bytes = signature_key.encode("utf-8")
+            payload_bytes = notification_url.encode("utf-8") + request_body
+            signature_header_bytes = signature_header.encode("ascii")
+            signature_key_bytes = signature_key.encode("ascii")
 
             # Compute the hash value
             hashing_obj = hmac.new(
@@ -217,13 +198,13 @@ class SquareWebhookController(http.Controller):
             if event_type == "order.created":
                 order_data = event_data.get("object", {}).get("order_created", {})
                 return request.env["square.order.processor"]._process_webhook_order(
-                    order_data, "created", webhook_event_id, square_config=square_config,
+                    order_data, "created", webhook_event_id, square_config=square_config, signed=signed,
                 )
 
             elif event_type == "order.updated":
                 order_data = event_data.get("object", {}).get("order_updated", {})
                 return request.env["square.order.processor"]._process_webhook_order(
-                    order_data, "updated", webhook_event_id, square_config=square_config,
+                    order_data, "updated", webhook_event_id, square_config=square_config, signed=signed,
                 )
 
             elif event_type == "payment.updated":
@@ -280,29 +261,6 @@ class SquareWebhookController(http.Controller):
                     "message": f"Payment status {payment_status} not processed",
                 }
 
-            # Check for existing processing of this payment event
-            if webhook_event_id:
-                existing_log = (
-                    request.env["square.integration.log"]
-                    .sudo()
-                    .search(
-                        [
-                            ("webhook_event_id", "=", webhook_event_id),
-                            ("status", "=", "success"),
-                        ],
-                        limit=1,
-                    )
-                )
-
-                if existing_log:
-                    _logger.info(
-                        f"Payment event {webhook_event_id} already processed successfully, skipping"
-                    )
-                    return {
-                        "status": "already_processed",
-                        "payment_id": payment_id,
-                    }
-
             # Fetch full order details from Square API to check for exchanges
             api_client = request.env["square.api.client"].sudo()
             routing, order_data = api_client._read_pos_order(order_id)
@@ -352,23 +310,16 @@ class SquareWebhookController(http.Controller):
                 )
                 
                 # Process the exchange
-                bot_user = None
-                try:
-                    bot_user = request.env.ref("odoo_square.user_square_bot")
-                except ValueError:
-                    bot_user = request.env.ref("base.user_admin")
-
-                square_processor = (
-                    request.env["square.order.processor"].sudo().with_user(bot_user)
-                )
+                processor = request.env["square.order.processor"]
+                bot_user = processor._get_square_bot_user()
+                square_processor = processor.with_user(bot_user)
 
                 # Find existing sale order using source_order_id (the original order)
                 # Important: Load with bot_user context so it has a user throughout processing
                 sale_order = (
                     request.env["sale.order"]
-                    .sudo()
                     .with_user(bot_user)
-                    .search([("square_order_id", "=", source_order_id)], limit=1)
+                    .search([("square_order_id", "=", source_order_id), ("company_id", "=", request.env.company.id)], limit=1)
                 )
 
                 if not sale_order:
@@ -381,24 +332,12 @@ class SquareWebhookController(http.Controller):
                     }
 
                 # Process the exchange
-                result = square_processor.process_product_exchange(
-                    sale_order, order_data, payment_data
+                config = api_client._website_routing_config()
+                result = request.env["square.webhook.event"]._apply_once(
+                    config, "exchange:" + order_id,
+                    lambda: square_processor._process_product_exchange(sale_order, order_data, payment_data),
+                    duplicate_status="skipped",
                 )
-
-                # Log successful processing
-                if webhook_event_id and result.get("status") == "success":
-                    request.env["square.integration.log"].sudo().with_user(
-                        bot_user
-                    ).create(
-                        {
-                            "webhook_event_id": webhook_event_id,
-                            "square_order_id": source_order_id,
-                            "status": "success",
-                            "event_type": "order_updated",
-                            "title": f"Exchange processed for order {source_order_id}",
-                            "description": f"Payment event {webhook_event_id} processed successfully for exchange on source order {source_order_id} (current order: {order_id})",
-                        }
-                    )
 
                 return result
             else:
@@ -445,15 +384,17 @@ class SquareWebhookController(http.Controller):
         return False
 
     def _process_refund(
-        self, refund_data, event_type, webhook_event_id=None, env=None, *, square_config=None, signed=False,
+        self, refund_data, event_type, webhook_event_id=None, env=None, *, square_config=None, signed,
     ):
         """Process refund data from webhook using the new refund model.
 
         ``env`` allows unit tests to call this without a bound HTTP ``request``.
         """
         req_env = env if env is not None else request.env
+        if not signed:
+            raise AccessError("Square refunds require a verified Square notification.")
         try:
-            if not refund_data:
+            if not refund_data or not isinstance(refund_data.get("id"), str) or not refund_data["id"]:
                 _logger.warning(f"No refund data in {event_type} webhook")
                 return {"status": "ignored", "message": "No refund data"}
 
@@ -466,110 +407,33 @@ class SquareWebhookController(http.Controller):
                 f"Processing Square refund {refund_id} for order {order_id} with status {refund_status}"
             )
 
-            # Multi-layer idempotency check for refunds
-            # First check by webhook event ID (most specific)
-            if webhook_event_id:
-                existing_log = (
-                    req_env["square.integration.log"]
-                    .sudo()
-                    .search(
-                        [
-                            ("webhook_event_id", "=", webhook_event_id),
-                            ("status", "=", "success"),
-                        ],
-                        limit=1,
-                    )
-                )
-
-                if existing_log:
-                    _logger.info(
-                        f"Webhook event {webhook_event_id} for refund {refund_id} already processed successfully, skipping"
-                    )
-                    return {
-                        "status": "already_processed",
-                        "message": f"Refund webhook event {webhook_event_id} already processed",
-                        "refund_id": refund_id,
-                    }
-
             api_client = req_env["square.api.client"].sudo()
             config = api_client._website_routing_config(square_config)
             routing = api_client._route_website_refund(refund_data, config, signed=signed)
             if routing:
                 return routing
 
-            if not order_id:
-                _logger.error(f"No order ID in refund {event_type} webhook")
-                return {"status": "error", "message": "No order ID in refund"}
+            sales = req_env["sale.order"].sudo()
 
-            # Find the original sale order - try multiple strategies
-            sale_order = None
-            search_strategy = "order_id"
+            def find(field, provider_id):
+                # Refund order IDs can identify a return; its payment ID
+                # identifies the original sale. Never search across companies.
+                if not provider_id:
+                    return sales.browse()
+                return sales.search([
+                    (field, "=", provider_id), ("company_id", "=", config.company_id.id),
+                    ("square_order_id", "!=", False),
+                ], limit=1)
 
-            # Strategy 1: Search by order_id (most common case)
-            sale_order = (
-                req_env["sale.order"]
-                .sudo()
-                .search([("square_order_id", "=", order_id)], limit=1)
-            )
-
-            # Strategy 2: If not found, try to find by payment_id if available
-            if not sale_order and refund_data.get("payment_id"):
-                payment_id = refund_data.get("payment_id")
-                sale_order = (
-                    req_env["sale.order"]
-                    .sudo()
-                    .search([("square_payment_id", "=", payment_id)], limit=1)
-                )
-                if sale_order:
-                    search_strategy = "payment_id"
-                    _logger.info(
-                        f"Found order {sale_order.name} by payment_id {payment_id} for refund {refund_id}"
-                    )
-
-            # Strategy 3: If still not found, try to fetch refund details from Square API
+            payment_id = refund_data.get("payment_id")
+            sale_order = find("square_payment_id", payment_id) or find("square_order_id", order_id)
             if not sale_order:
-                try:
-                    refund_details = self._fetch_refund_details_from_square(
-                        refund_id, env=req_env
-                    )
-                    if refund_details:
-                        # Try to find order by payment_id from refund details
-                        payment_id = refund_details.get("payment_id")
-                        if payment_id:
-                            sale_order = (
-                                req_env["sale.order"]
-                                .sudo()
-                                .search(
-                                    [("square_payment_id", "=", payment_id)], limit=1
-                                )
-                            )
-                            if sale_order:
-                                search_strategy = "square_api_payment_id"
-                                _logger.info(
-                                    f"Found order {sale_order.name} by Square API payment_id {payment_id} for refund {refund_id}"
-                                )
-
-                        # If still not found, try order_id from refund details
-                        if not sale_order:
-                            api_order_id = refund_details.get("order_id")
-                            if api_order_id and api_order_id != order_id:
-                                sale_order = (
-                                    req_env["sale.order"]
-                                    .sudo()
-                                    .search(
-                                        [("square_order_id", "=", api_order_id)],
-                                        limit=1,
-                                    )
-                                )
-                                if sale_order:
-                                    search_strategy = "square_api_order_id"
-                                    _logger.info(
-                                        f"Found order {sale_order.name} by Square API order_id {api_order_id} for refund {refund_id}"
-                                    )
-                except Exception as e:
-                    _logger.warning(
-                        f"Failed to fetch refund details from Square API: {str(e)}"
-                    )
+                refund = api_client._read_website_routing_resource("refunds", "refund", refund_id, config)
+                api_payment_id = refund.get("payment_id")
+                sale_order = find("square_payment_id", api_payment_id)
+                if api_payment_id and not sale_order:
+                    payment = api_client._read_website_routing_resource("payments", "payment", api_payment_id, config)
+                    sale_order = find("square_order_id", payment.get("order_id"))
 
             if not sale_order:
                 _logger.warning(
@@ -579,30 +443,11 @@ class SquareWebhookController(http.Controller):
                     f"from a different location, or processed by another system."
                 )
 
-                # Create a log entry for tracking purposes
-                req_env["square.integration.log"].sudo().create(
-                    {
-                        "event_type": "refund_created",
-                        "status": "error",
-                        "title": f"Refund for unknown order: {refund_id}",
-                        "square_order_id": order_id,
-                        "square_refund_id": refund_id,
-                        "description": f"Refund {refund_id} references order {order_id} which is not in the system. "
-                        f"Payment ID: {refund_data.get('payment_id', 'N/A')}. "
-                        f"This may be a refund for an order created before webhook integration.",
-                        "technical_details": json.dumps(
-                            {
-                                "refund_data": refund_data,
-                                "search_strategies_tried": [
-                                    "order_id",
-                                    "payment_id",
-                                    "square_api",
-                                ],
-                                "reason": "Order not found in system",
-                            }
-                        ),
-                        "webhook_event_id": webhook_event_id,
-                    }
+                req_env["square.integration.log"]._log_square_event(
+                    event_type="refund_created", status="warning",
+                    title="Refund references an order that was not found",
+                    square_order_id=order_id, square_refund_id=refund_id,
+                    webhook_event_id=webhook_event_id,
                 )
 
                 return {
@@ -611,7 +456,7 @@ class SquareWebhookController(http.Controller):
                 }
 
             _logger.info(
-                f"Successfully linked refund {refund_id} to order {sale_order.name} using strategy: {search_strategy}"
+                "Linked Square refund %s to sale %s", refund_id, sale_order.id,
             )
 
             return req_env["square.refund"].sudo()._process_webhook_refund(
@@ -625,59 +470,16 @@ class SquareWebhookController(http.Controller):
                 f"Error processing {event_type} refund: {str(e)}", exc_info=True
             )
 
-            # Log error
+            # Record a safe summary without copying the payload or exception.
             try:
-                req_env["square.integration.log"].sudo().log_error(
+                req_env["square.integration.log"].sudo()._log_error(
                     title=f"Refund {event_type} Processing Error",
-                    error_message=str(e),
+                    error_message="The refund could not be applied.",
                     square_order_id=(
                         refund_data.get("order_id") if refund_data else None
                     ),
-                    technical_details=f"Refund data: {refund_data}\nError: {str(e)}",
                 )
             except:
                 pass  # Don't let logging errors break the process
 
             return {"status": "error", "message": str(e)}
-
-    def _fetch_refund_details_from_square(self, refund_id, env=None):
-        """
-        Fetch detailed refund information from Square API
-        This helps us find the correct order when webhook data is incomplete
-        """
-        try:
-            req_env = env if env is not None else request.env
-            square_api = req_env["square.api.client"]
-
-            # Try to get payment details first (refunds are associated with payments)
-            payment_data = square_api.get_payment(refund_id)
-
-            if payment_data:
-                # Extract refund information from payment
-                refund_info = {
-                    "id": refund_id,
-                    "payment_id": payment_data.get("id"),
-                    "order_id": payment_data.get("order_id"),
-                    "amount_money": payment_data.get("amount_money"),
-                    "status": payment_data.get("status"),
-                    "refund_ids": payment_data.get("refund_ids", []),
-                }
-
-                _logger.info(
-                    f"Successfully fetched payment details for {refund_id} from Square API"
-                )
-                return refund_info
-
-            # If payment not found, try to get refund directly
-            # This is a fallback for cases where refund_id might be different from payment_id
-            _logger.debug(f"Payment {refund_id} not found, might be a direct refund ID")
-
-            # For now, return None if payment not found
-            # In the future, we could add a direct refund endpoint if needed
-            return None
-
-        except Exception as e:
-            _logger.error(
-                f"Error fetching payment/refund details from Square API: {str(e)}"
-            )
-            return None

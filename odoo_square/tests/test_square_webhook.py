@@ -3,7 +3,7 @@ import json
 from html import unescape
 from unittest.mock import patch
 import logging
-from odoo.tests.common import tagged
+from odoo.tests.common import new_test_user, tagged
 from odoo.tools import mute_logger
 from odoo.addons.odoo_square.controllers.square_webhook import SquareWebhookController
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
@@ -43,6 +43,7 @@ class TestSquareWebhook(SquareHttpCase):
             {
                 "name": "Test Square Config",
                 "square_application_id": "test_app_id",
+                "square_webhook_signature_key": "test-pos-webhook-key",
                 "square_access_token": "test_access_token",
                 "square_environment": "sandbox",
             }
@@ -117,8 +118,7 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Make webhook request using Odoo's HTTP testing
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
@@ -177,8 +177,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
@@ -210,8 +209,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
@@ -258,21 +256,23 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
-            "/square/webhook",
+        # Simulate a success log forged under the old ACLs. Diagnostic rows
+        # have no authority over a later genuine delivery.
+        self.env["square.integration.log"].create({
+            "event_type": "order_updated", "status": "success", "title": "Legacy fixture",
+            "square_order_id": existing_order.square_order_id,
+            "description": "state: COMPLETED", "webhook_event_id": webhook_data["event_id"],
+        })
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
 
         self.assertEqual(response.status_code, 200)
         response_data = response.json()
-        self.assertIn(
-            response_data["status"],
-            ("success", "updated", "already_processed"),
-        )
+        self.assertEqual(response_data["status"], "updated", response.text)
 
-        response2 = self.url_open(
-            "/square/webhook",
+        response2 = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
@@ -308,8 +308,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
@@ -331,8 +330,7 @@ class TestSquareWebhook(SquareHttpCase):
     def test_webhook_invalid_content_type(self):
         """Test webhook with invalid content type returns error"""
 
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data="invalid data",
             headers={"Content-Type": "text/plain"},
         )
@@ -367,9 +365,7 @@ class TestSquareWebhook(SquareHttpCase):
                     headers["x-square-hmacsha256-signature"] = signature
 
                 response = self.url_open(
-                    "/square/webhook",
-                    data=json.dumps(webhook_data),
-                    headers=headers,
+                    "/square/webhook", data=json.dumps(webhook_data), headers=headers,
                 )
 
                 self.assertEqual(response.status_code, 403)
@@ -378,24 +374,111 @@ class TestSquareWebhook(SquareHttpCase):
                 )
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
+    def test_missing_or_invalid_signing_key_rejects_anonymous_delivery(self):
+        for key in (False, "  "):
+            self.square_config.square_webhook_signature_key = key
+            for kind, data in (
+                ("order.created", {"order_created": {"id": "blocked-order", "state": "COMPLETED"}}),
+                ("refund.updated", {"refund": {"id": "blocked-refund", "status": "COMPLETED"}}),
+            ):
+                with self.subTest(key=key, kind=kind):
+                    response = self.url_open(
+                        "/square/webhook",
+                        data=json.dumps({"type": kind, "data": {"object": data}}),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(response.status_code, 403)
+            malformed = self.url_open("/square/webhook", data=b"\xff")
+            self.assertEqual(malformed.status_code, 403)
+        self.assertFalse(self.env["sale.order"].search([("square_order_id", "=", "blocked-order")]))
+        self.assertFalse(self.env["square.refund"].search([]))
+        self.assertFalse(self.env["square.integration.log"].search([]))
+
+    def test_sales_rpc_cannot_call_ingest_or_merchant_transport(self):
+        sales = new_test_user(
+            self.env, login="square-rpc-sales", password="square-rpc-sales",
+            groups="sales_team.group_sale_salesman",
+        )
+        self.authenticate(sales.login, "square-rpc-sales")
+        with patch.object(SquareApiClient, "_make_api_request") as transport:
+            for model, method, args in (
+                ("square.api.client", "get_customer", ["sample-customer"]),
+                ("square.api.client", "_get_customer", ["sample-customer"]),
+                ("square.api.client", "set_physical_count", ["sample-item", "sample-location", 0, "sample"]),
+                ("square.order.processor", "process_square_order", [{"id": "fixture-rpc-order", "state": "OPEN"}]),
+                ("square.order.processor", "_process_square_order", [[], {"id": "fixture-rpc-order", "state": "OPEN"}]),
+                ("square.refund", "action_process_refund", [[1]]),
+                ("square.webhook.queue", "queue_event", ["sample-event", "order.updated", {}]),
+                ("square.webhook.queue", "process_pending_events", []),
+            ):
+                with self.subTest(model=model, method=method):
+                    response = self.url_open(
+                        "/web/dataset/call_kw",
+                        data=json.dumps({
+                            "jsonrpc": "2.0", "method": "call", "id": 1,
+                            "params": {"model": model, "method": method, "args": args, "kwargs": {}},
+                        }),
+                        headers={"Content-Type": "application/json"},
+                    )
+                    self.assertIn("error", response.json())
+            transport.assert_not_called()
+        self.assertFalse(self.env["sale.order"].search([("square_order_id", "=", "fixture-rpc-order")]))
+
+    def test_signed_order_uses_the_configured_company_not_the_public_session_company(self):
+        other = self.env["res.company"].create({"name": "Square test branch"})
+        self.square_config.unlink()
+        config = self.env["square.config"].with_company(other).create({
+            "square_application_id": "fixture-app", "square_access_token": "fixture-token",
+            "square_webhook_signature_key": "fixture-signing-key",
+        })
+        warehouse = self.env["stock.warehouse"].create({
+            "name": "Square pickup branch", "code": "SQBR", "company_id": other.id,
+        })
+        self.env["square.location.mapping"].create({
+            "config_id": config.id, "warehouse_id": warehouse.id,
+            "square_location_id": "branch-location", "square_location_name": "Branch",
+        })
+        order = {"id": "fixture-branch-order", "state": "OPEN", "location_id": "branch-location"}
+        with patch.object(SquareApiClient, "_get_order", return_value=order):
+            self._send_order_event("order.created", "fixture-branch-event", order, "success")
+        sale = self.env["sale.order"].search([("square_order_id", "=", order["id"])])
+        self.assertEqual(sale.company_id, other)
+        self.assertEqual(sale.warehouse_id, warehouse)
+        self.assertEqual(sale.create_uid, self.env.ref("odoo_square.user_square_bot"))
+
+    def test_signed_refund_lookup_cannot_link_a_sale_in_another_company(self):
+        other = self.env["res.company"].create({"name": "Unrelated Square test company"})
+        order = self.env["sale.order"].with_company(other).create({
+            "partner_id": self.partner.id, "square_order_id": "other-company-order",
+            "square_payment_id": "other-company-payment",
+        })
+        payload = {
+            "type": "refund.updated", "event_id": "fixture-cross-company-event",
+            "data": {"object": {"refund": {
+                "id": "fixture-cross-company-refund", "order_id": "fixture-return",
+                "status": "COMPLETED", "amount_money": {"amount": 300, "currency": "EUR"},
+            }}},
+        }
+        with patch.object(SquareApiClient, "_make_api_request", side_effect=[
+            {"refund": {"id": "fixture-cross-company-refund", "payment_id": order.square_payment_id}},
+            {"payment": {"id": order.square_payment_id, "order_id": order.square_order_id}},
+        ]) as request:
+            response = self.post_square_webhook(json.dumps(payload))
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(response.json()["status"], "ignored", response.text)
+        self.assertFalse(self.env["square.refund"].search([("sale_order_id", "=", order.id)]))
+
+    @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_malformed_json(self):
         """Test webhook with malformed JSON returns error"""
 
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data="{ invalid json }",
             headers={"Content-Type": "application/json"},
         )
 
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(
-            response.json(), {"status": "error", "message": "Internal server error"}
-        )
-        self.assertTrue(
-            self.env["square.integration.log"].search(
-                [("event_type", "=", "error"), ("title", "=", "Webhook Processing Error")]
-            )
-        )
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(self.env["square.integration.log"].search([]))
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_no_event_type(self):
@@ -412,16 +495,13 @@ class TestSquareWebhook(SquareHttpCase):
             }
         }
 
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
 
         self.assertEqual(response.status_code, 400)
-        response_data = response.json()
-        self.assertEqual(response_data["status"], "error")
-        self.assertIn("event type", response_data["message"])
+        self.assertFalse(self.env["square.integration.log"].search([]))
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_unhandled_event_type(self):
@@ -429,8 +509,7 @@ class TestSquareWebhook(SquareHttpCase):
 
         webhook_data = {"type": "catalog.updated", "data": {}}  # Unhandled event type
 
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
@@ -545,7 +624,7 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         processor = self.env["square.order.processor"]
-        result = processor.process_square_order(square_data)
+        result = processor._import_square_order(square_data)
 
         # Check result
         self.assertIn("sale_order_id", result)
@@ -597,8 +676,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
@@ -669,8 +747,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
@@ -704,7 +781,7 @@ class TestSquareWebhook(SquareHttpCase):
             "reason": "Customer request",
         }
 
-        refund_record = self.env["square.refund"].create_from_square_data(
+        refund_record = self.env["square.refund"]._create_from_square_data(
             refund_data, sale_order
         )
 
@@ -712,7 +789,7 @@ class TestSquareWebhook(SquareHttpCase):
         self.assertEqual(refund_record.square_refund_id, "test_refund_model_001")
         self.assertEqual(refund_record.status, "pending")
         self.assertEqual(refund_record.refund_amount, 30.00)
-        self.assertEqual(refund_record.refund_reason, "Customer request")
+        self.assertFalse(refund_record.refund_reason)
 
     def test_partial_refund_detection(self):
         """Test partial refund detection logic"""
@@ -780,8 +857,7 @@ class TestSquareWebhook(SquareHttpCase):
         self.assertFalse(full_refund._is_partial_refund())
 
     def _send_order_event(self, event_type, event_id, order_data, expected_status):
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(
                 {
                     "type": event_type,
@@ -834,7 +910,7 @@ class TestSquareWebhook(SquareHttpCase):
                 {"pickup_details": {"recipient": {"email_address": self.partner.email}}}
             ],
         }
-        with patch.object(SquareApiClient, "get_order", return_value=order_data):
+        with patch.object(SquareApiClient, "_get_order", return_value=order_data):
             self._send_order_event(
                 "order.created", "evt_line_sync_created",
                 {**order_notice, "version": 1}, "success",
@@ -885,7 +961,7 @@ class TestSquareWebhook(SquareHttpCase):
                 None, "already_processed", 4, 120,
             ),
         ):
-            with patch.object(SquareApiClient, "get_order", return_value=fetched_order):
+            with patch.object(SquareApiClient, "_get_order", return_value=fetched_order):
                 self._send_order_event("order.updated", event_id, payload, status)
             self.assertEqual(self.env["sale.order"].search(order_domain), sale_order)
             self.assertEqual(sale_order.state, "draft")
@@ -940,7 +1016,12 @@ class TestSquareWebhook(SquareHttpCase):
         self._send_order_event(
             "order.updated", "evt_open_before_creation", {**snapshot(2), "version": 2}, "queued"
         )
-        with patch.object(SquareApiClient, "get_order", return_value={**snapshot(3), "version": 3}):
+        queued_event = self.env["square.webhook.queue"].search(
+            [("webhook_event_id", "=", "evt_open_before_creation")]
+        )
+        self.assertTrue(queued_event.signature_verified)
+        self.assertNotIn("fulfillments", json.loads(queued_event.order_data))
+        with patch.object(SquareApiClient, "_get_order", return_value={**snapshot(3), "version": 3}):
             self._send_order_event(
                 "order.created", "evt_open_order_created", {**order_notice, "version": 1}, "success"
             )
@@ -952,9 +1033,13 @@ class TestSquareWebhook(SquareHttpCase):
             [("webhook_event_id", "=", "evt_open_before_creation")]
         )
         self.assertEqual(queued_event.state, "completed")
+        self.assertEqual(queued_event.order_data, "{}")
+        self._send_order_event(
+            "order.updated", "evt_open_before_creation", {**snapshot(2), "version": 2}, "already_processed"
+        )
 
         # A version from a notice cannot identify an unversioned retrieved snapshot.
-        with patch.object(SquareApiClient, "get_order", return_value=snapshot(4)):
+        with patch.object(SquareApiClient, "_get_order", return_value=snapshot(4)):
             self._send_order_event(
                 "order.updated", "evt_unversioned_snapshot", {**order_notice, "version": 5}, "updated"
             )
@@ -1019,12 +1104,12 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Create first refund
-        refund1 = self.env["square.refund"].create_from_square_data(
+        refund1 = self.env["square.refund"]._create_from_square_data(
             refund_data, sale_order
         )
 
         # Try to create duplicate
-        refund2 = self.env["square.refund"].create_from_square_data(
+        refund2 = self.env["square.refund"]._create_from_square_data(
             refund_data, sale_order
         )
 
@@ -1102,7 +1187,7 @@ class TestSquareWebhook(SquareHttpCase):
         # Mock the request environment for testing
         with self.env.cr.savepoint():
             result = webhook_controller._process_refund(
-                refund_data, "created", env=self.env
+                refund_data, "created", env=self.env, signed=True
             )
 
             self.assertEqual(result["status"], "success")
@@ -1125,7 +1210,7 @@ class TestSquareWebhook(SquareHttpCase):
 
         # This should not raise an error (method exists)
         try:
-            result = square_api.get_payment("test_payment_id")
+            result = square_api._get_payment("test_payment_id")
             self.assertIsNone(result)
         except Exception as e:
             msg = str(e)
@@ -1183,12 +1268,12 @@ class TestSquareWebhook(SquareHttpCase):
 
         with self.env.cr.savepoint():
             result = webhook_controller._process_refund(
-                eur_refund_data, "created", env=self.env
+                eur_refund_data, "created", env=self.env, signed=True
             )
             self.assertEqual(result["status"], "success")
 
             result_usd = webhook_controller._process_refund(
-                usd_refund_data, "created", env=self.env
+                usd_refund_data, "created", env=self.env, signed=True
             )
             self.assertEqual(result_usd["status"], "error")
             err = (result_usd.get("message") or "").lower()
@@ -1241,10 +1326,9 @@ class TestSquareWebhook(SquareHttpCase):
                 # The key test: this should not cause the mail follower SQL error
                 if test_picking.state == "assigned":
                     test_picking.with_user(bot_user).with_context(
-                        force_validate=True,
                         mail_auto_subscribe_no_notify=True,
                         mail_create_nosubscribe=True,
-                    ).button_validate()
+                    )._validate_square_picking(test_order)
 
                 # If we get here without SQL errors, the fix is working
                 success = True
@@ -1493,8 +1577,7 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Process the webhook
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
@@ -1589,8 +1672,7 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Process the webhook
-        response = self.url_open(
-            "/square/webhook",
+        response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
         )
@@ -1676,8 +1758,7 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
-        response_1 = self.url_open(
-            "/square/webhook",
+        response_1 = self.post_square_webhook(
             data=json.dumps(webhook_data_1),
             headers={"Content-Type": "application/json"},
         )

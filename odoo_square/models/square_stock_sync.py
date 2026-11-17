@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import logging
 from odoo import models, fields, api
+from odoo.exceptions import AccessError, UserError
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 
 _logger = logging.getLogger(__name__)
 
@@ -27,607 +29,215 @@ class SquareStockSync(models.Model):
         help="Automatically sync stock changes to Square",
     )
 
-    def _get_square_api_client(self):
-        """Get Square API client instance"""
-        return self.env["square.api.client"]
+    _statistics_fields = frozenset({
+        "last_sync_date", "total_syncs", "successful_syncs", "failed_syncs",
+    })
 
-    def _search_square_catalog_by_sku(self, product_sku):
-        """Search Square catalog for a product by SKU"""
-        api_client = self._get_square_api_client()
-        return api_client.search_catalog_by_sku(product_sku)
-
-    def _get_configured_warehouse(self):
-        """Get the configured warehouse from Square configuration (legacy method)"""
-        api_client = self._get_square_api_client()
-        config = api_client._get_square_config()
-        return config.get_configured_warehouse()
-
-    def _get_warehouse_for_location(self, square_location_id):
-        """Get the warehouse mapped to a specific Square location"""
-        api_client = self._get_square_api_client()
-        config = api_client._get_square_config()
+    def _check_management_access(self):
+        if not self.env.is_system():
+            raise AccessError("Only Square administrators can manage stock synchronization.")
+        config = self.env["square.config"].sudo().with_context(active_test=False).search([], limit=1)
         if config:
-            return config.get_warehouse_for_location(square_location_id)
-        return self._get_configured_warehouse()
+            config.with_env(self.env).check_access("read")
+            if config.company_id != self.env.company:
+                raise AccessError("Switch to the Square configuration's company to manage stock synchronization.")
 
-    def _get_square_location_id(self):
-        """Get the first available Square location ID"""
-        api_client = self._get_square_api_client()
-        return api_client.get_first_active_location_id()
+    @api.model_create_multi
+    def create(self, vals_list):
+        if not self.env.su:
+            self._check_management_access()
+            if any(self._statistics_fields.intersection(vals) for vals in vals_list):
+                raise AccessError("Stock synchronization statistics are maintained by the integration.")
+            # Discard RPC context defaults as well as explicit statistics values.
+            self = self.with_context({
+                key: value for key, value in self.env.context.items()
+                if key not in {f"default_{name}" for name in self._statistics_fields}
+            })
+        return super().create(vals_list)
 
-    def _is_square_sourced_move(self, stock_move):
-        """Check if a stock move originated from a Square order"""
-        # Check if the move is related to a sale order with square_order_id
-        if stock_move.sale_line_id and stock_move.sale_line_id.order_id.square_order_id:
-            return True
+    def write(self, vals):
+        if not self.env.su:
+            self._check_management_access()
+            if self._statistics_fields.intersection(vals):
+                raise AccessError("Stock synchronization statistics are maintained by the integration.")
+        return super().write(vals)
 
-        # Check if the move has Square origin reference
-        if stock_move.origin and "Square" in stock_move.origin:
-            return True
+    def unlink(self):
+        if not self.env.su:
+            self._check_management_access()
+        return super().unlink()
 
-        return False
+    @api.model
+    def _for_company(self, company):
+        """Select integration records using the stock record's company."""
+        service = self.with_context({}, allowed_company_ids=company.ids).sudo()
+        config = service.env["square.config"].search([("company_id", "=", company.id)], limit=1)
+        if not config:
+            return service, config
 
-    def _is_configured_warehouse_move(self, stock_move):
-        """Check if the move involves the configured warehouse"""
-        configured_warehouse = self._get_configured_warehouse()
+        sync = service.search([], limit=1) or service.create({})
+        return sync, config
 
-        # Check source and destination locations
-        warehouse_locations = (
-            configured_warehouse.lot_stock_id | configured_warehouse.view_location_id
+    def _should_sync_product(self, product, company):
+        return (
+            product.default_code
+            and product.is_storable
+            and (not product.company_id or product.company_id == company)
         )
-
-        source_is_warehouse = stock_move.location_id in warehouse_locations
-        dest_is_warehouse = stock_move.location_dest_id in warehouse_locations
-
-        return source_is_warehouse or dest_is_warehouse
-
-    def _should_sync_product(self, product):
-        """Check if product should be synced to Square"""
-        # Only sync products with SKU (default_code)
-        if not product.default_code:
-            _logger.info(f"Skipping product {product.name} - no SKU")
-            return False
-
-        # Only sync stockable products
-        if not product.is_storable:
-            _logger.info(f"Skipping product {product.name} - not stockable")
-            return False
-
-        return True
 
     def _get_warehouse_stock(self, product, warehouse):
         """Count stock in the warehouse's stock location and its bins."""
-        quants = self.env["stock.quant"].search(
-            [
-                ("product_id", "=", product.id),
-                ("location_id", "child_of", warehouse.lot_stock_id.id),
-            ]
-        )
+        quants = self.env["stock.quant"].search([
+            ("company_id", "=", warehouse.company_id.id),
+            ("product_id", "=", product.id),
+            ("location_id", "child_of", warehouse.lot_stock_id.id),
+        ])
         return max(0, sum(quants.mapped("quantity")))
 
-    def _get_product_square_inventory(self, product_sku):
-        """Get current inventory from Square for a product"""
-        try:
-            # Search for the product in Square catalog
-            search_result = self._search_square_catalog_by_sku(product_sku)
+    def _get_location_mappings(self, config):
+        return self.env["square.location.mapping"].search([
+            ("config_id", "=", config.id),
+            ("warehouse_id.company_id", "=", config.company_id.id),
+        ])
 
-            if not search_result["success"]:
-                _logger.error(f"Failed to get Square catalog for SKU {product_sku}")
-                return None
+    def _merchant_location_ids(self, config):
+        locations = self.env["square.api.client"]._get_locations(square_config=config)
+        return [
+            location["id"] for location in locations
+            if isinstance(location, dict)
+            and location.get("status") == "ACTIVE"
+            and isinstance(location.get("id"), str)
+            and location["id"]
+        ]
 
-            if search_result["not_found"]:
-                _logger.warning(
-                    f"Product with SKU {product_sku} not found in Square catalog"
-                )
-                return None
-
-            catalog_object_id = search_result["catalog_object_id"]
-
-            # Get inventory for the catalog object
-            api_client = self._get_square_api_client()
-            return api_client.get_inventory(catalog_object_id)
-
-        except Exception as e:
-            _logger.error(f"Error getting Square inventory for {product_sku}: {str(e)}")
-            return None
-
-    def _update_square_inventory(self, product_sku, new_quantity):
-        """Update inventory in Square for a specific product - Odoo is source of truth"""
-        try:
-            # Search for the product in Square catalog
-            search_result = self._search_square_catalog_by_sku(product_sku)
-
-            if not search_result["success"]:
-                _logger.error(f"Failed to find Square catalog for SKU {product_sku}")
-                return False
-
-            if search_result["not_found"]:
-                _logger.warning(
-                    f"Product with SKU {product_sku} not found in Square catalog - skipping sync"
-                )
-                return True  # Return True to avoid retry, product doesn't exist in Square
-
-            catalog_object_id = search_result["catalog_object_id"]
-
-            # Get Square location ID
-            location_id = self._get_square_location_id()
-            if not location_id:
-                _logger.error(
-                    f"Cannot update inventory for {product_sku}: No Square location ID available"
-                )
-                return False
-
-            _logger.info(
-                f"Setting Square inventory for {product_sku} to {new_quantity} units (Odoo source of truth)"
-            )
-
-            # Simply set the exact quantity from Odoo - no adjustments needed
-            api_client = self._get_square_api_client()
-            result = api_client.set_physical_count(
-                catalog_object_id, location_id, int(new_quantity), product_sku
-            )
-
-            if not result:
-                _logger.error(f"Square API failed to set inventory for {product_sku}")
-                self.env["square.integration.log"].log_error(
-                    title=f"Square API Error - Sync refused",
-                    error_message=f"Square API refused stock sync for {product_sku}",
-                    technical_details=f"SKU: {product_sku}, Odoo Quantity: {new_quantity}",
-                )
-
-            return result
-
-        except Exception as e:
-            _logger.error(
-                f"Error updating Square inventory for {product_sku}: {str(e)}"
-            )
-            return False
-
-    def sync_product_stock(self, product):
-        """Sync stock for a specific product to Square"""
-        if not self._should_sync_product(product):
-            return True
-
-        try:
-            # Get current stock quantity in configured warehouse
-            configured_warehouse = self._get_configured_warehouse()
-            total_quantity = self._get_warehouse_stock(product, configured_warehouse)
-
-            _logger.info(
-                f"Syncing {product.default_code} to Square: {total_quantity} units"
-            )
-
-            success = self._update_square_inventory(
-                product.default_code, total_quantity
-            )
-
-            # Log to integration dashboard
-            if success:
-                self.env["square.integration.log"].log_square_event(
-                    event_type="stock_sync",
-                    title=f"Stock synchronized for {product.name}",
-                    description=f"""
-                        <h4>Square Stock Synchronization Successful</h4>
-                        <ul>
-                            <li><strong>Product:</strong> {product.name}</li>
-                            <li><strong>SKU :</strong> <code>{product.default_code}</code></li>
-                            <li><strong>Synchronized quantity:</strong> {total_quantity}</li>
-                            <li><strong>Warehouse:</strong> {configured_warehouse.name}</li>
-                        </ul>
-                        <p><em>Stock automatically synchronized to Square</em></p>
-                    """,
-                    status="success",
-                )
-            else:
-                self.env["square.integration.log"].log_error(
-                    title=f"Stock sync failed for {product.name}",
-                    error_message=f"Unable to synchronize stock for product {product.name} (SKU: {product.default_code}) vers Square",
-                    technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Quantité: {total_quantity}, Entrepôt: {configured_warehouse.name}",
-                )
-
-            # Update sync statistics
-            self.total_syncs += 1
-            if success:
-                self.successful_syncs += 1
-            else:
-                self.failed_syncs += 1
-
-            self.last_sync_date = fields.Datetime.now()
-
-            return success
-
-        except Exception as e:
-            _logger.error(f"Error syncing product {product.default_code}: {str(e)}")
-
-            # Log exception to integration dashboard
-            self.env["square.integration.log"].log_error(
-                title=f"Critical stock sync error for {product.name}",
-                error_message=f"Exception during stock synchronization: {str(e)}",
-                technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Exception: {str(e)}",
-            )
-
-            self.total_syncs += 1
-            self.failed_syncs += 1
-
-    def sync_product_stock_for_location(self, product, square_location_id, quantity):
-        """Sync stock for a specific product to a specific Square location"""
-        if not self._should_sync_product(product):
-            return True
-
-        try:
-            # Search for the product in Square catalog to get the catalog object ID
-            search_result = self._search_square_catalog_by_sku(product.default_code)
-
-            if not search_result["success"]:
-                _logger.error(f"Failed to find Square catalog for SKU {product.default_code}")
-                return False
-
-            if search_result["not_found"]:
-                _logger.warning(
-                    f"Product with SKU {product.default_code} not found in Square catalog - skipping sync"
-                )
-                return True  # Return True to avoid retry, product doesn't exist in Square
-
-            catalog_object_id = search_result["catalog_object_id"]
-
-            _logger.info(
-                f"Syncing {product.default_code} to Square location {square_location_id}: {quantity} units"
-            )
-
-            # Simply set the exact quantity from Odoo - no adjustments needed
-            api_client = self._get_square_api_client()
-            result = api_client.set_physical_count(
-                catalog_object_id, square_location_id, int(quantity), product.default_code
-            )
-
-            if result:
-                _logger.info(
-                    f"Stock sync successful: Product {product.name} "
-                    f"in location {square_location_id} -> {quantity} units"
-                )
-
-                # Log to integration dashboard
-                self.env["square.integration.log"].log_square_event(
-                    event_type="stock_sync",
-                    title=f"Stock synchronized for {product.name}",
-                    description=f"""
-                        <p><strong>Square Stock Synchronization Successful</strong></p>
-                        <ul>
-                            <li>Product: <strong>{product.name}</strong></li>
-                            <li>SKU : <code>{product.default_code}</code></li>
-                            <li>Synchronized quantity: {quantity}</li>
-                            <li>Square Location: {square_location_id}</li>
-                        </ul>
-                    """,
-                    status="success",
-                )
-
-                # Update sync statistics
-                self.total_syncs += 1
-                self.successful_syncs += 1
-                self.last_sync_date = fields.Datetime.now()
-
-                return True
-            else:
-                _logger.error(f"Stock sync failed for {product.name}: API call returned False")
-
-                # Log error to integration dashboard
-                self.env["square.integration.log"].log_error(
-                    title=f"Stock sync failed for {product.name}",
-                    error_message=f"Unable to synchronize stock for product {product.name} vers Square",
-                    technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Quantité: {quantity}, Emplacement: {square_location_id}",
-                )
-
-                self.total_syncs += 1
-                self.failed_syncs += 1
-                self.last_sync_date = fields.Datetime.now()
-
-                return False
-
-        except Exception as e:
-            _logger.error(f"Error syncing product {product.default_code}: {str(e)}")
-
-            # Log exception to integration dashboard
-            self.env["square.integration.log"].log_error(
-                title=f"Critical stock sync error for {product.name}",
-                error_message=f"Exception during stock synchronization: {str(e)}",
-                technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Exception: {str(e)}",
-            )
-
-            self.total_syncs += 1
-            self.failed_syncs += 1
-            self.last_sync_date = fields.Datetime.now()
-
-            return False
-
-    @api.model
-    def sync_stock_changes(self, stock_move):
-        """Main method to handle stock move changes"""
-        if not self.auto_sync_enabled:
-            _logger.debug("Auto sync disabled - skipping stock sync")
+    def _sync_stock_changes(self, move, config):
+        """Synchronize affected warehouses after core completes a stock move."""
+        if not self.auto_sync_enabled or move.state != "done":
+            return
+        if any((move | move.origin_returned_move_id).sale_line_id.order_id.mapped("square_order_id")):
+            return
+        if not self._should_sync_product(move.product_id, config.company_id):
             return
 
-        # Skip if Square-sourced move
-        if self._is_square_sourced_move(stock_move):
-            _logger.info(f"Skipping Square-sourced move: {stock_move.name}")
-            return
-
-        # Skip if move is not done
-        if stock_move.state != "done":
-            _logger.debug(f"Skipping non-done move: {stock_move.name}")
-            return
-
-        if not self._should_sync_product(stock_move.product_id):
-            return
-
-        locations = stock_move.location_id | stock_move.location_dest_id
-        warehouses = locations.warehouse_id
-        mappings = self._get_location_mappings().filtered(
+        warehouses = (move.location_id | move.location_dest_id).warehouse_id
+        mappings = self._get_location_mappings(config).filtered(
             lambda mapping: mapping.warehouse_id in warehouses
         )
-        if not mappings:
-            _logger.debug(f"No mapped warehouse affected by move: {stock_move.name}")
+        self._sync_mapped_product(move.product_id, config, mappings)
+
+    def _sync_quant_change(self, quant, config):
+        if not self._should_sync_product(quant.product_id, config.company_id):
             return
+        mappings = self._get_location_mappings(config).filtered(
+            lambda mapping: mapping.warehouse_id == quant.location_id.warehouse_id
+        )
+        self._sync_mapped_product(quant.product_id, config, mappings)
 
+    def _sync_mapped_product(self, product, config, mappings):
+        if not mappings:
+            return
+        merchant_location_ids = self._merchant_location_ids(config)
         for mapping in mappings:
-            self._sync_mapped_stock_move(
-                stock_move, mapping.warehouse_id, mapping.square_location_id
-            )
-
-    def _sync_mapped_stock_move(
-        self, stock_move, affected_warehouse, square_location_id
-    ):
-        _logger.info(f"Processing stock move for Square sync: {stock_move.name} (warehouse: {affected_warehouse.name}, location: {square_location_id})")
-
-        # Get current stock quantity for this warehouse
-        total_quantity = self._get_warehouse_stock(
-            stock_move.product_id, affected_warehouse
-        )
-
-        # Sync affected product to the specific location
-        success = self.sync_product_stock_to_location(
-            stock_move.product_id, affected_warehouse, square_location_id, total_quantity
-        )
-
-        # Log the stock move trigger event
-        if success:
-            _logger.info(
-                f"Successfully synced {stock_move.product_id.default_code} to Square location {square_location_id}"
-            )
-            self.env["square.integration.log"].log_square_event(
-                event_type="stock_sync",
-                title=f"Stock synchronisé suite au mouvement {stock_move.name}",
-                description=f"""
-                    <h4>Stock Synchronization Triggered by Movement</h4>
-                    <ul>
-                        <li><strong>Stock movement:</strong> {stock_move.name}</li>
-                        <li><strong>Product:</strong> {stock_move.product_id.name}</li>
-                        <li><strong>SKU :</strong> <code>{stock_move.product_id.default_code}</code></li>
-                        <li><strong>Moved quantity:</strong> {stock_move.quantity}</li>
-                        <li><strong>From:</strong> {stock_move.location_id.name}</li>
-                        <li><strong>To:</strong> {stock_move.location_dest_id.name}</li>
-                        <li><strong>Affected warehouse:</strong> {affected_warehouse.name}</li>
-                        <li><strong>Square Location:</strong> {square_location_id}</li>
-                    </ul>
-                    <p><em>Synchronisation déclenchée automatiquement par mouvement de stock</em></p>
-                """,
-                status="success",
-            )
-        else:
-            _logger.error(
-                f"Failed to sync {stock_move.product_id.default_code} to Square location {square_location_id}"
-            )
-
-    def _get_location_mappings(self):
-        """Get all configured location mappings from Square config"""
-        api_client = self._get_square_api_client()
-        config = api_client._get_square_config()
-        if config and config.location_mapping_ids:
-            return config.location_mapping_ids
-        return self.env["square.location.mapping"]
+            if mapping.square_location_id not in merchant_location_ids:
+                _logger.warning("Skipping a Square stock mapping outside the configured merchant's active locations")
+                continue
+            self._sync_product_to_location(product, mapping.warehouse_id, mapping.square_location_id)
 
     def manual_sync_all_products(self):
-        """Manually sync all products to Square for all configured location mappings"""
-        _logger.info("Starting manual sync of all products to Square")
+        """Synchronize stock from the configured company and its mapped warehouses."""
+        self.ensure_one()
+        self._check_management_access()
+        self.check_access("write")
+        sync = self.with_context({}, allowed_company_ids=self.env.company.ids).sudo()
+        return sync._manual_sync_all_products()
 
-        # Get all location mappings
-        location_mappings = self._get_location_mappings()
+    def _manual_sync_all_products(self):
+        config = self.env["square.api.client"]._get_square_config()
+        mappings = self._get_location_mappings(config)
+        merchant_location_ids = self._merchant_location_ids(config)
+        if not merchant_location_ids:
+            raise UserError("No active Square locations could be verified for this configuration.")
 
-        if not location_mappings:
-            _logger.warning("No location mappings configured - falling back to legacy sync")
-            # Fallback to legacy behavior
-            configured_warehouse = self._get_configured_warehouse()
-            _logger.info(f"Using fallback warehouse: {configured_warehouse.name}")
+        if not mappings:
+            if config.with_context(active_test=False).location_mapping_ids:
+                raise UserError("No active Square warehouse mappings belong to this company.")
+            # Preserve the legacy single-warehouse path when no mapping has been set up.
+            warehouse = self.env["stock.warehouse"].search(
+                [("company_id", "=", config.company_id.id)], limit=1,
+            )
+            if not warehouse:
+                raise UserError("No warehouse belongs to the Square configuration's company.")
+            return self._sync_products_for_warehouse(warehouse, merchant_location_ids[0])
 
-            return self._sync_products_for_warehouse(configured_warehouse, None)
+        if set(mappings.mapped("square_location_id")) - set(merchant_location_ids):
+            raise UserError("A Square warehouse mapping points to a location outside the merchant's active locations.")
 
-        _logger.info(f"Found {len(location_mappings)} location mappings to sync")
-
-        total_successful = 0
-        total_failed = 0
-        total_products = 0
-        location_results = []
-
-        # Sync each warehouse to its corresponding Square location
-        for mapping in location_mappings:
-            _logger.info(f"Syncing warehouse '{mapping.warehouse_id.name}' to Square location '{mapping.square_location_name}'")
-
-            result = self._sync_products_for_warehouse(mapping.warehouse_id, mapping.square_location_id)
-            location_results.append({
-                'warehouse': mapping.warehouse_id.name,
-                'square_location': mapping.square_location_name,
-                'successful': result['successful'],
-                'failed': result['failed'],
-                'total': result['total']
+        result = {"successful": 0, "failed": 0, "total": 0, "locations": []}
+        for mapping in mappings:
+            totals = self._sync_products_for_warehouse(mapping.warehouse_id, mapping.square_location_id)
+            for key, total in totals.items():
+                result[key] += total
+            result["locations"].append({
+                "warehouse": mapping.warehouse_id.name,
+                "square_location": mapping.square_location_name,
+                **totals,
             })
 
-            total_successful += result['successful']
-            total_failed += result['failed']
-            total_products += result['total']
-
-        _logger.info(f"Manual sync completed: {total_successful} successful, {total_failed} failed across {len(location_mappings)} locations")
-
-        # Log manual sync completion to integration dashboard
-        location_summary = ""
-        for loc_result in location_results:
-            location_summary += f"""
-                <li><strong>{loc_result['warehouse']}</strong> → <em>{loc_result['square_location']}</em>
-                    ({loc_result['successful']} réussis, {loc_result['failed']} échecs)</li>"""
-
-        self.env["square.integration.log"].log_square_event(
+        self.env["square.integration.log"]._log_square_event(
             event_type="stock_sync",
-            title=f"Synchronisation manuelle multi-entrepôts terminée",
-            description=f"""
-                <h4>Synchronisation Manuelle Stock Square Terminée</h4>
-                <ul>
-                    <li><strong>Emplacements synchronisés :</strong> {len(location_mappings)}</li>
-                    <li><strong>Total produits traités :</strong> {total_products}</li>
-                    <li><strong>Synchronisations réussies :</strong> {total_successful}</li>
-                    <li><strong>Échecs :</strong> {total_failed}</li>
-                </ul>
-                <h5>Détail par emplacement :</h5>
-                <ul>
-                    {location_summary}
-                </ul>
-                <p><em>Synchronisation manuelle multi-entrepôts lancée depuis l'interface</em></p>
-            """,
-            status=(
-                "success" if total_failed == 0 else "warning" if total_successful > 0 else "error"
+            title="Manual Square stock synchronization",
+            description=(
+                f"{result['successful']} products synchronized successfully. "
+                f"{result['failed']} failed."
             ),
+            status="success" if not result["failed"] else "warning",
         )
+        return result
 
-        return {"successful": total_successful, "failed": total_failed, "total": total_products, "locations": location_results}
-
-    def _sync_products_for_warehouse(self, warehouse, square_location_id=None):
-        """Sync all products for a specific warehouse to Square"""
-        # Get all products with stock in the specified warehouse
-        stock_quants = self.env["stock.quant"].search(
-            [
-                ("location_id", "child_of", warehouse.lot_stock_id.id),
-                ("quantity", ">", 0),
-            ]
+    def _sync_products_for_warehouse(self, warehouse, square_location_id):
+        quants = self.env["stock.quant"].search([
+            ("company_id", "=", warehouse.company_id.id),
+            ("location_id", "child_of", warehouse.lot_stock_id.id),
+            ("quantity", ">", 0),
+        ])
+        products = quants.product_id.filtered(
+            lambda product: self._should_sync_product(product, warehouse.company_id)
         )
-
-        _logger.info(
-            f"Found {len(stock_quants)} stock quants in warehouse '{warehouse.name}' to sync. Only syncing products with default_code."
+        successful = sum(
+            self._sync_product_to_location(product, warehouse, square_location_id)
+            for product in products
         )
+        return {"successful": successful, "failed": len(products) - successful, "total": len(products)}
 
-        products = stock_quants.mapped("product_id").filtered(lambda p: p.default_code)
-
-        _logger.info(f"Found {len(products)} products in warehouse '{warehouse.name}' to sync")
-
-        successful = 0
-        failed = 0
-
-        for product in products:
-            # Get current stock quantity for this warehouse
-            total_quantity = self._get_warehouse_stock(product, warehouse)
-
-            if square_location_id:
-                # Sync to specific Square location
-                if self.sync_product_stock_to_location(product, warehouse, square_location_id, total_quantity):
-                    successful += 1
-                else:
-                    failed += 1
-            else:
-                # Fallback to legacy sync method
-                if self.sync_product_stock(product):
-                    successful += 1
-                else:
-                    failed += 1
-
-        _logger.info(f"Warehouse '{warehouse.name}' sync completed: {successful} successful, {failed} failed")
-
-        return {"successful": successful, "failed": failed, "total": len(products)}
-
-    def sync_product_stock_to_location(self, product, warehouse, square_location_id, quantity):
-        """Sync a specific product's stock to a specific Square location"""
-        if not self._should_sync_product(product):
-            return True
-
+    def _sync_product_to_location(self, product, warehouse, square_location_id):
+        """Send a physical count derived from Odoo stock for a validated mapping."""
+        api_client = self.env["square.api.client"]
         try:
-            # Search for the product in Square catalog to get the catalog object ID
-            search_result = self._search_square_catalog_by_sku(product.default_code)
-
-            if not search_result["success"]:
-                _logger.error(f"Failed to find Square catalog for SKU {product.default_code}")
-                return False
-
-            if search_result["not_found"]:
-                _logger.warning(
-                    f"Product with SKU {product.default_code} not found in Square catalog - skipping sync"
-                )
-                return True  # Return True to avoid retry, product doesn't exist in Square
-
-            catalog_object_id = search_result["catalog_object_id"]
-
-            _logger.info(
-                f"Syncing {product.default_code} from warehouse '{warehouse.name}' to Square location {square_location_id}: {quantity} units"
-            )
-
-            # Simply set the exact quantity from Odoo - no adjustments needed
-            api_client = self._get_square_api_client()
-            result = api_client.set_physical_count(
-                catalog_object_id, square_location_id, int(quantity), product.default_code
-            )
-
-            if result:
-                _logger.info(
-                    f"Stock sync successful: Product {product.name} "
-                    f"in warehouse '{warehouse.name}' -> Square location {square_location_id} -> {quantity} units"
-                )
-
-                # Log to integration dashboard
-                self.env["square.integration.log"].log_square_event(
-                    event_type="stock_sync",
-                    title=f"Stock synchronized for {product.name}",
-                    description=f"""
-                        <p><strong>Square Stock Synchronization Successful</strong></p>
-                        <ul>
-                            <li>Product: <strong>{product.name}</strong></li>
-                            <li>SKU : <code>{product.default_code}</code></li>
-                            <li>Synchronized quantity: {quantity}</li>
-                            <li>Entrepôt Odoo : <strong>{warehouse.name}</strong></li>
-                            <li>Square Location: {square_location_id}</li>
-                        </ul>
-                    """,
-                    status="success",
-                )
-
-                # Update sync statistics
-                self.total_syncs += 1
-                self.successful_syncs += 1
-                self.last_sync_date = fields.Datetime.now()
-
+            sku = product.default_code
+            search = api_client._search_catalog_by_sku(sku)
+            if search["not_found"]:
                 return True
-            else:
-                _logger.error(f"Stock sync failed for {product.name} in location {square_location_id}: API call returned False")
 
-                # Log error to integration dashboard
-                self.env["square.integration.log"].log_error(
-                    title=f"Stock sync failed for {product.name}",
-                    error_message=f"Unable to synchronize stock for product {product.name} vers Square",
-                    technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Quantité: {quantity}, Entrepôt: {warehouse.name}, Emplacement: {square_location_id}",
-                )
-
-                self.total_syncs += 1
-                self.failed_syncs += 1
-                self.last_sync_date = fields.Datetime.now()
-
-                return False
-
-        except Exception as e:
-            _logger.error(f"Error syncing product {product.default_code} to location {square_location_id}: {str(e)}")
-
-            # Log exception to integration dashboard
-            self.env["square.integration.log"].log_error(
-                title=f"Critical stock sync error for {product.name}",
-                error_message=f"Exception during stock synchronization: {str(e)}",
-                technical_details=f"Produit: {product.name}, SKU: {product.default_code}, Quantité: {quantity}, Entrepôt: {warehouse.name}, Emplacement: {square_location_id}, Exception: {str(e)}",
+            success = search["success"] and api_client._set_physical_count(
+                search["catalog_object_id"], square_location_id,
+                int(self._get_warehouse_stock(product, warehouse)), sku,
             )
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except Exception:
+            _logger.exception("Square could not synchronize stock")
+            success = False
 
-            self.total_syncs += 1
-            self.failed_syncs += 1
-            self.last_sync_date = fields.Datetime.now()
-
-            return False
+        self.write({
+            "total_syncs": self.total_syncs + 1,
+            "successful_syncs": self.successful_syncs + int(success),
+            "failed_syncs": self.failed_syncs + int(not success),
+            "last_sync_date": fields.Datetime.now(),
+        })
+        self.env["square.integration.log"]._log_square_event(
+            event_type="stock_sync",
+            title=f"Stock synchronized for {product.name}" if success else "Square stock synchronization failed",
+            description=f"Square location: {square_location_id}",
+            status="success" if success else "error",
+        )
+        return success

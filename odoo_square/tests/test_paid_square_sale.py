@@ -59,6 +59,7 @@ class TestPaidSquareSale(SquareHttpCase):
             {
                 "name": "Checkout Integration",
                 "square_application_id": "test_app_id",
+                "square_webhook_signature_key": "test-pos-webhook-key",
                 "square_access_token": "test_access_token",
                 "payment_journal_id": journal.id,
             }
@@ -120,17 +121,16 @@ class TestPaidSquareSale(SquareHttpCase):
         invoice_domain = [("partner_id", "=", partner.id), ("move_type", "=", "out_invoice")]
         payment_domain = [("partner_id", "=", partner.id)]
         with (
-            patch.object(SquareApiClient, "get_order", return_value=square_order),
+            patch.object(SquareApiClient, "_get_order", return_value=square_order),
             patch.object(
                 SquareApiClient,
-                "get_catalog_object",
+                "_get_catalog_object",
                 return_value={"success": True, "sku": "CHECKOUT-SKU"},
             ),
         ):
             records = None
             for expected_status in ("success", "already_processed"):
-                response = self.url_open(
-                    "/square/webhook",
+                response = self.post_square_webhook(
                     data=webhook_data,
                     headers={"Content-Type": "application/json"},
                 )

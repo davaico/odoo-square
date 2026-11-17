@@ -1,10 +1,12 @@
 from unittest.mock import patch
 
 from odoo import Command
+from odoo.exceptions import AccessError, ValidationError
 from odoo.tests import Form, TransactionCase
-from odoo.tests.common import tagged
+from odoo.tests.common import new_test_user, tagged
 
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
+from odoo.addons.odoo_square.models.stock_move import _SQUARE_MANAGED_PICKING
 
 
 @tagged("post_install", "-at_install", "TestSquareStockSync")
@@ -15,7 +17,7 @@ class TestSquareStockSync(TransactionCase):
         warehouse_model = cls.env["stock.warehouse"]
         cls.warehouse = warehouse_model.create({"name": "Downtown", "code": "DWTN"})
         cls.other_warehouse = warehouse_model.create({"name": "Airport", "code": "AIRP"})
-        config = cls.env["square.config"].create(
+        cls.config = cls.env["square.config"].create(
             {
                 "square_application_id": "test-app",
                 "square_access_token": "test-token",
@@ -28,13 +30,19 @@ class TestSquareStockSync(TransactionCase):
         ):
             cls.env["square.location.mapping"].create(
                 {
-                    "config_id": config.id,
+                    "config_id": cls.config.id,
                     "square_location_id": square_location_id,
                     "square_location_name": warehouse.name,
                     "warehouse_id": warehouse.id,
                 }
             )
         cls.stock_sync = cls.env["square.stock.sync"].create({})
+        cls.employee = new_test_user(cls.env, login="square-count-employee", groups="base.group_user")
+        cls.salesperson = new_test_user(
+            cls.env, login="square-count-salesperson", groups="sales_team.group_sale_salesman",
+        )
+        cls.stock_user = new_test_user(cls.env, login="square-count-stock", groups="stock.group_stock_user")
+        cls.admin = cls.env.ref("base.user_admin")
         cls.product = cls.env["product.product"].create(
             {
                 "name": "Stock Sync Item",
@@ -65,8 +73,12 @@ class TestSquareStockSync(TransactionCase):
         )
 
     @staticmethod
-    def _square_response(endpoint, method, data):
+    def _square_response(endpoint, method="GET", data=None, square_config=None):
         responses = {
+            "/v2/locations": {"locations": [
+                {"id": "SQUARE-DOWNTOWN", "status": "ACTIVE"},
+                {"id": "SQUARE-AIRPORT", "status": "ACTIVE"},
+            ]},
             "/v2/catalog/search": {"objects": [{"id": "SQUARE-VARIATION"}]},
             "/v2/inventory/changes/batch-create": {"counts": []},
         }
@@ -78,6 +90,9 @@ class TestSquareStockSync(TransactionCase):
         idempotency_keys = set()
         for request in self.square_request.call_args_list:
             endpoint = request.args[0]
+            if endpoint == "/v2/locations":
+                self.assertEqual(request.kwargs["square_config"], self.config)
+                continue
             self.assertEqual(request.kwargs["method"], "POST")
             data = request.kwargs["data"]
             if endpoint == "/v2/catalog/search":
@@ -111,8 +126,11 @@ class TestSquareStockSync(TransactionCase):
             ] * len(expected),
         )
 
-    def _validate_picking(self, picking_type, source, destination, origin=None):
-        picking = self.env["stock.picking"].create(
+    def _validate_picking(self, picking_type, source, destination, origin=None, user=None, **context):
+        model = self.env["stock.picking"]
+        if user:
+            model = model.with_user(user)
+        picking = model.with_context(**context).create(
             {
                 "picking_type_id": picking_type.id,
                 "location_id": source.id,
@@ -142,6 +160,10 @@ class TestSquareStockSync(TransactionCase):
             self.warehouse.out_type_id,
             self.warehouse.lot_stock_id,
             self.env.ref("stock.stock_location_customers"),
+            user=self.stock_user,
+            origin="Square typed by an employee",
+            square_move_in_progress=True,
+            square_managed_picking=True,
         )
 
         self.assertEqual(self.quant.quantity, 5)
@@ -216,7 +238,8 @@ class TestSquareStockSync(TransactionCase):
         self.square_request.reset_mock()
 
         self._validate_picking(
-            self.warehouse.in_type_id, customer_stock, warehouse_stock, origin="Square refund"
+            self.warehouse.in_type_id, customer_stock, warehouse_stock,
+            origin="Square refund", square_managed_picking=_SQUARE_MANAGED_PICKING,
         )
 
         self.assertEqual(self.quant.quantity, 8)
@@ -224,7 +247,7 @@ class TestSquareStockSync(TransactionCase):
         self.assert_square_counts([])
 
     def test_disabling_automatic_sync_keeps_inventory_adjustments_local(self):
-        with Form(self.stock_sync, view="odoo_square.view_square_stock_sync_form") as form:
+        with Form(self.stock_sync.with_user(self.admin), view="odoo_square.view_square_stock_sync_form") as form:
             form.auto_sync_enabled = False
 
         quant = self.quant.with_context(inventory_mode=True)
@@ -233,3 +256,73 @@ class TestSquareStockSync(TransactionCase):
 
         self.assertEqual(quant.quantity, 9)
         self.assert_square_counts([])
+
+    def test_stock_sync_controls_require_administrator(self):
+        for user in (self.employee, self.salesperson, self.stock_user):
+            with self.subTest(user=user.login):
+                with self.assertRaises(AccessError):
+                    self.stock_sync.with_user(user).write({"auto_sync_enabled": False})
+                with self.assertRaises(AccessError):
+                    self.stock_sync.with_user(user).manual_sync_all_products()
+        self.square_request.assert_not_called()
+
+        sync = self.stock_sync.with_user(self.admin)
+        with self.assertRaises(AccessError):
+            sync.write({"successful_syncs": 100})
+        self.assertTrue(sync.auto_sync_enabled)
+        result = sync.manual_sync_all_products()
+        self.assertEqual(result["successful"], 2)
+        self.assertEqual(sync.successful_syncs, 2)
+        self.assert_square_counts([("SQUARE-DOWNTOWN", "8"), ("SQUARE-AIRPORT", "15")])
+
+    def test_admin_can_disable_move_sync_without_changing_direct_quant_sync(self):
+        self.stock_sync.with_user(self.admin).write({"auto_sync_enabled": False})
+        self._validate_picking(
+            self.warehouse.out_type_id,
+            self.warehouse.lot_stock_id,
+            self.env.ref("stock.stock_location_customers"),
+            user=self.stock_user,
+        )
+        self.assertEqual(self.quant.quantity, 5)
+        self.square_request.assert_not_called()
+
+        self.quant.quantity = 4
+        self.assert_square_counts([("SQUARE-DOWNTOWN", "4")])
+
+    def test_mapping_write_and_outbound_scope(self):
+        mapping = self.config.location_mapping_ids.filtered(lambda m: m.warehouse_id == self.warehouse)
+        with self.assertRaises(AccessError):
+            mapping.with_user(self.salesperson).write({"square_location_id": "UNAUTHORIZED"})
+        self.assertEqual(mapping.square_location_id, "SQUARE-DOWNTOWN")
+
+        other_company = self.env["res.company"].create({"name": "Unrelated stock company"})
+        warehouse = self.env["stock.warehouse"].search([("company_id", "=", other_company.id)], limit=1)
+        self.assertTrue(warehouse)
+        with self.assertRaises(ValidationError), self.cr.savepoint():
+            mapping.write({"warehouse_id": warehouse.id})
+
+        mapping.with_user(self.admin).write({"square_location_id": "OUTSIDE-MERCHANT"})
+        self._validate_picking(
+            self.warehouse.out_type_id,
+            self.warehouse.lot_stock_id,
+            self.env.ref("stock.stock_location_customers"),
+            user=self.stock_user,
+        )
+        self.assertEqual(self.quant.quantity, 5)
+        self.square_request.assert_called_once()
+        self.assertEqual(self.square_request.call_args.args, ("/v2/locations",))
+        self.assert_square_counts([])
+
+    def test_another_company_cannot_operate_the_square_stock_service(self):
+        company = self.env["res.company"].create({"name": "Another stock company"})
+        admin = new_test_user(
+            self.env, login="other-square-admin", groups="base.group_system",
+            company_id=company.id, company_ids=[Command.set(company.ids)],
+        )
+        sync = self.stock_sync.with_user(admin).with_context(allowed_company_ids=company.ids)
+        with self.assertRaises(AccessError):
+            sync.write({"auto_sync_enabled": False})
+        with self.assertRaises(AccessError):
+            sync.manual_sync_all_products()
+        self.assertTrue(self.stock_sync.auto_sync_enabled)
+        self.square_request.assert_not_called()

@@ -3,7 +3,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 {
     "name": "Square POS Integration",
-    "version": "18.0.1.4.0",
+    "version": "18.0.1.4.1",
     "category": "Sales",
     "summary": "Complete Square POS integration for orders, refunds, exchanges and inventory sync",
     "description": """
@@ -26,6 +26,7 @@ Features:
     },
     "data": [
         "security/ir.model.access.csv",
+        "security/square_company_rules.xml",
         "data/square_bot_user.xml",
         "data/square_products.xml",
         "views/views.xml",

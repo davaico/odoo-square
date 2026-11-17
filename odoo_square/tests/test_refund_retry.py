@@ -34,14 +34,14 @@ class TestSquareRefundRetry(TransactionCase):
             # Commit a competing insert after the other transaction has taken its snapshot.
             with self.registry.cursor() as winning_cr:
                 winning_env = api.Environment(winning_cr, SUPERUSER_ID, {})
-                winner_id = winning_env["square.refund"].create_from_square_data(
+                winner_id = winning_env["square.refund"]._create_from_square_data(
                     refund_data, winning_env["sale.order"].browse(order_id)
                 ).id
 
             self.assertFalse(stale_refunds.search(refund_domain))
             completed_data = {**refund_data, "status": "COMPLETED"}
             refund = retrying(
-                lambda: stale_refunds.create_from_square_data(
+                lambda: stale_refunds._create_from_square_data(
                     completed_data, stale_env["sale.order"].browse(order_id)
                 ),
                 stale_env,

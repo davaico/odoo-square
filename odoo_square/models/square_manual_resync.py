@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as dt_parser
 from odoo import _, api, fields, models
-from odoo.exceptions import UserError, ValidationError
+from odoo.exceptions import AccessError, UserError, ValidationError
 
 _logger = logging.getLogger(__name__)
 
@@ -154,11 +154,20 @@ class SquareManualResyncWizard(models.TransientModel):
             self.end_at = now
             self.start_at = now - timedelta(days=self.days_back)
 
+    def _check_resync_operator(self):
+        self.ensure_one()
+        if not self.env.user.has_group("base.group_system"):
+            raise AccessError("Only administrators can resync Square orders.")
+        self.check_access("write")
+        self.config_id._check_square_operator()
+        if self.location_ids - self.config_id._company_location_mappings():
+            raise AccessError("The selected locations do not belong to this Square configuration.")
+
     def action_scan_missing_orders(self):
         """
         Scan Square for orders and identify missing ones in Odoo
         """
-        self.ensure_one()
+        self._check_resync_operator()
         _logger.info("=" * 70)
         _logger.info("SCAN MISSING ORDERS STARTED")
         _logger.info(f"Wizard ID: {self.id}, Config: {self.config_id.name if self.config_id else 'None'}")
@@ -218,7 +227,7 @@ class SquareManualResyncWizard(models.TransientModel):
                         _logger.info(f"Fetching orders for location: {location_id}")
                         # Square SearchOrders: server-side date + state filter + pagination
                         # (avoids empty results when >limit orders exist outside the window)
-                        loc_orders = api_client.get_location_orders(
+                        loc_orders = api_client._get_location_orders(
                             location_id=location_id,
                             limit=500,
                             start_at=range_start,
@@ -338,7 +347,7 @@ class SquareManualResyncWizard(models.TransientModel):
         """
         Process selected missing orders through the webhook pipeline
         """
-        self.ensure_one()
+        self._check_resync_operator()
 
         try:
             # Get selected lines
@@ -365,10 +374,10 @@ class SquareManualResyncWizard(models.TransientModel):
                     _logger.info(f"Fetching full order data for {order_id}")
 
                     # Fetch full order from Square
-                    order_data = api_client.get_order(
+                    order_data = api_client._get_order(
                         order_id, square_config=self.config_id
                     )
-                    if not order_data:
+                    if not order_data or (order_data.get("id") or order_data.get("order_id")) != order_id:
                         raise UserError(f"Could not fetch order {order_id} from Square")
 
                     # Normalize order_id
@@ -427,7 +436,7 @@ class SquareManualResyncWizard(models.TransientModel):
             self.state = "done"
 
             # Log batch operation
-            self.env["square.integration.log"].log_square_event(
+            self.env["square.integration.log"]._log_square_event(
                 event_type="manual_resync",
                 title=f"Manual resync completed: {processed_count} orders processed",
                 description=f"""

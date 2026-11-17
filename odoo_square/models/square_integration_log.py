@@ -18,6 +18,8 @@ class SquareIntegrationLog(models.Model):
         string="Summary", compute="_compute_display_name", store=True
     )
 
+    company_id = fields.Many2one("res.company", readonly=True, index=True)
+
     # Core Information
     event_type = fields.Selection(
         [
@@ -85,7 +87,7 @@ class SquareIntegrationLog(models.Model):
                 )
 
     @api.model
-    def log_square_event(
+    def _log_square_event(
         self,
         event_type,
         title,
@@ -102,7 +104,9 @@ class SquareIntegrationLog(models.Model):
         Utility method to log Square integration events
         """
         try:
+            sale_order = self.env["sale.order"].sudo().browse(sale_order_id)
             vals = {
+                "company_id": (sale_order.company_id or self.env.company).id,
                 "event_type": event_type,
                 "status": status,
                 "title": title,
@@ -110,12 +114,11 @@ class SquareIntegrationLog(models.Model):
                 "square_order_id": square_order_id,
                 "square_refund_id": square_refund_id,
                 "sale_order_id": sale_order_id,
-                "technical_details": technical_details,
                 "webhook_event_id": webhook_event_id,
                 "processing_time": processing_time,
             }
 
-            return self.create(vals)
+            return self.sudo().create(vals)
 
         except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
             raise
@@ -124,9 +127,9 @@ class SquareIntegrationLog(models.Model):
             return False
 
     @api.model
-    def log_order_creation(self, sale_order, square_data, processing_time=None):
+    def _log_order_creation(self, sale_order, square_data, processing_time=None):
         """Log successful order creation"""
-        return self.log_square_event(
+        return self._log_square_event(
             event_type="order_created",
             title=f"Order {sale_order.name} created from Square",
             description=f"""
@@ -134,8 +137,6 @@ class SquareIntegrationLog(models.Model):
                 <ul>
                     <li>Odoo Order: <strong>{sale_order.name}</strong></li>
                     <li>Square Order ID: <code>{square_data.get('order_id')}</code></li>
-                    <li>Customer: {sale_order.partner_id.name}</li>
-                    <li>Total Amount: {sale_order.amount_total} {sale_order.currency_id.name}</li>
                     <li>Order Lines: {len(sale_order.order_line)} items</li>
                 </ul>
             """,
@@ -146,9 +147,9 @@ class SquareIntegrationLog(models.Model):
         )
 
     @api.model
-    def log_refund_processed(self, sale_order, refund_data, processing_time=None):
+    def _log_refund_processed(self, sale_order, refund_data, processing_time=None):
         """Log successful refund processing"""
-        return self.log_square_event(
+        return self._log_square_event(
             event_type="refund_processed",
             title=f"Refund processed for order {sale_order.name}",
             description=f"""
@@ -170,7 +171,7 @@ class SquareIntegrationLog(models.Model):
         )
 
     @api.model
-    def log_error(
+    def _log_error(
         self,
         title,
         error_message,
@@ -179,12 +180,12 @@ class SquareIntegrationLog(models.Model):
         technical_details=None,
     ):
         """Log errors in Square integration"""
-        return self.log_square_event(
+        return self._log_square_event(
             event_type="error",
             title=title,
             description=f"""
                 <p><strong>Square Integration Error</strong></p>
-                <p class="text-danger">{error_message}</p>
+                <p class="text-danger">See the related record for its current state.</p>
             """,
             status="error",
             square_order_id=square_order_id,
@@ -193,20 +194,11 @@ class SquareIntegrationLog(models.Model):
         )
 
     @api.model
-    def log_webhook_received(self, event_type, event_data, webhook_event_id=None):
-        """Log webhook reception"""
-        return self.log_square_event(
+    def _log_webhook_received(self, event_type, webhook_event_id=None):
+        """Record receipt metadata without storing a copy of the event."""
+        return self._log_square_event(
             event_type="webhook_received",
             title=f"Webhook received: {event_type}",
-            description=f"""
-                <p><strong>Square Webhook Received</strong></p>
-                <ul>
-                    <li>Event Type: <code>{event_type}</code></li>
-                    <li>Event ID: <code>{webhook_event_id or 'N/A'}</code></li>
-                    <li>Data Keys: {', '.join(event_data.keys()) if event_data else 'None'}</li>
-                </ul>
-            """,
             status="info",
             webhook_event_id=webhook_event_id,
-            technical_details=str(event_data) if event_data else None,
         )

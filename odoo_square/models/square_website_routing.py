@@ -8,10 +8,12 @@ class SquareWebsiteRouting(models.Model):
     _inherit = "square.api.client"
 
     def _website_routing_config(self, config=None):
-        return config or self.env["square.config"].sudo().search([], limit=1)
+        return config or self.env["square.config"].sudo().with_context(active_test=True).search(
+            [("company_id", "=", self.env.company.id)], limit=1,
+        )
 
     def _read_pos_order(self, order_id, config=None):
-        order = self.get_order(order_id, square_config=config) if config else self.get_order(order_id)
+        order = self._get_order(order_id, square_config=config) if config else self._get_order(order_id)
         return self._route_website_order(order_id, self._website_routing_config(config), order=order or {})
 
     def _website_scope_exists(self, config):
@@ -37,7 +39,7 @@ class SquareWebsiteRouting(models.Model):
         matches = self.env["payment.transaction"]._square_online_matches_pos_resource
         if not matches(config.square_environment, kind, resource):
             return False
-        # POS may use a separate application and can receive unsigned notifications.
+        # POS may use a separate application.
         # The Square location retrieved with its own token identifies the merchant.
         location_id = resource["location_id"]
         location = self._read_website_routing_resource("locations", "location", location_id, config)
@@ -53,7 +55,7 @@ class SquareWebsiteRouting(models.Model):
         if not config:
             return self._website_routing_retry(), order
         if order is None:
-            order = self.get_order(quote(order_id, safe=""), square_config=config)
+            order = self._get_order(order_id, square_config=config)
         if not order or order.get("id") != order_id or not order.get("location_id"):
             return self._website_routing_retry(), order
         ownership = self._website_resource_matches("order", order, config)
@@ -67,7 +69,7 @@ class SquareWebsiteRouting(models.Model):
         }
         retry = False
         for source_id in sorted(source_ids - {order_id}):
-            source = self.get_order(quote(source_id, safe=""), square_config=config)
+            source = self._get_order(source_id, square_config=config)
             if not source or source.get("id") != source_id or not source.get("location_id"):
                 retry = True
                 continue
@@ -89,6 +91,7 @@ class SquareWebsiteRouting(models.Model):
         order_id, payment_id = event.get("order_id"), event.get("payment_id")
         if signed and order_id and payment_id and self.env["sale.order"].sudo().search_count([
             ("square_order_id", "=", order_id), ("square_payment_id", "=", payment_id),
+            ("company_id", "=", config.company_id.id),
         ], limit=1):
             return None
 
