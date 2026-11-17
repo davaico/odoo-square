@@ -1,6 +1,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from odoo import _, api, fields, models
 from odoo.exceptions import AccessError, ValidationError
+from odoo.http import request
 
 from odoo.addons.payment import utils as payment_utils
 
@@ -97,6 +98,7 @@ class PaymentProvider(models.Model):
             connection = provider._square_online_get_connection()
             if (
                 provider.company_id.id != company_id
+                or (request and not self.env.context.get("square_online_website_checkout"))
                 or (provider.website_id and provider.website_id.id != website_id)
                 or not connection
                 or not connection._square_online_is_ready()

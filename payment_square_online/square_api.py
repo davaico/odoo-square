@@ -1,5 +1,6 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import re
+from decimal import Decimal, DecimalException, Inexact, localcontext
 
 import requests
 
@@ -64,3 +65,19 @@ def square_request(environment, method, path, *, token=None, payload=None, param
                 codes.append(code)
         raise SquareAPIError(response.status_code, codes)
     return content
+
+
+MINOR_UNIT_DIGITS = {currency: 0 if currency == "JPY" else 2 for currency in CURRENCY_BY_COUNTRY.values()}
+
+
+def square_amount_in_minor_units(amount, currency_code):
+    try:
+        digits = MINOR_UNIT_DIGITS[currency_code]
+        value = Decimal(str(amount))
+        if not value.is_finite():
+            raise ValueError("Square amounts must be finite.")
+        with localcontext() as context:
+            context.traps[Inexact] = True
+            return int(value.quantize(Decimal(1).scaleb(-digits)).scaleb(digits))
+    except (DecimalException, KeyError) as exc:
+        raise ValueError("Invalid Square checkout amount or currency.") from exc

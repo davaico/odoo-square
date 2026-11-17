@@ -43,3 +43,15 @@ Square processes in the location's currency and the checkout currency must match
 - If Square denies authorization or the account has no eligible location, review the result in the connection form. In Sandbox, open the test seller dashboard before starting the authorization.
 - To authorize the same merchant again, open the existing connection and select **Authorize with Square**. Create a new connection for a different merchant, application, environment, or location.
 - Configure reverse proxies and external request loggers to omit query strings for the OAuth callback path. Odoo redacts that path's query string from its Werkzeug access log. Use normal production log levels to keep RPC inputs and credentials out of diagnostics.
+
+## Make a sandbox payment
+
+1. With **Square Online** in **Test Mode** and published, open the store in a shopper session. Use an HTTPS checkout origin. For testing on the same computer as Odoo, Square also supports the browser's secure localhost context.
+2. Put a product in the cart, enter the billing and shipping details, and select a delivery method if Odoo asks for one. Check that the order currency matches the Sandbox location. Select **Card** secured by **Square Online**.
+3. Use the [Square Sandbox test cards](https://developer.squareup.com/docs/devtools/sandbox/payments) in the embedded card form. Select **Pay now** and complete the bank verification prompt when the chosen test card requires it.
+4. Confirm that the existing Odoo order is confirmed and the charge appears in the Square Sandbox seller's transactions. Check the payment in Odoo Accounting and the order's invoice if automatic invoicing is enabled. Odoo handles delivery through its normal fulfillment workflow.
+5. Try a Sandbox decline card to see how checkout handles a definitive failure. If a payment remains processing after an interruption, keep the order reference for support and check its status before trying to pay again.
+
+If you enforce a Content Security Policy, allow the appropriate environment's Square SDK and its frame, network, and font origins for checkout. Check Square's requirements against your existing policy. [Square Web Payments SDK security policy](https://developer.squareup.com/docs/web-payments/content-security-policy)
+
+The automated checkout tests simulate Square's SDK and API. Use Square Sandbox to qualify your store's actual card form, authentication, and capture.
