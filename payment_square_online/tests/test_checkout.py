@@ -289,6 +289,237 @@ class TestSquareCheckout(HttpCase):
         response._content = json.dumps(body).encode()
         return response
 
+    def _square_refund_webhook(self, refund, event_id, event_type='refund.updated', *, merchant='TESTMERCHANT'):
+        from odoo.addons.payment_square_online.const import SQUARE_WEBHOOK_PATH
+
+        path = f'{SQUARE_WEBHOOK_PATH}/{self.provider.id}'
+        subscription_url = f'https://square-test.example.test{path}'
+        key = 'test-refund-webhook-key'
+        self.provider.write({'square_webhook_url': subscription_url, 'square_webhook_signature_key': key})
+        payload = json.dumps({
+            'event_id': event_id, 'merchant_id': merchant, 'type': event_type,
+            'data': {'id': refund['id'], 'type': 'refund', 'object': {'refund': refund}},
+        }).encode()
+        signature = b64encode(hmac.digest(key.encode(), subscription_url.encode() + payload, 'sha256')).decode()
+        return self.url_open(path, data=payload, headers={
+            'Content-Type': 'application/json', 'x-square-hmacsha256-signature': signature,
+        })
+
+    def test_square_dashboard_full_refund_webhook_posts_one_outbound_payment(self):
+        order = self._captured_order()
+        tx = order.transaction_ids
+        self.authenticate('admin', 'admin')
+        cron = self.env.ref('payment_square_online.ir_cron_square_online_webhooks')
+        external = {
+            'id': 'SQ-DASHBOARD-REFUND', 'payment_id': 'SQ-PAYMENT-1', 'status': 'COMPLETED',
+            'amount_money': {'amount': 5000, 'currency': 'USD'}, 'location_id': 'TESTNYC',
+            'reason': 'Square Dashboard', 'order_id': 'SQ-RETURN-ORDER',
+        }
+
+        def square(method, url, **kwargs):
+            self.assertEqual(method, 'GET')
+            self.assertTrue(url.endswith('/v2/refunds/SQ-DASHBOARD-REFUND'))
+            return self._refund_response({'refund': external})
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            self.assertEqual(self._square_refund_webhook(external, 'refund-complete', merchant='OTHER').status_code, 403)
+            self.assertEqual(self._square_refund_webhook(external, 'refund-complete').status_code, 204)
+            self.assertEqual(self._square_refund_webhook(external, 'refund-complete').status_code, 204)
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+            child = tx.child_transaction_ids
+            self.assertEqual(len(child), 1)
+            self.assertEqual(child.state, 'done')
+            outbound = child.payment_id
+
+            external['status'] = 'PENDING'
+            self.assertEqual(self._square_refund_webhook(external, 'refund-older', 'refund.created').status_code, 204)
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+
+        self.assertEqual([call.args[0] for call in api.call_args_list], ['GET', 'GET'])
+        self.assertEqual(tx.child_transaction_ids, child)
+        self.assertEqual(child.provider_reference, 'SQ-DASHBOARD-REFUND')
+        self.assertEqual(child.source_transaction_id, tx)
+        self.assertEqual(child.amount, -50)
+        self.assertEqual(child.currency_id, self.currency)
+        self.assertFalse(child.square_refund_requested_by_id)
+        self.assertEqual(child.state, 'done')
+        self.assertEqual(child.payment_id, outbound)
+        self.assertEqual(outbound.payment_type, 'outbound')
+        self.assertEqual(outbound.amount, 50)
+        self.assertEqual(outbound.currency_id, self.currency)
+        self.assertEqual(outbound.company_id, self.company)
+        self.assertEqual(outbound.source_payment_id, tx.payment_id)
+        self.assertEqual(tx.payment_id.amount_available_for_refund, 0)
+        self.assertEqual(self.env['account.payment'].search_count([('source_payment_id', '=', tx.payment_id.id)]), 1)
+        self.assertFalse(order.invoice_ids)
+        if 'picking_ids' in order._fields:
+            self.assertFalse(order.picking_ids.filtered(lambda picking: picking.picking_type_code == 'incoming'))
+
+    def test_square_refund_discovery_preserves_equal_amount_local_reservation(self):
+        order = self._captured_order()
+        charge = order.transaction_ids
+        self.authenticate('admin', 'admin')
+        wizard = self._refund_wizard(charge.payment_id, 20)
+        external = {
+            'id': 'SQ-EXTERNAL-PARTIAL', 'payment_id': 'SQ-PAYMENT-1', 'status': 'COMPLETED',
+            'location_id': 'TESTNYC', 'amount_money': {'amount': 2000, 'currency': 'USD'},
+        }
+        local = {**external, 'id': 'SQ-LOCAL-PARTIAL', 'status': 'PENDING'}
+
+        def square(method, url, **kwargs):
+            if method == 'POST' and url.endswith('/v2/refunds'):
+                local['reason'] = kwargs['json']['reason']
+                raise Timeout('Square accepted the local refund before losing the response')
+            self.assertEqual(method, 'GET')
+            if url.endswith('/v2/payments/SQ-PAYMENT-1'):
+                return self._refund_response({'payment': {
+                    'id': 'SQ-PAYMENT-1', 'status': 'COMPLETED', 'source_type': 'CARD',
+                    'location_id': 'TESTNYC', 'reference_id': charge.square_order_reference,
+                    'order_id': 'SQ-ORDER-1', 'amount_money': {'amount': 5000, 'currency': 'USD'},
+                    'refund_ids': [external['id']], 'refunded_money': {'amount': 2000, 'currency': 'USD'},
+                }})
+            for refund in (external, local):
+                if url.endswith(f"/v2/refunds/{refund['id']}"):
+                    return self._refund_response({'refund': refund})
+            self.fail(f'Unexpected Square API call: {method} {url}')
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            local_id = self._refund_button('payment.refund.wizard', 'action_refund', wizard)['res_id']
+            local_tx = charge.child_transaction_ids
+            self.assertEqual(local_tx.id, local_id)
+            self.assertFalse(local_tx.provider_reference)
+            self.assertEqual(charge.payment_id.amount_available_for_refund, 30)
+
+            self._refund_button('payment.transaction', 'action_square_refresh_status', charge.id)
+            self.assertEqual(len(charge.child_transaction_ids), 2)
+            external_tx = charge.child_transaction_ids - local_tx
+            self.assertEqual(external_tx.provider_reference, 'SQ-EXTERNAL-PARTIAL')
+            self.assertEqual(external_tx.square_refund_origin, 'square')
+            self.assertFalse(external_tx.square_refund_requested_by_id)
+            self.assertEqual((external_tx.state, external_tx.payment_id.amount), ('done', 20))
+            self.assertEqual(local_tx.state, 'pending')
+            self.assertFalse(local_tx.provider_reference)
+            self.assertEqual(charge.payment_id.amount_available_for_refund, 10)
+
+            cron = self.env.ref('payment_square_online.ir_cron_square_online_webhooks')
+            self.assertEqual(self._square_refund_webhook(local, 'local-link').status_code, 204)
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+            self.assertEqual(local_tx.provider_reference, 'SQ-LOCAL-PARTIAL')
+            self.assertEqual(local_tx.state, 'pending')
+            self.assertEqual(charge.payment_id.amount_available_for_refund, 10)
+
+            local['status'] = 'FAILED'
+            self.assertEqual(self._square_refund_webhook(local, 'local-failure').status_code, 204)
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+
+        self.assertEqual([call.args[0] for call in api.call_args_list], ['POST', 'GET', 'GET', 'GET', 'GET'])
+        self.assertEqual(len(charge.child_transaction_ids), 2)
+        self.assertEqual(local_tx.state, 'error')
+        self.assertEqual(local_tx.square_refund_origin, 'odoo')
+        self.assertEqual(local_tx.square_refund_requested_by_id, self.env.ref('base.user_admin'))
+        self.assertFalse(local_tx.payment_id)
+        self.assertEqual(charge.payment_id.amount_available_for_refund, 30)
+        self.assertEqual(self.env['account.payment'].search_count([('source_payment_id', '=', charge.payment_id.id)]), 1)
+
+    def test_scheduled_square_refund_discovery_checks_settled_payments_without_webhooks(self):
+        charge = self._captured_order().transaction_ids
+        self.authenticate('admin', 'admin')
+        new_location = self.env['payment.square.location'].create({
+            'provider_id': self.provider.id, 'square_id': 'NEWLOCATION', 'name': 'New store',
+            'country_code': 'US', 'currency_code': 'USD',
+        })
+        self.provider.square_location_id = new_location
+        external = {
+            'id': 'SQ-MISSING-WEBHOOK', 'payment_id': 'SQ-PAYMENT-1', 'status': 'PENDING',
+            'location_id': 'TESTNYC', 'amount_money': {'amount': 1250, 'currency': 'USD'},
+        }
+        unrelated = {**external, 'id': 'POS-REFUND', 'payment_id': 'POS-PAYMENT'}
+        wrong_location = {**external, 'id': 'UNRELATED-LOCATION', 'location_id': 'NEWLOCATION'}
+        wrong_currency = {**external, 'id': 'WRONG-CURRENCY', 'amount_money': {'amount': 1250, 'currency': 'EUR'}}
+
+        def square(method, url, **kwargs):
+            self.assertEqual(method, 'GET')
+            if url.endswith('/v2/refunds'):
+                if kwargs['params'].get('cursor') == 'next-refund-page':
+                    return self._refund_response({'refunds': [external]})
+                return self._refund_response({
+                    'refunds': [unrelated, wrong_location, wrong_currency], 'cursor': 'next-refund-page',
+                })
+            self.assertTrue(url.endswith('/v2/refunds/SQ-MISSING-WEBHOOK'))
+            return self._refund_response({'refund': {**external, 'status': 'COMPLETED'}})
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            cron = self.env.ref('payment_square_online.ir_cron_square_online_discover_refunds')
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+            child = charge.child_transaction_ids
+            self.assertEqual(len(child), 1)
+            self.assertEqual(child.provider_reference, 'SQ-MISSING-WEBHOOK')
+            self.assertEqual(child.state, 'pending')
+            self.assertEqual(child.square_location_ref, 'TESTNYC')
+            self.assertEqual(child.amount, -12.5)
+            self.assertFalse(child.payment_id)
+            self.assertEqual(charge.payment_id.amount_available_for_refund, 37.5)
+
+            status_cron = self.env.ref('payment_square_online.ir_cron_square_online_reconcile')
+            self._refund_button('ir.cron', 'method_direct_trigger', status_cron.id)
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+
+        self.assertEqual([call.args[0] for call in api.call_args_list], ['GET', 'GET', 'GET'])
+        self.assertEqual(charge.child_transaction_ids, child)
+        self.assertEqual(child.state, 'done')
+        self.assertEqual(child.payment_id.amount, 12.5)
+        self.assertEqual(child.payment_id.source_payment_id, charge.payment_id)
+        self.assertEqual(charge.payment_id.amount_available_for_refund, 37.5)
+        self.assertEqual(self.env['account.payment'].search_count([('source_payment_id', '=', charge.payment_id.id)]), 1)
+
+    def test_square_amount_rejection_recovers_the_dashboard_refund_that_won_the_race(self):
+        charge = self._captured_order().transaction_ids
+        self.authenticate('admin', 'admin')
+        wizard = self._refund_wizard(charge.payment_id, 40)
+        second_wizard = self._refund_wizard(charge.payment_id, 40)
+        visible_at_square = False
+        external = {
+            'id': 'SQ-DASHBOARD-FIRST', 'payment_id': 'SQ-PAYMENT-1', 'status': 'COMPLETED',
+            'location_id': 'TESTNYC', 'amount_money': {'amount': 3000, 'currency': 'USD'},
+        }
+
+        def square(method, url, **kwargs):
+            if method == 'POST' and url.endswith('/v2/refunds'):
+                self.assertEqual(kwargs['json']['amount_money'], {'amount': 4000, 'currency': 'USD'})
+                return self._square_error_response(400, 'REFUND_AMOUNT_INVALID')
+            self.assertEqual(method, 'GET')
+            if url.endswith('/v2/payments/SQ-PAYMENT-1'):
+                return self._refund_response({'payment': {
+                    'id': 'SQ-PAYMENT-1', 'status': 'COMPLETED', 'source_type': 'CARD', 'location_id': 'TESTNYC',
+                    'reference_id': charge.square_order_reference, 'order_id': 'SQ-ORDER-1',
+                    'amount_money': {'amount': 5000, 'currency': 'USD'},
+                    'refund_ids': [external['id']] if visible_at_square else [],
+                    'refunded_money': {'amount': 3000 if visible_at_square else 0, 'currency': 'USD'},
+                }})
+            self.assertTrue(url.endswith('/v2/refunds/SQ-DASHBOARD-FIRST'))
+            return self._refund_response({'refund': external})
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api:
+            local_id = self._refund_button('payment.refund.wizard', 'action_refund', wizard)['res_id']
+            self.assertEqual(self._refund_button('payment.refund.wizard', 'action_refund', wizard)['res_id'], local_id)
+            self.assertEqual(charge.payment_id.amount_available_for_refund, 0)
+            blocked = self._rpc('/web/dataset/call_button', model='payment.refund.wizard', method='action_refund',
+                                args=[[second_wizard]], kwargs={})
+            self.assertIn('reported a lower refundable balance', blocked['error']['data']['message'])
+            self.assertEqual(len(charge.child_transaction_ids), 1)
+            visible_at_square = True
+            self._refund_button('payment.transaction', 'action_square_refresh_status', charge.id)
+
+        self.assertEqual([call.args[0] for call in api.call_args_list], ['POST', 'GET', 'GET', 'GET'])
+        self.assertEqual(len(charge.child_transaction_ids), 2)
+        local = charge.child_transaction_ids.filtered(lambda child: child.id == local_id)
+        imported = charge.child_transaction_ids - local
+        self.assertEqual(local.state, 'error')
+        self.assertFalse(local.payment_id)
+        self.assertEqual((imported.state, imported.payment_id.amount), ('done', 30))
+        self.assertEqual(charge.payment_id.amount_available_for_refund, 20)
+        self.assertEqual(self.env['account.payment'].search_count([('source_payment_id', '=', charge.payment_id.id)]), 1)
+
     def test_accounting_manager_issues_full_refund_in_native_payment_wizard(self):
         self.env['ir.config_parameter'].set_param('sale.automatic_invoice', 'True')
         order = self._captured_order()

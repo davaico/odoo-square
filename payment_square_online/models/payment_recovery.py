@@ -43,7 +43,7 @@ class PaymentTransaction(models.Model):
         if self.provider_code != 'square_online' or not self.square_reserved_at:
             raise UserError(_("This transaction has no Square payment to refresh."))
 
-        self.sudo()._square_refresh_status()
+        self.sudo()._square_refresh_status(discover_refunds=True)
         return {'type': 'ir.actions.client', 'tag': 'reload'}
 
     def _square_lock_for_status(self):
@@ -73,9 +73,11 @@ class PaymentTransaction(models.Model):
                 self.square_connection_id._record_authorization_failure()
             raise
 
-    def _square_refresh_status(self, *, payment_id=None):
+    def _square_refresh_status(self, *, payment_id=None, discover_refunds=False):
         """Read and apply an existing operation under the same lock as checkout dispatch."""
         self.ensure_one()
+        if self.operation == 'refund':
+            self.source_transaction_id._square_lock_for_status()
         self._square_lock_for_status()
         if self.operation == 'refund':
             return self._square_refresh_refund()
@@ -94,7 +96,7 @@ class PaymentTransaction(models.Model):
             return False
 
         try:
-            verified = self._square_refresh_payment(payment_id=payment_id)
+            payment = self._square_refresh_payment(payment_id=payment_id)
         except UserError as error:
             self.square_recovery_message = error.args[0]
             return False
@@ -106,12 +108,15 @@ class PaymentTransaction(models.Model):
             )
             return False
 
-        if not verified:
+        if not payment:
             self.square_recovery_message = _("Square did not return a payment matching this attempt. Odoo will check again.")
             return False
 
-        self.square_recovery_message = False
+        if not self.square_refund_recheck_minor:
+            self.square_recovery_message = False
         self._square_post_process_recovered_payment()
+        if discover_refunds and payment.get('status') == 'COMPLETED' and self._square_is_captured_payment():
+            return self._square_discover_linked_refunds(payment)
         return True
 
     def _square_refresh_payment(self, *, payment_id=None):
@@ -121,7 +126,9 @@ class PaymentTransaction(models.Model):
                 return False
             response = self._square_request('GET', f'/v2/payments/{quote(payment_id, safe="")}')
             payment = response.get('payment')
-            return isinstance(payment, dict) and payment.get('id') == payment_id and self._square_apply_payment(payment)
+            if isinstance(payment, dict) and payment.get('id') == payment_id and self._square_apply_payment(payment):
+                return payment
+            return False
 
         # Square cannot filter by Odoo's reference. Scan the original location with a clock-skew
         # margin, then let the same verifier used for checkout confirm the exact attempt and money.
@@ -133,8 +140,9 @@ class PaymentTransaction(models.Model):
             payments = response.get('payments', [])
             if not isinstance(payments, list):
                 return False
-            if any(self._square_apply_payment(payment) for payment in payments):
-                return True
+            for payment in payments:
+                if self._square_apply_payment(payment):
+                    return payment
             cursor = response.get('cursor')
             if not isinstance(cursor, str) or not cursor or cursor in cursors:
                 return False
@@ -183,8 +191,12 @@ class PaymentTransaction(models.Model):
             try:
                 with self.env.registry.cursor() as cr:
                     tx = self.with_env(api.Environment(cr, SUPERUSER_ID, {})).browse(tx_id)
+                    if not tx.exists():
+                        continue
+                    if tx.operation == 'refund':
+                        tx.source_transaction_id._square_lock_for_status()
                     tx._square_lock_for_status()
-                    if not tx.exists() or (tx.square_recovery_next_check and tx.square_recovery_next_check > now):
+                    if tx.square_recovery_next_check and tx.square_recovery_next_check > now:
                         continue
                     tx.square_recovery_next_check = now + timedelta(minutes=5)
                     try:

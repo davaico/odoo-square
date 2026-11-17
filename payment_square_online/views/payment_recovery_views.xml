@@ -31,6 +31,7 @@
             <xpath expr="//group[@name='transaction_details']" position="after">
                 <group string="Square Payment Details" invisible="provider_code != 'square_online'">
                     <field name="square_order_id"/>
+                    <field name="square_refund_origin" invisible="operation != 'refund'"/>
                     <field name="square_refund_requested_by_id" invisible="not square_refund_requested_by_id"/>
                     <field name="square_environment"/>
                     <field name="square_merchant_id"/>

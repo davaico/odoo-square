@@ -1,6 +1,7 @@
 from datetime import timedelta
 from decimal import Decimal
 from math import isfinite
+from re import fullmatch
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -19,6 +20,7 @@ _REFUND_REJECTIONS = {
     'PAYMENT_NOT_REFUNDABLE_DUE_TO_DISPUTE', 'REFUND_AMOUNT_INVALID', 'REFUND_DECLINED',
     'REFUND_ERROR_PAYMENT_NEEDS_COMPLETION',
 }
+_REFUND_STATUSES = ('PENDING', 'COMPLETED', 'REJECTED', 'FAILED')
 
 
 class PaymentTransaction(models.Model):
@@ -28,12 +30,24 @@ class PaymentTransaction(models.Model):
     square_refund_requested_by_id = fields.Many2one(
         'res.users', string='Refund Requested By', readonly=True, copy=False, ondelete='restrict',
     )
+    square_refund_origin = fields.Selection(
+        [('odoo', 'Odoo'), ('square', 'Square')], string='Refund Origin', compute='_compute_square_refund_origin',
+    )
     square_refund_wizard_id = fields.Integer(readonly=True, copy=False)
     square_refund_revision = fields.Integer(readonly=True, copy=False)
+    square_refund_recheck_minor = fields.Integer(readonly=True, copy=False)
 
     _sql_constraints = [
         ('square_refund_key_unique', 'UNIQUE(square_refund_key)', 'Square refund requests must be unique.'),
     ]
+
+    @api.depends('provider_code', 'operation', 'square_refund_key')
+    def _compute_square_refund_origin(self):
+        for tx in self:
+            tx.square_refund_origin = (
+                ('odoo' if tx.square_refund_key else 'square')
+                if tx.provider_code == 'square_online' and tx.operation == 'refund' else False
+            )
 
     def action_refund(self, amount_to_refund=None):
         self.check_access('read')
@@ -67,12 +81,15 @@ class PaymentTransaction(models.Model):
             and self.square_amount_minor > 0 and self.square_currency_code == self.currency_id.name
         )
 
-    def _square_refundable_minor(self):
+    def _square_refundable_minor(self, *, excluding=None):
         self.ensure_one()
-        if not self._square_is_captured_payment():
+        if self.square_refund_recheck_minor or not self._square_is_captured_payment():
             return 0
+        return self._square_recorded_refund_balance(excluding=excluding)
+
+    def _square_recorded_refund_balance(self, *, excluding=None):
         reserved = self.child_transaction_ids.filtered(
-            lambda tx: tx.operation == 'refund' and tx.state in ('pending', 'done'),
+            lambda tx: tx != excluding and tx.operation == 'refund' and tx.state in ('pending', 'done'),
         )
         return max(self.square_amount_minor - sum(reserved.mapped('square_amount_minor')), 0)
 
@@ -113,16 +130,38 @@ class PaymentTransaction(models.Model):
             # after the POST, status checks can still find and verify the original request.
             with self.env.registry.cursor() as cr:
                 refund = api.Environment(cr, uid, context)['payment.transaction'].sudo().browse(refund_id)
+                source = refund.source_transaction_id
+                source._square_lock_for_status()
                 refund._square_lock_for_status()
                 if refund.state != 'pending' or refund.square_dispatched_at:
                     return self.browse(refund_id)
+                if refund.square_amount_minor > source._square_refundable_minor(excluding=refund):
+                    refund._set_error(_("Another Square refund reduced the remaining balance before Odoo sent this refund."))
+                    source.square_refund_revision += 1
+                    return self.browse(refund_id)
                 refund.square_dispatched_at = fields.Datetime.now()
 
+            # Release the credential lock before applying the financial result. Refund recovery
+            # takes the source lock before making read requests.
             with self.env.registry.cursor() as cr:
                 refund = api.Environment(cr, uid, context)['payment.transaction'].sudo().browse(refund_id)
-                refund._square_lock_for_status()
-                if refund.state == 'pending':
-                    refund.with_company(refund.company_id)._square_dispatch_refund()
+                response, error_message, check_balance = refund.with_company(refund.company_id)._square_dispatch_refund()
+            if response or error_message:
+                with self.env.registry.cursor() as cr:
+                    refund = api.Environment(cr, uid, context)['payment.transaction'].sudo().browse(refund_id)
+                    source = refund.source_transaction_id
+                    source._square_lock_for_status()
+                    refund._square_lock_for_status()
+                    if response:
+                        refund._square_apply_refund(response)
+                    elif refund.state == 'pending' and not refund.provider_reference:
+                        refund._set_error(error_message)
+                        source.square_refund_revision += 1
+                        if check_balance:
+                            amount = refund.square_amount_minor
+                            if source._square_recorded_refund_balance() >= amount:
+                                source.square_refund_recheck_minor = min(source.square_refund_recheck_minor or amount, amount)
+                            source._square_refresh_status(discover_refunds=True)
         return self.browse(refund_id)
 
     def _square_reserve_refund(self, amount_to_refund, wizard_id, actor_id):
@@ -134,6 +173,8 @@ class PaymentTransaction(models.Model):
                 return existing, False
         if not self._square_is_captured_payment():
             raise ValidationError(_("Only captured Square online payments recorded in Odoo can be refunded."))
+        if self.square_refund_recheck_minor:
+            raise UserError(_("Square reported a lower refundable balance. Refresh the original payment before trying again."))
 
         available = self._square_refundable_minor()
         if not available:
@@ -183,17 +224,91 @@ class PaymentTransaction(models.Model):
                 'reason': self.square_refund_key,
             })
         except UserError as error:
-            self._set_error(error.args[0])
+            return None, error.args[0], False
         except SquareAPIError as error:
             if error.is_authorization_error:
-                self._set_error(_("Reconnect the original Square account before requesting a new refund."))
-            elif error.status in (400, 402) and error.codes and set(error.codes) <= _REFUND_REJECTIONS:
-                self._set_error(_("Square rejected the refund. Check the original payment at Square for details."))
-        else:
-            self._square_apply_refund(response.get('refund'))
+                return None, _("Reconnect the original Square account before requesting a new refund."), False
+            if error.status in (400, 402) and error.codes and set(error.codes) <= _REFUND_REJECTIONS:
+                return (
+                    None, _("Square rejected the refund. Check the original payment at Square for details."),
+                    'REFUND_AMOUNT_INVALID' in error.codes,
+                )
+            return None, None, False
+        return response.get('refund'), None, False
+
+    def _square_discover_linked_refunds(self, payment):
+        """Check the refund IDs Square reports on a verified original payment."""
+        refund_ids = payment.get('refund_ids', [])
+        verified = isinstance(refund_ids, list) and all(isinstance(value, str) and value for value in refund_ids)
+        if verified:
+            for refund_id in dict.fromkeys(refund_ids):
+                try:
+                    if not self._square_fetch_linked_refund(refund_id):
+                        verified = False
+                except (UserError, SquareAPIError):
+                    verified = False
+        if self.square_refund_recheck_minor:
+            self.square_recovery_message = _("Square reported a lower refundable balance. Odoo is waiting for the related refund details.")
+            return False
+        if not verified:
+            self.square_recovery_message = _("Odoo could not verify all refunds for this Square payment. Try refreshing its status again later.")
+        return verified
+
+    def _square_fetch_linked_refund(self, refund_id):
+        response = self._square_request('GET', f'/v2/refunds/{quote(refund_id, safe="")}')
+        refund = response.get('refund')
+        return isinstance(refund, dict) and refund.get('id') == refund_id and self._square_ingest_refund(refund)
+
+    def _square_ingest_refund(self, refund):
+        """Record an existing Square refund retrieved with the original account's authorization."""
+        self.ensure_one()
+        self._square_lock_for_status()
+        if not self._square_is_captured_payment() or not isinstance(refund, dict):
+            return False
+        refund_id = refund.get('id')
+        money = refund.get('amount_money')
+        if (
+            not isinstance(refund_id, str) or not refund_id
+            or refund.get('payment_id') != self.provider_reference
+            or refund.get('location_id') != self.square_location_ref
+            or refund.get('status') not in _REFUND_STATUSES
+            or not isinstance(money, dict) or money.keys() != {'amount', 'currency'}
+            or money['currency'] != self.square_currency_code
+            or type(money['amount']) is not int or not 0 < money['amount'] <= self.square_amount_minor
+        ):
+            return False
+
+        children = self.child_transaction_ids.filtered(lambda tx: tx.operation == 'refund')
+        child = children.filtered(lambda tx: tx.provider_reference == refund_id)
+        reason = refund.get('reason')
+        marked = not child and isinstance(reason, str) and fullmatch(r'odoo-refund-[0-9a-f]{32}', reason)
+        if marked:
+            # An accepted request may still have no Square ID if its response was lost.
+            child = children.filtered(lambda tx: tx.square_refund_key == reason and tx.square_dispatched_at)
+            if not child:
+                return False
+        unlinked = not child or not child.provider_reference
+        if not child:
+            # Share the parent revision with local reservations to serialize changes to the balance.
+            self.square_refund_revision += 1
+            child = self.with_company(self.company_id)._square_create_refund_child(
+                money['amount'], square_reserved_at=fields.Datetime.now(),
+            )
+            child._set_pending(state_message=_("Square is processing this refund."))
+        child._square_lock_for_status()
+        applied = child._square_apply_refund(refund, require_marker=bool(marked))
+        if applied and unlinked and self.square_refund_recheck_minor:
+            # A newly verified refund may have failed since Square rejected our request.
+            available = self._square_recorded_refund_balance()
+            if child.state == 'error':
+                available -= money['amount']
+            if available < self.square_refund_recheck_minor:
+                self.square_refund_recheck_minor = 0
+                self.square_recovery_message = False
+        return applied
 
     def _square_apply_refund(self, refund, *, require_marker=False):
-        """Apply a verified response while holding the refund transaction lock."""
+        """Apply a verified response while holding the payment and refund transaction locks."""
         self.ensure_one()
         if not isinstance(refund, dict):
             return False
@@ -207,7 +322,7 @@ class PaymentTransaction(models.Model):
             or refund.get('location_id') != self.square_location_ref
             or money != self._square_money() or type(money['amount']) is not int
             or (require_marker and (not self.square_refund_key or refund.get('reason') != self.square_refund_key))
-            or status not in ('PENDING', 'COMPLETED', 'REJECTED', 'FAILED')
+            or status not in _REFUND_STATUSES
         ):
             return False
         if self.state != 'pending':
@@ -224,18 +339,20 @@ class PaymentTransaction(models.Model):
             self._set_done()
         elif status in ('REJECTED', 'FAILED'):
             self._set_error(_("Square reported that this refund failed."))
+            self.source_transaction_id.square_refund_revision += 1
         self._square_post_process_recovered_payment()
         return True
 
     def _square_refresh_refund(self):
         if self.state != 'pending' and not self.provider_reference:
             return False
-        if not self.square_dispatched_at:
+        if not self.provider_reference and not self.square_dispatched_at:
             if (
                 self.state == 'pending' and self.square_reserved_at
                 and self.square_reserved_at <= fields.Datetime.now() - _DISPATCH_RESERVATION_TIMEOUT
             ):
                 self._set_error(_("Odoo stopped before sending the refund to Square. You can try again."))
+                self.source_transaction_id.square_refund_revision += 1
                 return True
             return False
 

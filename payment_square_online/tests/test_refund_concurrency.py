@@ -31,6 +31,68 @@ class TestSquareRefundConcurrency(TestCase):
                 with self.subTest(second_amount=second_amount):
                     self._assert_overlapping_refunds(second_amount)
 
+    def test_external_refund_ingestion_serializes_with_an_overlapping_wizard(self):
+        with patch.dict(os.environ, {'ODOO_SQUARE_ONLINE_ENCRYPTION_KEY': Fernet.generate_key().decode()}):
+            source_id, wizard_ids, actor_id = self._prepare_refund_wizards(30)
+            with self.registry.cursor() as cr:
+                env = api.Environment(cr, SUPERUSER_ID, {})
+                source = env['payment.transaction'].browse(source_id)
+                payment_ref = source.provider_reference
+                refund_ref = f'{payment_ref}-external'
+                env['payment.square.webhook.event'].create({
+                    'connection_id': source.square_connection_id.id, 'event_id': refund_ref,
+                    'event_type': 'refund.created', 'merchant_id': source.square_merchant_id,
+                    'environment': 'sandbox', 'resource_id': refund_ref, 'resource_reference': payment_ref,
+                })
+
+            def square(method, url, **kwargs):
+                self.assertEqual((method, url), ('GET', f'https://connect.squareupsandbox.com/v2/refunds/{refund_ref}'))
+                response = Response()
+                response.status_code = 200
+                response._content = json.dumps({'refund': {
+                    'id': refund_ref, 'status': 'PENDING', 'location_id': 'RACELOCATION',
+                    'payment_id': payment_ref, 'amount_money': {'amount': 3000, 'currency': 'USD'},
+                }}).encode()
+                return response
+
+            def process_webhook():
+                with self.registry.cursor() as cr:
+                    env = api.Environment(cr, SUPERUSER_ID, {})
+                    env.ref('payment_square_online.ir_cron_square_online_webhooks').method_direct_trigger()
+
+            def submit_wizard():
+                with self.registry.cursor() as cr:
+                    env = api.Environment(cr, actor_id, {})
+                    wizard = env['payment.refund.wizard'].browse(wizard_ids)
+                    return retrying(wizard.action_refund, env)
+
+            with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square) as api_mock:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    with self.registry.cursor() as gate_cr:
+                        gate_cr.execute(
+                            'SELECT pg_backend_pid() FROM payment_transaction WHERE id = %s FOR NO KEY UPDATE',
+                            [source_id],
+                        )
+                        gate_pid = gate_cr.fetchone()[0]
+                        ingestion = pool.submit(process_webhook)
+                        self._wait_for_waiting_reservations(gate_pid, count=1)
+                        submission = pool.submit(submit_wizard)
+                        self._wait_for_waiting_reservations(gate_pid)
+
+                    ingestion.result(timeout=10)
+                    with self.assertRaisesRegex(ValidationError, 'remaining refundable'):
+                        submission.result(timeout=10)
+                api_mock.assert_called_once()
+
+            with self.registry.cursor() as cr:
+                source = api.Environment(cr, SUPERUSER_ID, {})['payment.transaction'].browse(source_id)
+                child = source.child_transaction_ids
+                self.assertEqual(len(child), 1)
+                self.assertEqual((child.provider_reference, child.state, child.amount), (refund_ref, 'pending', -30))
+                self.assertFalse(child.square_refund_requested_by_id)
+                self.assertFalse(child.payment_id)
+                self.assertEqual(source.payment_id.amount_available_for_refund, 20)
+
     def _assert_overlapping_refunds(self, second_amount):
         source_id, wizard_ids, actor_id = self._prepare_refund_wizards(30, second_amount)
         entered_square = Event()
@@ -99,7 +161,7 @@ class TestSquareRefundConcurrency(TestCase):
             self.assertTrue(source.child_transaction_ids.provider_reference)
             self.assertFalse(source.child_transaction_ids.payment_id)
 
-    def _wait_for_waiting_reservations(self, gate_pid):
+    def _wait_for_waiting_reservations(self, gate_pid, count=2):
         end = monotonic() + 10
         with self.registry.cursor() as cr:
             while monotonic() < end:
@@ -115,10 +177,10 @@ class TestSquareRefundConcurrency(TestCase):
                     )
                     SELECT COUNT(*) - 1 FROM waiting
                 """, [gate_pid])
-                if cr.fetchone()[0] >= 2:
+                if cr.fetchone()[0] >= count:
                     return
                 sleep(0.02)
-        self.fail('Two independent PostgreSQL reservations did not overlap on the same captured payment')
+        self.fail(f'{count} independent PostgreSQL operations did not wait on the same captured payment')
 
     def _prepare_refund_wizards(self, *amounts):
         unique = uuid4().hex

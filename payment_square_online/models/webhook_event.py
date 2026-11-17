@@ -4,7 +4,10 @@ from datetime import timedelta
 from psycopg2.errors import DeadlockDetected, SerializationFailure, UniqueViolation
 
 from odoo import SUPERUSER_ID, api, fields, models
+from odoo.exceptions import UserError
 from odoo.osv import expression
+
+from ..square_api import SquareAPIError
 
 
 _logger = logging.getLogger(__name__)
@@ -31,7 +34,10 @@ class SquareWebhookEvent(models.Model):
 
     @api.model
     def _square_webhook_event_types(self):
-        return {'payment.created': 'payment', 'payment.updated': 'payment'}
+        return {
+            'payment.created': 'payment', 'payment.updated': 'payment',
+            'refund.created': 'refund', 'refund.updated': 'refund',
+        }
 
     @api.model
     def _square_receive_event(self, connection, payload):
@@ -56,7 +62,7 @@ class SquareWebhookEvent(models.Model):
             or not isinstance(resource, dict) or resource.get('id') != resource_id
         ):
             return 400
-        resource_reference = resource.get('reference_id')
+        resource_reference = resource.get('payment_id' if object_type == 'refund' else 'reference_id')
         if self.search_count([('connection_id', '=', connection.id), ('event_id', '=', event_id)], limit=1):
             return 204
         try:
@@ -97,6 +103,8 @@ class SquareWebhookEvent(models.Model):
             ('square_connection_id', '=', self.connection_id.id), ('square_merchant_id', '=', self.merchant_id),
             ('square_environment', '=', self.environment), ('square_dispatched_at', '!=', False),
         ]
+        if self.event_type.startswith('refund.'):
+            return self._square_process_refund_event(scope)
         identity = [('provider_reference', '=', self.resource_id)]
         if self.resource_reference:
             identity = expression.OR([identity, [('square_order_reference', '=', self.resource_reference)]])
@@ -106,6 +114,24 @@ class SquareWebhookEvent(models.Model):
         # Square sends all of the merchant's events to the application's subscription. Late
         # visibility is retryable for our own references. Other payments belong to other flows.
         return not (self.resource_reference or '').startswith('odoo-web-')
+
+    def _square_process_refund_event(self, scope):
+        if not self.resource_reference:
+            # An unlinked Square refund has no original website payment.
+            return True
+        transactions = self.env['payment.transaction']
+        tx = transactions.search([*scope, ('provider_reference', '=', self.resource_reference)], limit=1)
+        if not tx:
+            # A refund can arrive before payment recovery has finished binding its Square ID.
+            return not transactions.search_count([*scope, ('state', '=', 'pending')], limit=1)
+        tx._square_lock_for_status()
+        if not tx._square_is_captured_payment():
+            if not tx._square_refresh_status(payment_id=self.resource_reference) or not tx._square_is_captured_payment():
+                return False
+        try:
+            return tx._square_fetch_linked_refund(self.resource_id)
+        except (UserError, SquareAPIError):
+            return False
 
     @api.model
     def _cron_square_webhooks(self):

@@ -27,4 +27,13 @@
         <field name="interval_number">1</field>
         <field name="interval_type">minutes</field>
     </record>
+    <record id="ir_cron_square_online_discover_refunds" model="ir.cron">
+        <field name="name">Square Online Payments: Discover refunds</field>
+        <field name="model_id" ref="model_payment_square_connection"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_square_discover_refunds()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">minutes</field>
+    </record>
 </odoo>

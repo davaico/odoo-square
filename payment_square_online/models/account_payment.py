@@ -5,7 +5,8 @@ class AccountPayment(models.Model):
     _inherit = 'account.payment'
 
     @api.depends('payment_transaction_id.child_transaction_ids.state',
-                 'payment_transaction_id.child_transaction_ids.square_amount_minor')
+                 'payment_transaction_id.child_transaction_ids.square_amount_minor',
+                 'payment_transaction_id.square_refund_recheck_minor')
     @api.depends_context('uid')
     def _compute_amount_available_for_refund(self):
         square_payments = self.filtered(

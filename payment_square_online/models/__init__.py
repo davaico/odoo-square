@@ -5,6 +5,7 @@ from . import sale_order
 from . import payment_transaction
 from . import payment_recovery
 from . import payment_refund
+from . import refund_recovery
 from . import account_payment
 from . import payment_refund_wizard
 from . import webhook_configuration
