@@ -59,3 +59,9 @@ A customer can close checkout while Square is processing a payment. They can ret
 Accounting managers and settings administrators can open **Invoicing → Configuration → Online Payments → Square Payment History**. The transaction shows the payment status, original Square location, and any status check message. Click **Refresh status** to look up that payment at Square. The scheduled check also resumes recovery once the original provider is connected.
 
 If Square collected payment for a cancelled Odoo order, Odoo records the incoming payment and shows a warning on the transaction and the customer's order. Review the payment and order. If the money needs to be returned, handle it as a separate refund.
+
+## Return a Square online payment
+
+1. As an accounting manager or settings administrator, open the original Odoo payment in its company. In **Invoicing → Customers → Payments**, select that payment and click **Refund**. Confirm the full remaining amount in the refund wizard. Odoo sends the refund to the original Square account and returns the funds to the original payment method.
+2. The refund transaction shows who requested it, the original payment, the amount and status, and the Square refund reference once available. Return to it from **Square Payment History** or the original transaction's **Refunds** button. If the refund is pending, its amount is reserved. Click **Refresh status** on the refund to check the existing request, or let Odoo check it in the background. Review any failure message before starting a new refund.
+3. A completed refund creates an outbound payment linked to the original payment. If the invoice needs a credit note, create and reconcile it separately in Invoicing. If the buyer returns goods, process the return separately in Inventory. Cancelling the sales order does not request a refund.

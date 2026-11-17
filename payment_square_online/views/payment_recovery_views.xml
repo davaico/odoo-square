@@ -23,13 +23,15 @@
         <field name="arch" type="xml">
             <xpath expr="//header/field[@name='state']" position="before">
                 <field name="square_reserved_at" invisible="1"/>
+                <field name="operation" invisible="1"/>
                 <button name="action_square_refresh_status" type="object" string="Refresh status"
-                        invisible="provider_code != 'square_online' or not square_reserved_at"
+                        invisible="provider_code != 'square_online' or not square_reserved_at or (operation == 'refund' and state == 'error' and not provider_reference)"
                         groups="account.group_account_manager,base.group_system"/>
             </xpath>
             <xpath expr="//group[@name='transaction_details']" position="after">
                 <group string="Square Payment Details" invisible="provider_code != 'square_online'">
                     <field name="square_order_id"/>
+                    <field name="square_refund_requested_by_id" invisible="not square_refund_requested_by_id"/>
                     <field name="square_environment"/>
                     <field name="square_merchant_id"/>
                     <field name="square_location_ref"/>

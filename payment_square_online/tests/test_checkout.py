@@ -262,6 +262,189 @@ class TestSquareCheckout(HttpCase):
         response._content = json.dumps({'errors': [{'code': code, 'detail': 'square-error-detail'}]}).encode()
         return response
 
+    def _refund_button(self, model, method, record_id, **kwargs):
+        return self._result('/web/dataset/call_button', model=model, method=method, args=[[record_id]], kwargs=kwargs)
+
+    def _refund_wizard(self, payment, amount):
+        action = self._refund_button('account.payment', 'action_refund_wizard', payment.id)
+        self.assertEqual(action['res_model'], 'payment.refund.wizard')
+        return self._result(
+            '/web/dataset/call_kw', model=action['res_model'], method='create',
+            args=[{'payment_id': payment.id, 'amount_to_refund': amount}], kwargs={},
+        )
+
+    def _captured_order(self):
+        order = self._cart()
+        prepared = self._prepare(order)
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=self._square_response):
+            self._result('/payment/square/online/submit', **prepared['square_submission'], source_id='cnon:refund-source')
+        self._result('/payment/status/poll')
+        return order
+
+    @staticmethod
+    def _refund_response(body, status=200):
+        response = Response()
+        response.status_code = status
+        response._content = json.dumps(body).encode()
+        return response
+
+    def test_accounting_manager_issues_full_refund_in_native_payment_wizard(self):
+        self.env['ir.config_parameter'].set_param('sale.automatic_invoice', 'True')
+        order = self._captured_order()
+        charge = order.transaction_ids
+        original_payment = charge.payment_id
+        original_credit_notes = self.env['account.move'].search([('move_type', '=', 'out_refund')])
+        self.assertEqual(order.invoice_ids.state, 'posted')
+        self.assertEqual(order.invoice_ids.amount_residual, 0)
+        if 'picking_ids' in order._fields:
+            self.assertTrue(order.picking_ids)
+            self.assertFalse(order.picking_ids.filtered(lambda picking: picking.state == 'done'))
+            pickings = {picking.id: picking.state for picking in self.env['stock.picking'].search([])}
+        manager = new_test_user(self.env, login='square_refund_manager', password='square_refund_manager',
+                                groups='account.group_account_manager', company_id=self.company.id)
+        self.authenticate(manager.login, manager.login)
+        wizard = self._refund_wizard(original_payment, 50)
+        replacement_journal = self.env['account.journal'].create({
+            'name': 'Replacement Square bank', 'code': 'SQNEW', 'type': 'bank', 'company_id': self.company.id,
+        })
+        replacement_location = self.env['payment.square.location'].create({
+            'provider_id': self.provider.id, 'square_id': 'OTHER_LOCATION', 'name': 'Replacement location',
+            'country_code': 'US', 'currency_code': 'USD',
+        })
+        self.provider.write({'journal_id': replacement_journal.id, 'square_location_id': replacement_location.id})
+
+        def square_refund(method, url, **kwargs):
+            self.assertEqual((method, url), ('POST', 'https://connect.squareupsandbox.com/v2/refunds'))
+            self.assertEqual(kwargs['headers']['Authorization'], 'Bearer test-access-token')
+            payment_refund = kwargs['json']
+            self.assertEqual(payment_refund['payment_id'], 'SQ-PAYMENT-1')
+            self.assertEqual(payment_refund['amount_money'], {'amount': 5000, 'currency': 'USD'})
+            self.assertNotIn('location_id', payment_refund)
+            self.assertTrue(payment_refund['idempotency_key'])
+            self.assertTrue(payment_refund['reason'])
+            return self._refund_response({'refund': {
+                'id': 'SQ-REFUND-1', 'status': 'COMPLETED', 'location_id': 'TESTNYC',
+                'payment_id': 'SQ-PAYMENT-1', 'amount_money': {'amount': 5000, 'currency': 'USD'},
+                'reason': payment_refund['reason'],
+            }})
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square_refund) as square:
+            action = self._refund_button('payment.refund.wizard', 'action_refund', wizard)
+            repeated = self._refund_button('payment.refund.wizard', 'action_refund', wizard)
+            self.assertEqual(repeated['res_id'], action['res_id'])
+            self.assertEqual(square.call_count, 1)
+
+        refund = charge.child_transaction_ids
+        self.assertEqual(refund.id, action['res_id'])
+        self.assertEqual(refund.operation, 'refund')
+        self.assertEqual(refund.state, 'done')
+        self.assertEqual(refund.amount, -50)
+        self.assertEqual(refund.provider_reference, 'SQ-REFUND-1')
+        self.assertEqual(refund.square_refund_requested_by_id, manager)
+        payment = refund.payment_id
+        self.assertEqual(payment.payment_type, 'outbound')
+        self.assertEqual(payment.source_payment_id, original_payment)
+        self.assertEqual(payment.move_id.state, 'posted')
+        self.assertEqual(payment.journal_id, original_payment.journal_id)
+        self.assertEqual(payment.currency_id, self.currency)
+        self.assertEqual(payment.amount, 50)
+        self.assertEqual(original_payment.amount_available_for_refund, 0)
+        self.assertEqual(order.state, 'sale')
+        self.assertEqual(self.env['account.move'].search([('move_type', '=', 'out_refund')]), original_credit_notes)
+        if 'picking_ids' in order._fields:
+            self.assertEqual({picking.id: picking.state for picking in self.env['stock.picking'].search([])}, pickings)
+        self.assertEqual(order.invoice_ids.amount_residual, 0)
+
+    def test_refund_rejection_releases_the_balance_without_retrying_the_same_wizard(self):
+        charge = self._captured_order().transaction_ids
+        self.authenticate('admin', 'admin')
+        wizard = self._refund_wizard(charge.payment_id, 50)
+        rejection = self._refund_response({'errors': [{'code': 'PAYMENT_NOT_REFUNDABLE'}]}, status=400)
+        with patch('odoo.addons.payment_square_online.square_api.request', return_value=rejection) as square:
+            first = self._refund_button('payment.refund.wizard', 'action_refund', wizard)
+            repeated = self._refund_button('payment.refund.wizard', 'action_refund', wizard)
+            square.assert_called_once()
+        self.assertEqual(first['res_id'], repeated['res_id'])
+        refund = charge.child_transaction_ids
+        self.assertEqual(refund.state, 'error')
+        self.assertIn('Square rejected the refund', refund.state_message)
+        self.assertEqual(refund.square_refund_requested_by_id, self.env.ref('base.user_admin'))
+        self.assertEqual(charge.payment_id.amount_available_for_refund, 50)
+        self.assertFalse(refund.payment_id)
+
+    def test_refund_response_loss_recovers_by_marker_and_known_id_without_another_post(self):
+        charge = self._captured_order().transaction_ids
+        self.authenticate('admin', 'admin')
+        wizard = self._refund_wizard(charge.payment_id, 50)
+        other_wizard = self._refund_wizard(charge.payment_id, 50)
+        accepted = {}
+
+        def square_refund(method, url, **kwargs):
+            if method == 'POST':
+                self.assertTrue(url.endswith('/v2/refunds'))
+                accepted.update({
+                    'id': 'SQ-REFUND-1', 'status': 'PENDING', 'location_id': 'TESTNYC',
+                    'payment_id': 'SQ-PAYMENT-1', 'amount_money': {'amount': 5000, 'currency': 'USD'},
+                    'reason': kwargs['json']['reason'],
+                })
+                raise Timeout('Square accepted the refund before the response was lost')
+            self.assertEqual(method, 'GET')
+            if url.endswith('/v2/refunds'):
+                self.assertEqual(kwargs['params']['location_id'], 'TESTNYC')
+                if kwargs['params'].get('cursor') == 'next-page':
+                    return self._refund_response({'refunds': [accepted]})
+                unrelated = {**accepted, 'reason': 'Square Dashboard', 'id': 'SQ-UNRELATED', 'status': 'COMPLETED'}
+                return self._refund_response({'refunds': [unrelated], 'cursor': 'next-page'})
+            self.assertTrue(url.endswith('/v2/refunds/SQ-REFUND-1'))
+            return self._refund_response({'refund': {**accepted, 'status': 'COMPLETED'}})
+
+        with patch('odoo.addons.payment_square_online.square_api.request', side_effect=square_refund) as square:
+            action = self._refund_button('payment.refund.wizard', 'action_refund', wizard)
+            self.assertEqual(self._refund_button('payment.refund.wizard', 'action_refund', wizard), action)
+            refund = charge.child_transaction_ids
+            self.assertEqual(refund.state, 'pending')
+            self.assertFalse(refund.provider_reference)
+            self.assertFalse(refund.payment_id)
+            self.assertEqual(charge.payment_id.amount_available_for_refund, 0)
+            wizard_fields = self._result('/web/dataset/call_kw', model='payment.refund.wizard', method='read',
+                                         args=[[other_wizard], ['has_pending_refund', 'refunded_amount']], kwargs={})
+            self.assertEqual(wizard_fields, [{'id': other_wizard, 'has_pending_refund': True, 'refunded_amount': 0}])
+            blocked = self._rpc('/web/dataset/call_button', model='payment.refund.wizard', method='action_refund',
+                                args=[[other_wizard]], kwargs={})
+            self.assertIn('no amount available', blocked['error']['data']['message'])
+            self._refund_button('payment.transaction', 'action_square_refresh_status', refund.id)
+            self.assertEqual(refund.provider_reference, 'SQ-REFUND-1')
+            self.assertEqual(refund.state, 'pending')
+            cron = self.env.ref('payment_square_online.ir_cron_square_online_reconcile')
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+            self._refund_button('ir.cron', 'method_direct_trigger', cron.id)
+        self.assertEqual([call.args[0] for call in square.call_args_list], ['POST', 'GET', 'GET', 'GET'])
+        self.assertEqual(refund.state, 'done')
+        self.assertEqual(refund.payment_id.payment_type, 'outbound')
+        self.assertEqual(refund.payment_id.source_payment_id, charge.payment_id)
+        self.assertEqual(self.env['account.payment'].search_count([('source_payment_id', '=', charge.payment_id.id)]), 1)
+
+    def test_square_refund_actions_deny_unauthorized_users_and_companies(self):
+        charge = self._captured_order().transaction_ids
+        other_company = self.env['res.company'].create({'name': 'Other refund company'})
+        accountant = new_test_user(self.env, login='square_refund_clerk', password='square_refund_clerk',
+                                   groups='account.group_account_invoice', company_id=self.company.id)
+        manager = new_test_user(self.env, login='square_refund_other', password='square_refund_other',
+                                groups='account.group_account_manager', company_id=other_company.id)
+        with patch('odoo.addons.payment_square_online.square_api.request') as square:
+            for user in (accountant, self.customer, manager):
+                with self.subTest(user=user.login):
+                    self.authenticate(user.login, user.login)
+                    for model, method, target in (
+                        ('payment.transaction', 'action_refund', charge),
+                        ('account.payment', 'action_refund_wizard', charge.payment_id),
+                    ):
+                        result = self._rpc('/web/dataset/call_button', model=model, method=method,
+                                           args=[target.ids], kwargs={})
+                        self.assertEqual(result['error']['data']['name'], 'odoo.exceptions.AccessError')
+            square.assert_not_called()
+        self.assertFalse(charge.child_transaction_ids)
+
     def test_declined_card_leaves_the_order_payable_again(self):
         order = self._cart()
         declined = self._prepare(order)

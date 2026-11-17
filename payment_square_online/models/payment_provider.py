@@ -200,6 +200,10 @@ class PaymentProvider(models.Model):
             'url': f'{SQUARE_BASE_URLS[self.square_environment]}/oauth2/authorize?{urlencode(params)}',
         }
 
+    def _compute_feature_support_fields(self):
+        super()._compute_feature_support_fields()
+        self.filtered(lambda provider: provider.code == 'square_online').support_refund = 'full_only'
+
     def _get_default_payment_method_codes(self):
         if self.code == 'square_online':
             return {'card'}

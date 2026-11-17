@@ -77,6 +77,8 @@ class PaymentTransaction(models.Model):
         """Read and apply an existing operation under the same lock as checkout dispatch."""
         self.ensure_one()
         self._square_lock_for_status()
+        if self.operation == 'refund':
+            return self._square_refresh_refund()
         if self.operation != 'online_direct':
             return False
         if not self.square_dispatched_at:
@@ -165,7 +167,7 @@ class PaymentTransaction(models.Model):
     @api.model
     def _square_payment_recovery_domain(self):
         return [
-            ('provider_code', '=', 'square_online'), ('operation', '=', 'online_direct'),
+            ('provider_code', '=', 'square_online'), ('operation', 'in', ('online_direct', 'refund')),
             ('square_reserved_at', '!=', False),
             '|', ('state', '=', 'pending'), '&', ('state', '=', 'done'), ('is_post_processed', '=', False),
         ]
