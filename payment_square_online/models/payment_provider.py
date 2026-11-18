@@ -220,7 +220,10 @@ class PaymentProvider(models.Model):
             amount_minor = payment_utils.to_minor_currency_units(amount, currency)
             payable_amount = payment_utils.to_major_currency_units(amount_minor, currency)
             # Allow float representation noise without applying Odoo's currency rounding.
-            has_exact_amount = amount_minor > 0 and isclose(amount, payable_amount, rel_tol=0, abs_tol=ulp(amount))
+            has_exact_amount = (
+                0 < amount_minor <= 2147483647  # The transaction stores minor units as a PostgreSQL integer.
+                and isclose(amount, payable_amount, rel_tol=0, abs_tol=ulp(amount))
+            )
         unavailable = providers.filtered(lambda p: p.code == 'square_online' and not (
             has_exact_amount and p.company_id.id == company_id
             and (not p.website_id or p.website_id.id == kwargs.get('website_id'))

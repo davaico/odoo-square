@@ -11,7 +11,10 @@ class SquareAPIError(Exception):
 
     @property
     def is_authorization_error(self):
-        return self.status in (401, 403)
+        return self.status == 401 or (
+            self.status in (400, 403)
+            and bool({'ACCESS_TOKEN_EXPIRED', 'ACCESS_TOKEN_REVOKED', 'INSUFFICIENT_SCOPES'}.intersection(self.codes))
+        )
 
 
 def square_request(environment, method, path, *, access_token=None, payload=None, params=None):

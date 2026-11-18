@@ -123,7 +123,9 @@ class PaymentTransaction(models.Model):
         except UserError:
             self._set_error(_("Could not start the Square payment. No payment was sent. Please try again."))
         except SquareAPIError as error:
-            if error.is_authorization_error:
+            if error.is_authorization_error or (
+                error.status == 403 and set(error.codes) == {'CARD_PROCESSING_NOT_ENABLED'}
+            ):
                 self._set_error(_("Square is unavailable. No payment was collected. Choose another payment method."))
             elif error.status in (400, 402) and error.codes and set(error.codes) <= _DEFINITIVE_REJECTIONS:
                 codes = set(error.codes)

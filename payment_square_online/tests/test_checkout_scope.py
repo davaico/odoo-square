@@ -341,6 +341,20 @@ class TestSquareCheckoutScope(HttpCase):
             square.assert_not_called()
         self.assertFalse(order.transaction_ids)
 
+    def test_checkout_hides_square_above_the_storable_minor_unit_limit(self):
+        currency = self.env.ref('base.USD')
+        provider = self._configure_provider(self.company, self.website, 'US-LIMIT', 'US', 'USD')
+        order = self._cart(self.website, currency, 20000000, 5)
+        self.assertEqual(order.amount_total, 22000005)
+        with patch('odoo.addons.payment_square_online.square_api.request') as square:
+            self.assertFalse(self._square_forms())
+            result = self._rpc(
+                f'/shop/payment/transaction/{order.id}', **self._prepare_params(order, provider, 'stale-form'),
+            )
+            self.assertIn('Square is unavailable', result['error']['data']['message'])
+            square.assert_not_called()
+        self.assertFalse(order.transaction_ids)
+
     def test_checkout_rechecks_publication_currency_and_location_before_sending_payment(self):
         provider = self._configure_provider(self.company, self.website, 'US-FIRST', 'US', 'USD')
         order = self._cart(self.website, self.env.ref('base.USD'), 40.15, 6.26)

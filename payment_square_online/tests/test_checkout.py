@@ -779,19 +779,22 @@ class TestSquareCheckout(SquareCheckoutCase):
     def test_refund_rejection_releases_the_balance_without_retrying_the_same_wizard(self):
         charge = self._captured_order().transaction_ids
         self.authenticate('admin', 'admin')
-        wizard = self._refund_wizard(charge.payment_id, 50)
-        rejection = self._refund_response({'errors': [{'code': 'PAYMENT_NOT_REFUNDABLE'}]}, status=400)
-        with patch('odoo.addons.payment_square_online.square_api.request', return_value=rejection) as square:
-            first = self._refund_button('payment.refund.wizard', 'action_refund', wizard)
-            repeated = self._refund_button('payment.refund.wizard', 'action_refund', wizard)
-            square.assert_called_once()
-        self.assertEqual(first['res_id'], repeated['res_id'])
-        refund = charge.child_transaction_ids
-        self.assertEqual(refund.state, 'error')
-        self.assertIn('Square rejected the refund', refund.state_message)
-        self.assertEqual(refund.square_refund_requested_by_id, self.env.ref('base.user_admin'))
-        self.assertEqual(charge.payment_id.amount_available_for_refund, 50)
-        self.assertFalse(refund.payment_id)
+        for code in ('PAYMENT_NOT_REFUNDABLE', 'GENERIC_DECLINE'):
+            with self.subTest(code=code):
+                wizard = self._refund_wizard(charge.payment_id, 50)
+                rejection = self._refund_response({'errors': [{'code': code}]}, status=400)
+                with patch('odoo.addons.payment_square_online.square_api.request', return_value=rejection) as square:
+                    first = self._refund_button('payment.refund.wizard', 'action_refund', wizard)
+                    repeated = self._refund_button('payment.refund.wizard', 'action_refund', wizard)
+                    square.assert_called_once()
+                self.assertEqual(first['res_id'], repeated['res_id'])
+                refund = self.env['payment.transaction'].browse(first['res_id'])
+                self.assertIn(refund, charge.child_transaction_ids)
+                self.assertEqual(refund.state, 'error')
+                self.assertIn('Square rejected the refund', refund.state_message)
+                self.assertEqual(refund.square_refund_requested_by_id, self.env.ref('base.user_admin'))
+                self.assertEqual(charge.payment_id.amount_available_for_refund, 50)
+                self.assertFalse(refund.payment_id)
 
     def test_accounting_manager_issues_successive_partial_refunds_and_the_remainder(self):
         self.env['ir.config_parameter'].set_param('sale.automatic_invoice', 'True')
@@ -1060,18 +1063,19 @@ class TestSquareCheckout(SquareCheckoutCase):
 
     def test_definitive_square_rejections_release_checkout_for_a_safe_retry(self):
         order = self._cart()
-        for code, message in (
-            ('AMOUNT_TOO_LOW', 'payment amount'),
-            ('VERIFY_BUYER_FAILED', 'authentication'),
-            ('PAYMENT_AMOUNT_MISMATCH', 'payment amount'),
-            ('INVALID_LOCATION', 'unavailable'),
+        for status, code, message in (
+            (400, 'AMOUNT_TOO_LOW', 'payment amount'),
+            (400, 'VERIFY_BUYER_FAILED', 'authentication'),
+            (400, 'PAYMENT_AMOUNT_MISMATCH', 'payment amount'),
+            (400, 'INVALID_LOCATION', 'unavailable'),
+            (403, 'CARD_PROCESSING_NOT_ENABLED', 'unavailable'),
         ):
             with self.subTest(code=code):
                 prepared = self._prepare(order)
 
                 def rejected(method, url, **kwargs):
                     if url.endswith('/v2/payments'):
-                        return self._square_error_response(400, code)
+                        return self._square_error_response(status, code)
                     return self._square_response(method, url, **kwargs)
 
                 with patch('odoo.addons.payment_square_online.square_api.request', side_effect=rejected) as square:
