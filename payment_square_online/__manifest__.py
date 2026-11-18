@@ -1,6 +1,6 @@
 {
     "name": "Square Online Payments",
-    "summary": "Connect a Square account to Odoo website payments",
+    "summary": "Accept Square card payments at Odoo website checkout",
     "description": (
         "Connect your Square merchant account to a self-hosted Odoo 18 Community store. "
         "Customers pay through the embedded Square card form, and accounting managers "
@@ -10,6 +10,10 @@
     ),
     "version": "18.0.1.0.0",
     "category": "Accounting/Payment Providers",
+    "author": "Davai",
+    "website": "https://github.com/davaico/odoo-square",
+    "support": "support@davai.co",
+    "images": ["static/description/square-online-payments.png"],
     "license": "AGPL-3",
     "depends": ["account_payment", "website_sale"],
     "external_dependencies": {"python": ["cryptography", "requests"]},
