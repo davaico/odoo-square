@@ -59,7 +59,7 @@ DB_PASSWORD=ci_odoo_test docker compose -f docker-compose.test.yml run --rm odoo
     --test-enable \
     --workers=0 \
     --stop-after-init \
-    --test-tags=odoo_square \
+    --test-tags=/odoo_square \
     --log-level=test
 ```
 

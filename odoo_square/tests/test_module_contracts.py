@@ -3,7 +3,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import json
 
-from odoo.modules.module import load_information_from_description_file
+from odoo.modules.module import get_manifest
 from odoo.tests import TransactionCase
 from odoo.tests.common import tagged
 
@@ -13,7 +13,7 @@ class TestSquareModuleContracts(TransactionCase):
     """Low-level contracts that keep the addon installable and operable."""
 
     def test_manifest_metadata_matches_odoo_addon_conventions(self):
-        manifest = load_information_from_description_file("odoo_square")
+        manifest = get_manifest("odoo_square")
 
         self.assertEqual(manifest["license"], "AGPL-3")
         self.assertEqual(manifest["version"], "17.0.1.4.0")
