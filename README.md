@@ -23,7 +23,7 @@ For Odoo website checkout, install **Square Online Payments**. You can install e
 
 ## Requirements
 
-- A fresh Odoo 19.0 Community database and PostgreSQL. The included Compose setup uses the official Odoo Community image and PostgreSQL 17.
+- A fresh Odoo 19.0 Community database and PostgreSQL. The included Compose setup builds from the official Odoo Community image with Ubuntu package updates and uses PostgreSQL 17.
 - Python package `requests` in the Odoo environment. The Compose image includes it.
 - A Square Developer account with an application, access token, location IDs, and webhook signature key.
 - Docker and Docker Compose for the included local setup.
@@ -56,6 +56,7 @@ cp .env.example .env
 Set `DB_PASSWORD` in `.env`. Install the addon into the fresh database, then start Odoo.
 
 ```bash
+docker compose build --pull
 docker compose run --rm odoo odoo --database=odoo_square_v19 --init=odoo_square --stop-after-init
 docker compose up -d
 ```
@@ -97,6 +98,15 @@ Start the local stack.
 ```bash
 docker compose up -d
 ```
+
+To refresh the Odoo 19.0 and PostgreSQL 17 images and apply current Ubuntu package updates, rebuild the images and recreate the services with the existing volumes.
+
+```bash
+docker compose build --pull --no-cache
+docker compose up -d
+```
+
+When updating to PostgreSQL 17.12, review its migration notes for affected indexes and incremental backups. [PostgreSQL 17.12 release notes](https://www.postgresql.org/docs/17/release-17-12.html)
 
 Follow Odoo logs.
 

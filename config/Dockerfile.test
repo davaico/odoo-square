@@ -1,13 +1,15 @@
-FROM odoo:19.0-20260908
+FROM odoo:19.0
 
 USER root
-RUN curl --fail --location --show-error \
-        --output /tmp/google-chrome-stable.deb \
-        https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_153.0.8010.52-1_amd64.deb \
-    && echo "29e0e4b5af01213915ffdb7f4e49a11956dc5fc591165c85af8688dcdff907ac  /tmp/google-chrome-stable.deb" \
-        | sha256sum --check --strict \
-    && apt-get update \
-    && apt-get install --yes --no-install-recommends /tmp/google-chrome-stable.deb python3-websocket \
-    && rm -f /tmp/google-chrome-stable.deb \
+RUN export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl --fail --location --silent --show-error \
+        --output /etc/apt/keyrings/google-chrome.asc \
+        https://dl.google.com/linux/linux_signing_key.pub \
+    && printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.asc] https://dl.google.com/linux/chrome/deb/ stable main' \
+        > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update -o APT::Update::Error-Mode=any \
+    && apt-get upgrade --yes \
+    && apt-get install --yes --no-install-recommends google-chrome-stable python3-websocket \
     && rm -rf /var/lib/apt/lists/*
 USER odoo
