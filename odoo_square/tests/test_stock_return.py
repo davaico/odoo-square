@@ -216,7 +216,7 @@ class TestStockReturn(SquareHttpCase):
         allocation.product_return_moves.quantity = quantity
         action = allocation.action_create_returns()
         returned = self.env["stock.picking"].browse(action["res_id"])
-        returned.with_context(force_validate=True).button_validate()
+        returned._validate_square_picking()
         self.assertEqual(returned.state, "done")
         self.assertEqual(self._get_stock(self.product, self.warehouse), 4)
         quantity, still_remaining = move._allocate_square_return_quantity(remainder, dozen, unit)
@@ -334,12 +334,12 @@ class TestStockReturn(SquareHttpCase):
         move_line.copy({"quantity": 1})
         self.assertEqual(len(move.move_line_ids), 2)
 
-        return_picking.with_context(force_validate=True).button_validate()
+        return_picking._validate_square_picking()
 
         self.assertEqual(
             return_picking.state,
             "done",
-            "Incoming picking with force_validate should be fully validated",
+            "Square return should be fully validated",
         )
 
         self.assertEqual(move.quantity, 2)

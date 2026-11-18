@@ -25,7 +25,11 @@ class SquareRefund(models.Model):
 
     # Square Data
     square_refund_id = fields.Char(
-        string="Square Refund ID", required=True, index=True, copy=False
+        string="Square Refund ID", index=True, copy=False
+    )
+    unverified_square_refund_id = fields.Char(
+        string="Unverified Legacy Refund ID", readonly=True, copy=False,
+        help="Original identifier retained with historical documents after the refund was quarantined.",
     )
     square_order_id = fields.Char(string="Square Order ID", required=True, index=True)
 
@@ -92,6 +96,11 @@ class SquareRefund(models.Model):
         "Square Refund ID must be unique.",
     )
 
+    _square_refund_identity = models.Constraint(
+        "CHECK ((square_refund_id IS NULL) <> (unverified_square_refund_id IS NULL))",
+        "A refund must have either a Square refund ID or an unverified legacy refund ID.",
+    )
+
     @api.model
     def _track_visibility(self):
         """Track visibility for refund status changes"""
@@ -104,10 +113,12 @@ class SquareRefund(models.Model):
             }
         }
 
-    @api.depends("square_refund_id", "status", "refund_amount")
+    @api.depends("square_refund_id", "unverified_square_refund_id", "status", "refund_amount")
     def _compute_display_name(self):
         for record in self:
-            if record.square_refund_id:
+            if record.unverified_square_refund_id:
+                record.display_name = f"Unverified legacy refund {record.unverified_square_refund_id}"
+            elif record.square_refund_id:
                 record.display_name = f"Refund {record.square_refund_id} - {record.status.title()} - {record.refund_amount} {record.currency_id.name}"
             else:
                 record.display_name = f"Refund - {record.status.title()}"
@@ -121,6 +132,8 @@ class SquareRefund(models.Model):
         order_id = refund_data.get("order_id")
         refund_status = refund_data.get("status")
 
+        if not refund_id:
+            return {"status": "error", "message": "No refund ID in Square webhook"}
         routing = self.env["square.order.processor"]._square_online_event_result(
             order_id=order_id, payment_id=refund_data.get("payment_id"), refund_id=refund_id,
             location_id=refund_data.get("location_id"),
@@ -342,7 +355,7 @@ class SquareRefund(models.Model):
             try:
                 self.env["square.integration.log"].sudo()._log_error(
                     title=f"Refund {event_type} Processing Error",
-                    error_message=str(e),
+                    error_message=type(e).__name__,
                     square_order_id=(
                         refund_data.get("order_id") if refund_data else None
                     ),
@@ -560,7 +573,7 @@ class SquareRefund(models.Model):
             "webhook_event_id": refund_data.get("webhook_event_id"),
         }
 
-        # A legacy refund row may have been removed. Reuse a reversal created
+        # A legacy refund row may have been quarantined. Reuse a reversal created
         # by the integration for this exact refund and sale, if there is one.
         bot_user = self._get_bot_user()
         credit_note = self._find_square_refund_credit_note(sale_order, square_refund_id, bot_user)
@@ -793,10 +806,9 @@ class SquareRefund(models.Model):
                     lambda picking: picking.state not in ("done", "cancel")
                 ):
                     picking.with_user(bot_user).with_context(
-                        force_validate=True,
                         mail_auto_subscribe_no_notify=True,
                         mail_create_nosubscribe=True,
-                    ).button_validate()
+                    )._validate_square_picking()
                     if picking.state != "done":
                         raise UserError(f"Impossible de valider le retour {picking.name}")
 
@@ -1053,6 +1065,7 @@ class SquareRefund(models.Model):
             lambda picking: not picking.square_exchange_order_id
         )
         other_refunds = self.search([
+            ("square_refund_id", "!=", False),
             ("id", "!=", self.id),
             ("return_picking_ids", "in", candidate_returns.ids),
         ])

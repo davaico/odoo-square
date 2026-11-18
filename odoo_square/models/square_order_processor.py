@@ -8,6 +8,10 @@ import logging
 _logger = logging.getLogger(__name__)
 
 
+class SquareOrderCompletionDeferred(UserError):
+    """Retry this Square event after its Odoo business effects have rolled back."""
+
+
 class SquareOrderProcessor(models.Model):
     _name = "square.order.processor"
     _description = "Square Order Processor"
@@ -134,6 +138,8 @@ class SquareOrderProcessor(models.Model):
                                 self.env[
                                     "square.webhook.queue"
                                 ].sudo()._process_pending_for_order(order_id)
+                            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                                raise
                             except Exception as queue_error:
                                 _logger.warning(
                                     f"Error processing queued events after order creation: {str(queue_error)}"
@@ -178,6 +184,8 @@ class SquareOrderProcessor(models.Model):
                                     "state": order_state,
                                     "message": "Order not found - event queued for retry",
                                 }
+                            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                                raise
                             except Exception as queue_error:
                                 _logger.error(
                                     f"Failed to queue event {event_id}: {str(queue_error)}"
@@ -237,6 +245,8 @@ class SquareOrderProcessor(models.Model):
                     )
 
             return result
+        except SquareOrderCompletionDeferred as error:
+            return {"status": "retry", "message": str(error)}
         except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
             raise
         except Exception as e:
@@ -489,7 +499,7 @@ class SquareOrderProcessor(models.Model):
                     sale_order, square_order_data
                 ) is False:
                     result.update(
-                        status="error",
+                        status="retry",
                         message="Could not post all cancellation credit notes",
                     )
                     return result
@@ -561,19 +571,14 @@ class SquareOrderProcessor(models.Model):
                 f"Order {sale_order.name} already confirmed (state: {sale_order.state}), skipping confirmation"
             )
 
-        # Step 2: Generate and validate invoice
+        # Delivered-quantity invoice policies need completed stock moves first.
+        self._create_stock_movements(sale_order, square_order_data.get("location_id"))
+
+        # Generate and validate the invoice
         if sale_order.invoice_ids.filtered(lambda inv: inv.state == "posted"):
             self._settle_existing_order_invoice(sale_order, square_order_data)
         else:
             self._create_and_validate_invoice(sale_order, square_order_data)
-
-        # Step 3: Create stock movements
-        square_location_id = square_order_data.get("location_id")
-        self._create_stock_movements(sale_order, square_location_id)
-
-        # TODO: fix TTC ammout
-        # Step 4: Recalculate totals
-        # sale_order._amount_all()
 
         # Log to integration dashboard
         self.env["square.integration.log"]._log_square_event(
@@ -1254,8 +1259,7 @@ class SquareOrderProcessor(models.Model):
             return_picking.action_confirm()
             return_picking.action_assign()
             
-            # Validate with force_validate context
-            return_picking.with_context(force_validate=True).button_validate()
+            return_picking._validate_square_picking()
             
             _logger.info(f"Created and validated manual return picking {return_picking.name}, state={return_picking.state}")
             return return_picking
@@ -1284,7 +1288,7 @@ class SquareOrderProcessor(models.Model):
 
         result = wizard.action_create_returns()
         picking = self.env["stock.picking"].browse(result["res_id"])
-        picking.with_context(force_validate=True).button_validate()
+        picking._validate_square_picking()
         if picking.state != "done":
             raise UserError(f"Could not complete the Square exchange return {picking.name}")
         return picking
@@ -1528,10 +1532,9 @@ class SquareOrderProcessor(models.Model):
 
                     if picking.state in ["assigned", "confirmed", "waiting"]:
                         picking.with_user(bot_user).with_context(
-                            force_validate=True,
                             mail_auto_subscribe_no_notify=True,
                             mail_create_nosubscribe=True,
-                        ).button_validate()
+                        )._validate_square_picking()
                     if picking.state != "done":
                         raise UserError(f"Could not complete the Square replacement delivery {picking.name}")
 
@@ -1669,7 +1672,8 @@ class SquareOrderProcessor(models.Model):
         ):
             return False
         if self._has_verified_order_payment(invoice, sale_order, notification, square_order=square_order):
-            return self._create_payment_for_invoice(invoice, sale_order, self._get_square_bot_user())
+            self._create_payment_for_invoice(invoice, sale_order, self._get_square_bot_user())
+            return True
         return False
 
     def _has_verified_order_payment(self, invoice, sale_order, notification, *, square_order=None):
@@ -1731,10 +1735,7 @@ class SquareOrderProcessor(models.Model):
             invoices = sale_order.with_user(bot_user)._create_invoices()
 
             if not invoices:
-                _logger.error(
-                    f"Failed to create invoice for sale order {sale_order.name}"
-                )
-                return None
+                raise SquareOrderCompletionDeferred("Could not invoice the Square order.")
 
             # Get the first invoice if it's a recordset
             invoice = invoices[0] if len(invoices) > 1 else invoices
@@ -1806,25 +1807,13 @@ class SquareOrderProcessor(models.Model):
             )
             return invoice
 
-        except Exception as e:
-            _logger.error(
-                f"Error creating invoice for sale order {sale_order.name}: {str(e)}",
-                exc_info=True,
-            )
-
-            # Log error to integration dashboard
-            try:
-                self.env["square.integration.log"]._log_error(
-                    title=f"Erreur création facture pour {sale_order.name}",
-                    error_message=f"Impossible de créer la facture pour la commande {sale_order.name}",
-                    technical_details=f"Commande: {sale_order.name}, Erreur: {str(e)}",
-                    square_order_id=sale_order.square_order_id,
-                    sale_order_id=sale_order.id,
-                )
-            except:
-                pass  # Don't let logging errors break the process
-
-            return None
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except SquareOrderCompletionDeferred:
+            raise
+        except Exception as error:
+            _logger.exception("Square invoicing failed for %s", sale_order.name)
+            raise SquareOrderCompletionDeferred("Could not invoice the Square order.") from error
 
     def _create_payment_for_invoice(self, invoice, sale_order, bot_user):
         """Create and register payment for Square invoice (already paid orders)"""
@@ -1834,8 +1823,7 @@ class SquareOrderProcessor(models.Model):
             payment_method_line = self._get_payment_method_line(payment_journal)
 
             if not payment_journal or not payment_method_line:
-                _logger.error("Missing payment journal or method line for Square payment")
-                return False
+                raise SquareOrderCompletionDeferred("Configure a Square payment journal and payment method.")
 
             _logger.info(f"Creating payment for invoice {invoice.name}")
 
@@ -1860,9 +1848,13 @@ class SquareOrderProcessor(models.Model):
             _logger.info(f"Successfully created payment for invoice {invoice.name}")
             return True
 
-        except Exception as e:
-            _logger.error(f"Failed to create payment for invoice {invoice.name}: {str(e)}")
-            return False
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except SquareOrderCompletionDeferred:
+            raise
+        except Exception as error:
+            _logger.exception("Square payment registration failed for invoice %s", invoice.name)
+            raise SquareOrderCompletionDeferred("Could not register the Square payment.") from error
 
     def _create_payment_for_credit_note(self, credit_note, sale_order, bot_user, refund_amount=None):
         """Create and register payment for Square credit note (refund processed)"""
@@ -2137,15 +2129,15 @@ class SquareOrderProcessor(models.Model):
                     if picking.state in ["assigned", "confirmed", "waiting"]:
                         _logger.info(
                             f"Validating picking {picking.name} in state {picking.state} "
-                            f"with force_validate context"
+                            f"from the Square order"
                         )
                         # Use bot user context and avoid mail subscription issues
-                        # force_validate=True allows validation even with negative stock
                         picking.with_user(bot_user).with_context(
-                            force_validate=True,
                             mail_auto_subscribe_no_notify=True,
                             mail_create_nosubscribe=True,
-                        ).button_validate()
+                        )._validate_square_picking()
+                    if picking.state != "done":
+                        raise SquareOrderCompletionDeferred("Could not complete the Square delivery.")
 
             # Add chatter message for stock movements
             processed_pickings = sale_order.picking_ids.filtered(
@@ -2193,26 +2185,13 @@ class SquareOrderProcessor(models.Model):
 
             _logger.info(f"Processed stock movements for sale order {sale_order.name}")
 
-        except Exception as e:
-            error_msg = str(e)
-            _logger.error(
-                f"Error creating stock movements for sale order {sale_order.name}: {error_msg}",
-                exc_info=True,
-            )
-
-            # If it's a mail follower issue, provide a more specific error
-            if (
-                "operator does not exist: integer = boolean" in error_msg
-                or "mail_followers" in error_msg
-            ):
-                _logger.warning(
-                    f"Mail follower issue detected for sale order {sale_order.name}. "
-                    f"This may be due to user/partner configuration issues. "
-                    f"The order has been processed but stock movements may need manual validation."
-                )
-
-            # Don't re-raise the exception to avoid aborting the entire transaction
-            # The order processing should continue even if stock movements fail
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except SquareOrderCompletionDeferred:
+            raise
+        except Exception as error:
+            _logger.exception("Square delivery failed for order %s", sale_order.name)
+            raise SquareOrderCompletionDeferred("Could not deliver the Square order.") from error
 
     def _get_configured_warehouse(self):
         """Get the configured warehouse from Square configuration (legacy method)"""

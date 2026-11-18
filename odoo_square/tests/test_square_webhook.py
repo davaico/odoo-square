@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
 from unittest.mock import patch
+from requests import Response
 import logging
 from odoo.tests.common import tagged
 from odoo.tools import mute_logger
@@ -440,6 +441,46 @@ class TestSquareWebhook(SquareHttpCase):
         response_data = response.json()
         self.assertEqual(response_data["status"], "ignored")
         self.assertIn("not handled", response_data["message"])
+
+    def test_customer_import_logs_keep_contact_and_http_response_private(self):
+        order_id = "square-order-log-test"
+        customer_id = "square-customer-log-test"
+        customer = {
+            "given_name": "Logprivate", "family_name": "Customer",
+            "email_address": self.partner.email, "phone_number": self.partner.phone,
+            "address": {"address_line_1": "7 Private Road"},
+        }
+        order = {"id": order_id, "customer_id": customer_id, "fulfillments": [{
+            "pickup_details": {"recipient": {"display_name": "Logprivate Customer", **customer}},
+        }]}
+        order_response = Response()
+        order_response.status_code = 200
+        order_response._content = json.dumps({"order": order}).encode()
+        customer_response = Response()
+        customer_response.status_code = 200
+        customer_response._content = json.dumps({"customer": customer}).encode()
+        failure = Response()
+        failure.status_code = 503
+        failure.reason = "Private upstream reason"
+        failure._content = b'{"errors":[{"detail":"Private upstream response"}]}'
+
+        with self.assertLogs("odoo.addons.odoo_square", level="INFO") as captured, patch(
+            "odoo.addons.odoo_square.models.square_api_client.requests.get",
+            side_effect=[order_response, customer_response, order_response, failure],
+        ) as get:
+            for _ in range(2):
+                matched, _payload = self.env["sale.order"]._get_or_create_customer_from_square({"id": order_id})
+                self.assertEqual(matched, self.partner)
+            self.assertEqual(get.call_count, 4)
+
+        messages = "\n".join(captured.output)
+        self.assertIn(order_id, messages)
+        self.assertIn("503", messages)
+        for private in (
+            "Logprivate", self.partner.name, self.partner.email, self.partner.phone, "7 Private Road",
+            failure.reason, "Private upstream response", self.square_config.square_access_token,
+        ):
+            self.assertNotIn(private, messages)
 
     def test_customer_matching_by_email(self):
         """Test customer matching by email"""
@@ -1074,10 +1115,9 @@ class TestSquareWebhook(SquareHttpCase):
                 # The key test: this should not cause the mail follower SQL error
                 if test_picking.state == "assigned":
                     test_picking.with_user(bot_user).with_context(
-                        force_validate=True,
                         mail_auto_subscribe_no_notify=True,
                         mail_create_nosubscribe=True,
-                    ).button_validate()
+                    )._validate_square_picking()
 
                 # If we get here without SQL errors, the fix is working
                 success = True

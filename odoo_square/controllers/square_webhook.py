@@ -10,6 +10,8 @@ from odoo import http, fields
 from odoo.http import request
 from odoo.exceptions import UserError, ValidationError, AccessError
 
+from ..models.square_order_processor import SquareOrderCompletionDeferred
+
 _logger = logging.getLogger(__name__)
 
 
@@ -137,8 +139,7 @@ class SquareWebhookController(http.Controller):
             if authenticated:
                 request.env["square.integration.log"].sudo()._log_error(
                     title="Webhook Processing Error",
-                    error_message=str(e),
-                    technical_details=f"Event type: {event_type if 'event_type' in locals() else 'Unknown'}\nError: {str(e)}",
+                    error_message=type(e).__name__,
                 )
 
             return http.Response(
@@ -401,16 +402,19 @@ class SquareWebhookController(http.Controller):
                 return result
             processor = processor.with_user(processor.sudo()._get_square_bot_user())
             sale_order = processor._check_existing_order(order_id)
-            if sale_order and processor._settle_existing_order_invoice(
-                sale_order, payment_data, square_order=order_data,
-            ):
-                receipts._record_applied("payment.updated", payment_id, webhook_event_id)
+            with request.env.cr.savepoint():
+                if sale_order and processor._settle_existing_order_invoice(
+                    sale_order, payment_data, square_order=order_data,
+                ):
+                    receipts._record_applied("payment.updated", payment_id, webhook_event_id)
             return {
                 "status": "success",
                 "message": "Payment processed, no exchange detected",
                 "payment_id": payment_id,
             }
 
+        except SquareOrderCompletionDeferred as error:
+            return {"status": "retry", "message": str(error)}
         except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
             raise
         except Exception as e:

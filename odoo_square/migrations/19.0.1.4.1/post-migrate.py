@@ -52,12 +52,15 @@ def migrate(cr, version):
     # Old refund data was editable by sales staff, including its identity and
     # document links. Preserve supported completions and release tainted IDs
     # so a new signed event can rebuild the record from Square and Odoo.
-    refunds = env["square.refund"].search([])
+    refunds = env["square.refund"].search([("square_refund_id", "!=", False)])
     for refund in refunds:
         if refund.processed_at and refund._has_settled_refund():
             continue
         if refund.create_uid not in trusted_users or refund.write_uid not in trusted_users:
-            refund.unlink()
+            refund.write({
+                "unverified_square_refund_id": refund.square_refund_id,
+                "square_refund_id": False,
+            })
         elif refund.processed_at:
             refund.processed_at = False
 

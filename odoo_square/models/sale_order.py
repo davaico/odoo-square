@@ -108,13 +108,16 @@ class SaleOrder(models.Model):
         for order in self:
             order.is_square_order = bool(order.square_order_id)
 
-    @api.depends("square_refund_ids.refund_amount", "square_refund_ids.status", "square_refund_ids.processed_at")
+    @api.depends(
+        "square_refund_ids.square_refund_id", "square_refund_ids.refund_amount",
+        "square_refund_ids.status", "square_refund_ids.processed_at",
+    )
     def _compute_total_refunded_amount(self):
         """Compute total refunded amount"""
         for order in self:
             # Get all completed refunds
             completed_refunds = order.square_refund_ids.filtered(
-                lambda r: r.status == "completed" and r.processed_at
+                lambda r: r.square_refund_id and r.status == "completed" and r.processed_at
             )
 
             # Calculate total refunded amount
@@ -122,6 +125,7 @@ class SaleOrder(models.Model):
             order.total_refunded_amount = total_refunded
 
     @api.depends(
+        "square_refund_ids.square_refund_id",
         "square_refund_ids.refund_amount",
         "square_refund_ids.status",
         "square_refund_ids.processed_at",
@@ -134,7 +138,7 @@ class SaleOrder(models.Model):
         for order in self:
             # Get all completed refunds
             completed_refunds = order.square_refund_ids.filtered(
-                lambda r: r.status == "completed" and r.processed_at
+                lambda r: r.square_refund_id and r.status == "completed" and r.processed_at
             )
 
             # Calculate total refunded amount for status determination
@@ -242,7 +246,7 @@ class SaleOrder(models.Model):
         try:
             tid = int(str(raw).strip())
         except (ValueError, TypeError):
-            _logger.warning("Invalid odoo_sales_team_id in Square metadata: %s", raw)
+            _logger.warning("Invalid odoo_sales_team_id in Square metadata")
             return Team.browse()
         team = Team.browse(tid)
         if team.exists() and self._sales_team_matches_company(team, company):
@@ -286,7 +290,7 @@ class SaleOrder(models.Model):
                 dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
             return dt
         except Exception:
-            _logger.warning("Could not parse Square created_at: %r", raw)
+            _logger.warning("Could not parse Square order creation date")
             return False
 
     def _square_backdate_sale_order_create_date(self, sale_order, create_dt):
@@ -420,18 +424,17 @@ class SaleOrder(models.Model):
 
         except Exception as e:
             _logger.error(
-                f"Error creating sale order from Square: {str(e)}", exc_info=True
+                "Square order creation failed (%s)", type(e).__name__
             )
 
             # Log error to integration dashboard
             try:
                 self.env["square.integration.log"]._log_error(
                     title="Order Creation Error",
-                    error_message=str(e),
+                    error_message=type(e).__name__,
                     square_order_id=(
                         square_data.get("order_id") if square_data else None
                     ),
-                    technical_details=f"Error: {str(e)}",
                 )
             except:
                 pass  # Don't let logging errors break the main process
@@ -546,9 +549,6 @@ class SaleOrder(models.Model):
                             customer_info["zip"] = address["postal_code"]
 
                     customer_info["square_customer_id"] = customer_id
-                    _logger.info(
-                        f"Retrieved customer details from Square API: {customer_info}"
-                    )
 
                     # If we got customer info from API, return it directly
                     if (
@@ -860,7 +860,7 @@ class SaleOrder(models.Model):
                 )
             else:
                 _logger.warning(
-                    f"Could not retrieve catalog object details for '{catalog_object_id}': {catalog_result}"
+                    "Could not retrieve Square catalog object %s", catalog_object_id
                 )
 
         if sku and not product:

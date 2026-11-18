@@ -5,6 +5,8 @@ import logging
 from odoo import api, fields, models
 from odoo.exceptions import ValidationError
 
+from .square_order_processor import SquareOrderCompletionDeferred
+
 _logger = logging.getLogger(__name__)
 
 
@@ -125,8 +127,10 @@ class SquareConfig(models.Model):
         )
 
         if mapping:
-            if not mapping.active or mapping.warehouse_id.company_id != self.company_id:
-                return self.env["stock.warehouse"]
+            if not mapping.active:
+                raise SquareOrderCompletionDeferred("The warehouse mapping for this Square location is archived.")
+            if mapping.warehouse_id.sudo().company_id != self.company_id:
+                raise SquareOrderCompletionDeferred("The Square location is mapped to a warehouse in another company.")
             _logger.info(
                 f"Using mapped warehouse '{mapping.warehouse_id.name}' for Square location '{square_location_id}'"
             )
@@ -323,89 +327,56 @@ class SquareConfig(models.Model):
         self.ensure_one()
         self.check_access("write")
 
-        try:
-            # Get Square API client
-            square_api = self.env["square.api.client"].with_company(self.company_id)
-            locations = square_api.get_locations()
-
-            if not locations:
-                _logger.warning("No Square locations found to sync")
-                return False
-
-            # Get existing mappings
-            existing_location_ids = set(
-                self.location_mapping_ids.mapped("square_location_id")
-            )
-
-            # Create mappings for new locations
-            new_mappings = []
-            for location in locations:
-                location_id = location.get("id")
-                location_name = location.get("name", "Unknown Location")
-
-                if location_id not in existing_location_ids:
-                    # Try to find a matching warehouse by name similarity or use first available
-                    suggested_warehouse = self._suggest_warehouse_for_location(
-                        location_name
-                    )
-
-                    new_mappings.append(
-                        {
-                            "square_location_id": location_id,
-                            "square_location_name": location_name,
-                            "warehouse_id": (
-                                suggested_warehouse.id if suggested_warehouse else False
-                            ),
-                        }
-                    )
-
-            # Create the new mappings
-            if new_mappings:
-                for mapping_vals in new_mappings:
-                    self.env["square.location.mapping"].create(
-                        {"config_id": self.id, **mapping_vals}
-                    )
-
-                _logger.info(f"Created {len(new_mappings)} new location mappings")
-
-            return True
-
-        except Exception as e:
-            _logger.error(f"Error syncing Square locations: {str(e)}")
+        locations = self.env["square.api.client"].with_company(self.company_id).get_locations()
+        if not locations:
+            _logger.warning("No Square locations found to sync")
             return False
+
+        existing_ids = set(
+            self.with_context(active_test=False).location_mapping_ids.mapped("square_location_id")
+        )
+        mappings = []
+        for location in locations:
+            location_id = location["id"]
+            if location_id in existing_ids:
+                continue
+            name = location.get("name") or "Unknown Location"
+            warehouse = self._suggest_warehouse_for_location(name)
+            mappings.append({
+                "config_id": self.id,
+                "square_location_id": location_id,
+                "square_location_name": name,
+                "warehouse_id": warehouse.id,
+            })
+            existing_ids.add(location_id)
+
+        if mappings:
+            with self.env.cr.savepoint():
+                self.env["square.location.mapping"].create(mappings)
+            _logger.info("Created %s new location mappings", len(mappings))
+        return True
 
     def _suggest_warehouse_for_location(self, location_name):
         """Suggest a warehouse for a Square location based on name similarity"""
         company_domain = [("company_id", "=", self.company_id.id)]
 
-        # First, try exact name match
-        exact_match = self.env["stock.warehouse"].search(
-            company_domain + [("name", "ilike", location_name)], limit=1
-        )
-
-        if exact_match:
-            return exact_match
-
-        # Try partial name match
-        partial_matches = self.env["stock.warehouse"].search(
-            company_domain + [("name", "ilike", f"%{location_name}%")]
-        )
-
-        if partial_matches:
-            return partial_matches[0]
+        warehouse = self.env["stock.warehouse"]
+        full_match = warehouse.search(company_domain + [("name", "ilike", location_name)], limit=1)
+        if full_match:
+            return full_match
 
         # Try location name in warehouse name
         location_words = location_name.lower().split()
         for word in location_words:
             if len(word) > 3:  # Only check meaningful words
-                word_match = self.env["stock.warehouse"].search(
-                    [("name", "ilike", f"%{word}%")], limit=1
+                word_match = warehouse.search(
+                    company_domain + [("name", "ilike", word)], limit=1
                 )
                 if word_match:
                     return word_match
 
         # Fallback to first available warehouse
-        return self.env["stock.warehouse"].search([("company_id", "=", self.company_id.id)], limit=1)
+        return warehouse.search(company_domain, limit=1)
 
     def action_open_manual_resync_wizard(self):
         """Open the manual resync wizard for missing orders"""

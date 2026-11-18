@@ -30,7 +30,7 @@ For Odoo website checkout, install **Square Online Payments**. You can install e
 
 ## Compatibility
 
-Use release branch `19.0` for Odoo 19 Community. The manifest version is `19.0.1.4.0`, where `19.0` is the Odoo series and `1.4.0` is the addon release version.
+Use release branch `19.0` for Odoo 19 Community. The manifest version is `19.0.1.4.2`, where `19.0` is the Odoo series and `1.4.2` is the addon release version.
 
 The addon manifest declares the following Odoo dependencies:
 
@@ -179,9 +179,12 @@ flowchart TB
 
 ## Operational Notes
 
+When upgrading Square POS Integration to `19.0.1.4.2`, update the installed module to apply the refund schema change. Unverified legacy refunds retain their claimed Square ID and document links for review. Confirmed Square deliveries can use the same ID to record the verified refund. If your installation already ran the 19.0.1.4.1 migration and a historical refund was removed, consult a backup taken before that operation for its original links.
+
 - Configure the webhook signature key in Odoo before exposing the endpoint publicly.
 - Keep Square access tokens out of Git. Use Odoo configuration records, environment-specific secrets management, or encrypted backups.
 - Map every active Square location to the intended Odoo warehouse before enabling production inventory sync.
+- Automatic stock counts are queued with the stock change. The **Square POS: Send inventory counts** scheduled action sends committed warehouse quantities every minute and retries failed requests after five minutes. A newer observation replaces an older queued count for the same SKU and location. Square accepts observations up to 24 hours old. After that, or after correcting an ambiguous SKU, use **Synchronize All Products** to send a fresh count.
 - Review **Square Integration Logs** after installation and after every Square credential or webhook change.
 - To recover missing Square orders, open **Manual Resync Orders** from **Square > Configuration**, scan the relevant dates, and select the orders to import.
 

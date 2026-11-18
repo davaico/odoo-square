@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 from unittest.mock import patch
 
 from odoo import fields
@@ -190,8 +191,17 @@ class TestSquarePosSecurity(SquareHttpCase):
             "square_order_id": sale.square_order_id,
             "order_data": json.dumps({"id": sale.square_order_id, "state": "CANCELED"}),
         })
+        cron = self.env.ref("odoo_square.cron_square_webhook_queue")
+        now = fields.Datetime.now()
+        self.env.cr.execute("UPDATE square_webhook_queue SET create_date = %s WHERE id = %s", (now - timedelta(days=45), self.queue.id))
+        queued.next_retry_time = now + timedelta(hours=1)
         self.authenticate("admin", "admin")
-        result = self._square_rpc("square.webhook.queue", "process_pending_events")
+        result = self._square_rpc("ir.cron", "method_direct_trigger", cron.ids)
+        self.assertNotIn("error", result)
+        self.assertEqual(queued.state, "pending")
+        self.assertEqual(self.queue.state, "failed")
+        queued.next_retry_time = now
+        result = self._square_rpc("ir.cron", "method_direct_trigger", cron.ids)
         self.assertNotIn("error", result)
         self.assertEqual(queued.state, "completed")
         self.assertEqual(self.queue.state, "failed")

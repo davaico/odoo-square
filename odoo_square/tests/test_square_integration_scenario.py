@@ -259,7 +259,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         )
         return sum(quants.mapped("quantity"))
 
-    def _send_square_order_event(self, event_type, event_id, state, **order_data):
+    def _send_square_order_event(self, event_type, event_id, state, *, expected_status_code=200, **order_data):
         payload = {
             "type": event_type,
             "event_id": event_id,
@@ -279,7 +279,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             data=json.dumps(payload),
             headers={"Content-Type": "application/json"},
         )
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, expected_status_code, response.text)
         return response.json()
 
     def _import_paid_square_sale(self):
@@ -545,8 +545,8 @@ class TestSquareIntegrationScenario(SquareHttpCase):
 
         event_id = "evt_cancellation_two_invoices"
         with patch.object(move_model, "action_post", post_except_second_reversal):
-            result = self._send_square_order_event("order.updated", event_id, "CANCELED")
-        self.assertEqual(result["status"], "error", result)
+            result = self._send_square_order_event("order.updated", event_id, "CANCELED", expected_status_code=503)
+        self.assertEqual(result["status"], "retry", result)
         first_reversal = first_invoice.reversal_move_ids
         self.assertEqual(len(first_reversal), 1)
         self.assertEqual(first_reversal.state, "posted")
@@ -665,7 +665,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
 
         self.created_invoice = invoice
 
-    def _send_square_exchange_event(self, event_type, event_id, object_type, data):
+    def _send_square_exchange_event(self, event_type, event_id, object_type, data, *, expected_status_code=200):
         response = self._post_signed_square_webhook(
             "/square/webhook",
             json={
@@ -674,7 +674,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                 "data": {"object": {object_type: data}},
             },
         )
-        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.status_code, expected_status_code, response.text)
         return response.json()
 
     def _run_square_exchange(self, replacement_cents, payment_cents, retry_after_catalog_failure=False):
@@ -1160,6 +1160,21 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             "status": "COMPLETED", "amount_money": tender["amount_money"],
         }
         with patch.object(SquareApiClient, "get_order", return_value=paid):
+            register = type(self.env["account.payment.register"])
+            create_payments = register.action_create_payments
+
+            def fail_after_registration(wizard):
+                create_payments(wizard)
+                raise UserError("Temporary failure after posting")
+
+            with patch.object(register, "action_create_payments", fail_after_registration):
+                result = self._send_square_exchange_event(
+                    "payment.updated", "evt_late_payment", "payment", payment, expected_status_code=503,
+                )
+            self.assertEqual(result["status"], "retry", result)
+            self.assertFalse(self.env["account.payment"].search([("partner_id", "=", self.customer.id)]))
+            self.assertEqual(imported.invoice_ids.amount_residual, imported.invoice_ids.amount_total)
+
             result = self._send_square_exchange_event("payment.updated", "evt_late_payment", "payment", payment)
             self.assertEqual(result["status"], "success", result)
             reconciled = imported.invoice_ids.reconciled_payment_ids
@@ -1171,6 +1186,39 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             self.assertEqual(imported.invoice_ids.reconciled_payment_ids, reconciled)
 
     def test_paid_sale_import_and_replay(self):
+        mapping = self.square_config.location_mapping_ids.filtered(lambda item: item.square_location_id == "L1")
+        mapping.active = False
+        result = self._send_square_order_event(
+            "order.updated", "evt_paid_sale_001", "COMPLETED", expected_status_code=503,
+        )
+        self.assertEqual(result["status"], "retry")
+        self.assertFalse(self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")]))
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w2), 50)
+        mapping.active = True
+        with patch.object(type(self.env["stock.picking"]), "button_validate", side_effect=UserError("Delivery blocked")):
+            result = self._send_square_order_event(
+                "order.updated", "evt_paid_sale_001", "COMPLETED", expected_status_code=503,
+            )
+        self.assertEqual(result["status"], "retry", result)
+        self.assertFalse(self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")]))
+        self.assertFalse(self.env["account.move"].search([("partner_id", "=", self.customer.id)]))
+        self.assertEqual(self._get_stock_quantity(self.product_p1, self.warehouse_w1), 50)
+
+        (self.product_p1 | self.product_p2).invoice_policy = "delivery"
+        with patch.object(
+            type(self.env["account.payment.register"]), "action_create_payments",
+            side_effect=UserError("Test journal failure"),
+        ):
+            result = self._send_square_order_event(
+                "order.updated", "evt_paid_sale_001", "COMPLETED", expected_status_code=503,
+            )
+        self.assertEqual(result["status"], "retry", result)
+        self.assertFalse(self.env["sale.order"].search([("square_order_id", "=", "ORDER_L1_001")]))
+        for model in ("account.move", "account.payment", "stock.picking"):
+            self.assertFalse(self.env[model].search([("partner_id", "=", self.customer.id)]))
+        self.assertFalse(self.env["square.event.receipt"].search([("event_key", "=", "evt_paid_sale_001")]))
+        for product in (self.product_p1, self.product_p2):
+            self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), 50)
         self._import_paid_square_sale()
 
         order_logs = self.env["square.integration.log"].search(
@@ -1292,6 +1340,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             "square_refund_id": refund_id,
             "square_order_id": order.square_order_id,
             "sale_order_id": unrelated.id,
+            "invoice_id": invoice.id,
             "refund_amount": 3.60,
             "status": "completed",
             "processed_at": datetime(2026, 1, 1),
@@ -1300,7 +1349,13 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             str(Path(__file__).resolve().parents[1] / "migrations/19.0.1.4.1/post-migrate.py")
         )["migrate"]
         migrate(self.env.cr, "19.0.1.4.0")
-        self.assertFalse(planted.exists())
+        self.assertTrue(planted.exists())
+        self.assertEqual(planted.unverified_square_refund_id, refund_id)
+        self.assertFalse(planted.square_refund_id)
+        self.assertEqual(planted.sale_order_id, unrelated)
+        self.assertEqual(planted.invoice_id, invoice)
+        self.assertEqual(unrelated.total_refunded_amount, 0)
+        self.assertEqual(unrelated.refund_status, "not_refunded")
         self.assertFalse(invoice.reversal_move_ids)
 
         result = self._send_square_refund_event(
@@ -1308,6 +1363,7 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         )
         self.assertEqual(result["status"], "success", result)
         refund = self._assert_refund_links(refund_id, 3.60)
+        self.assertNotEqual(refund, planted)
         self.assertEqual(refund.sale_order_id, order)
         self.assertTrue(refund.processed_at)
         self.assertEqual(invoice.reversal_move_ids, refund.credit_note_id)

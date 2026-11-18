@@ -3,7 +3,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 {
     "name": "Square POS Integration",
-    "version": "19.0.1.4.1",
+    "version": "19.0.1.4.2",
     "category": "Sales",
     "summary": "Complete Square POS integration for orders, refunds, exchanges and inventory sync",
     "description": """
@@ -13,7 +13,7 @@ A complete integration module connecting Odoo with Square POS system.
 
 Features:
 - Webhook processing for orders, refunds, and exchanges
-- Bidirectional inventory synchronization
+- Send Odoo stock counts to mapped Square locations
 - Smart customer matching (email → phone → name → auto-create)
 - Complete audit trail with integration logs
 - Support for full refunds, equivalent exchanges, and price-difference exchanges
@@ -29,6 +29,8 @@ Features:
         "security/ir.model.access.csv",
         "data/square_bot_user.xml",
         "data/square_products.xml",
+        "data/square_webhook_queue_cron.xml",
+        "data/square_stock_count_cron.xml",
         "views/views.xml",
         "views/square_config_views.xml",
         "views/square_stock_sync_views.xml",
