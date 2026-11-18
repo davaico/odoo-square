@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 import requests
-import json
 import logging
 from datetime import datetime, timezone
+from uuid import uuid4
 from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
-from odoo import models, api, fields
+from odoo import models, api
 from odoo.exceptions import UserError
 
 _logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ class SquareApiClient(models.Model):
     @api.model
     def _get_square_config(self):
         """Get Square configuration"""
-        config = self.env["square.config"].search([], limit=1)
+        config = self.env["square.config"].search([("company_id", "=", self.env.company.id), ("active", "=", True)], limit=1)
         if not config:
             raise UserError(
                 "No Square configuration found. Please configure Square integration first."
@@ -69,14 +69,9 @@ class SquareApiClient(models.Model):
             return response.json()
 
         except requests.exceptions.RequestException as e:
-            _logger.error(f"Square API request failed: {str(e)}")
-            if hasattr(e, "response") and e.response is not None:
-                try:
-                    error_data = e.response.json()
-                    _logger.error(f"Square API error response: {error_data}")
-                except:
-                    _logger.error(f"Square API error response (raw): {e.response.text}")
-            raise UserError(f"Failed to communicate with Square API: {str(e)}")
+            status = e.response.status_code if e.response is not None else None
+            _logger.error("Square API %s failed (%s, HTTP status %s)", method, type(e).__name__, status)
+            raise UserError("Failed to communicate with Square API.") from None
 
     @api.model
     def get_order(self, order_id, square_config=None):
@@ -126,9 +121,7 @@ class SquareApiClient(models.Model):
 
             if "customer" in response:
                 customer_data = response["customer"]
-                _logger.info(
-                    f"Retrieved customer {customer_id}: {customer_data.get('given_name', '')} {customer_data.get('family_name', '')}"
-                )
+                _logger.info("Retrieved Square customer details")
                 return customer_data
             else:
                 _logger.error(
@@ -245,6 +238,10 @@ class SquareApiClient(models.Model):
                 )
                 return {"success": True, "catalog_object_id": None, "not_found": True}
 
+            if len(response["objects"]) != 1 or response.get("cursor"):
+                _logger.warning("Multiple Square catalog variations match SKU %s", product_sku)
+                return {"ambiguous": True, "success": False, "catalog_object_id": None, "not_found": False}
+
             catalog_object_id = response["objects"][0]["id"]
             return {
                 "success": True,
@@ -317,8 +314,8 @@ class SquareApiClient(models.Model):
 
 
     @api.model
-    def set_physical_count(
-        self, catalog_object_id, location_id, target_quantity, product_sku
+    def _set_physical_count(
+        self, catalog_object_id, location_id, target_quantity, product_sku, *, request_id=None, occurred_at=None
     ):
         """
         Set exact inventory count in Square using PHYSICAL_COUNT
@@ -326,7 +323,7 @@ class SquareApiClient(models.Model):
         Args:
             catalog_object_id (str): Square catalog object ID
             location_id (str): Square location ID
-            target_quantity (int): Exact quantity to set
+            target_quantity (float): Exact quantity to set
             product_sku (str): Product SKU for logging
 
         Returns:
@@ -336,19 +333,20 @@ class SquareApiClient(models.Model):
             endpoint = "/v2/inventory/changes/batch-create"
 
             # Get current timestamp in ISO 8601 format for Square API
-            occurred_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            occurred_at = occurred_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            request_id = request_id or str(uuid4())
 
             data = {
-                "idempotency_key": f"odoo-count-{product_sku}-{fields.Datetime.now().strftime('%Y%m%d%H%M%S')}",
+                "idempotency_key": request_id,
                 "changes": [
                     {
                         "type": "PHYSICAL_COUNT",
                         "physical_count": {
-                            "reference_id": f"odoo-sync-{product_sku}-{fields.Datetime.now().strftime('%Y%m%d%H%M%S')}",
+                            "reference_id": f"odoo-sync-{request_id}",
                             "catalog_object_id": catalog_object_id,
                             "state": "IN_STOCK",
                             "location_id": location_id,
-                            "quantity": str(abs(target_quantity)),
+                            "quantity": f"{max(0, target_quantity):.5f}".rstrip("0").rstrip("."),
                             "occurred_at": occurred_at,
                         },
                     }
@@ -385,7 +383,7 @@ class SquareApiClient(models.Model):
             return []
 
     @api.model
-    def get_payment(self, payment_id):
+    def get_payment(self, payment_id, square_config=None):
         """
         Retrieve payment details from Square API
 
@@ -397,7 +395,7 @@ class SquareApiClient(models.Model):
         """
         try:
             endpoint = f"/v2/payments/{payment_id}"
-            response = self._make_api_request(endpoint)
+            response = self._make_api_request(endpoint, square_config=square_config)
 
             if "payment" in response:
                 payment_data = response["payment"]
@@ -513,7 +511,7 @@ class SquareApiClient(models.Model):
             "query": query,
         }
 
-        _logger.info("Square SearchOrders request: %s", base_data)
+        _logger.info("Searching Square orders for %s locations", len(loc_list))
 
         try:
             all_orders = []
@@ -531,10 +529,7 @@ class SquareApiClient(models.Model):
                 if not cursor:
                     break
             else:
-                _logger.warning(
-                    "Square SearchOrders: stopped after %s pages (max_pages)",
-                    max_pages,
-                )
+                raise UserError("The Square order search exceeded the page limit. Select a shorter date range.")
 
             _logger.info("Square SearchOrders: %s order(s) total", len(all_orders))
             return all_orders

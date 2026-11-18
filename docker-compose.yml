@@ -19,10 +19,12 @@ services:
       HOST: ${DB_HOST:-db}
       USER: ${DB_USER:-odoo}
       PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      SQUARE_ONLINE_ENCRYPTION_KEY: ${SQUARE_ONLINE_ENCRYPTION_KEY:-}
     volumes:
       - odoo_data:/var/lib/odoo
       - ./config/odoo.conf:/etc/odoo/odoo.conf:ro
       - ./odoo_square:/mnt/extra-addons/odoo_square:ro
+      - ./payment_square_online:/mnt/extra-addons/payment_square_online:ro
     ports:
       - "127.0.0.1:${ODOO_PORT:-8069}:8069"
     command:

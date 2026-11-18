@@ -3,6 +3,8 @@ import json
 import logging
 import uuid
 from odoo import models, fields, api
+from odoo.exceptions import AccessError
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from datetime import timedelta
 
 _logger = logging.getLogger(__name__)
@@ -17,6 +19,11 @@ class SquareWebhookQueue(models.Model):
     _name = "square.webhook.queue"
     _description = "Square Webhook Queue for Retry"
     _order = "create_date asc"
+
+    company_id = fields.Many2one("res.company", default=lambda self: self.env.company, index=True)
+    verified = fields.Boolean(default=False, copy=False)
+    merchant_id = fields.Char()
+    environment = fields.Char()
 
     # Event Information
     webhook_event_id = fields.Char(string="Webhook Event ID", required=True, index=True)
@@ -65,8 +72,9 @@ class SquareWebhookQueue(models.Model):
     processed_at = fields.Datetime(string="Processed At")
 
     @api.model
-    def queue_event(
-        self, webhook_event_id, event_type, order_data, square_order_id=None
+    def _queue_event(
+        self, webhook_event_id, event_type, order_data, square_order_id=None, *,
+        merchant_id=None, environment=None,
     ):
         """
         Queue a webhook event for later processing
@@ -86,12 +94,20 @@ class SquareWebhookQueue(models.Model):
             )
             webhook_event_id = f"synthetic-{event_type}-{oid}-{uuid.uuid4().hex[:16]}"
 
-        # Check if already queued
-        existing = self.search([("webhook_event_id", "=", webhook_event_id)], limit=1)
+        # Old rows may have been supplied or changed by staff. Only search trusted rows.
+        existing = self.search([
+            ("company_id", "=", self.env.company.id),
+            ("verified", "=", True),
+            ("webhook_event_id", "=", webhook_event_id),
+            ("event_type", "=", event_type),
+            ("square_order_id", "=", square_order_id),
+        ], limit=1)
         if existing:
             _logger.info(
                 f"Event {webhook_event_id} already queued, updating retry time"
             )
+            if existing.state == "completed":
+                return existing
             existing.write(
                 {
                     "next_retry_time": fields.Datetime.now() + timedelta(seconds=30),
@@ -100,11 +116,29 @@ class SquareWebhookQueue(models.Model):
             )
             return existing
 
-        # Create new queue entry
+        # An order update only needs identity, version, state and line quantities.
+        snapshot = {
+            name: order_data[name]
+            for name in ("id", "order_id", "state", "version", "location_id")
+            if name in order_data
+        }
+        if "line_items" in order_data:
+            snapshot["line_items"] = [
+                {name: item[name] for name in ("uid", "quantity") if name in item}
+                for item in order_data["line_items"]
+            ]
+        for name in ("returns", "return_line_items"):
+            if name in order_data:
+                snapshot[name] = bool(order_data[name])
+
         vals = {
+            "company_id": self.env.company.id,
+            "verified": True,
+            "merchant_id": merchant_id,
+            "environment": environment,
             "webhook_event_id": webhook_event_id,
             "event_type": event_type,
-            "order_data": json.dumps(order_data),
+            "order_data": json.dumps(snapshot),
             "square_order_id": square_order_id,
             "order_version": order_data.get("version"),
             "next_retry_time": fields.Datetime.now() + timedelta(seconds=30),
@@ -114,15 +148,28 @@ class SquareWebhookQueue(models.Model):
         return self.create(vals)
 
     @api.model
+    def _cron_retry_webhook_queue(self):
+        for config in self.env["square.config"].search([("active", "=", True)]):
+            scoped_queue = self.with_context(allowed_company_ids=config.company_id.ids)
+            scoped_queue._process_pending_events()
+
+    @api.model
     def process_pending_events(self):
         """
         Process pending events in the queue (called by cron)
         """
+        if not self.env.is_system() and not self.env.user.has_group("odoo_square.group_square_pos_service"):
+            raise AccessError("Only Square administrators and the Square service can run webhook retries.")
+        return self.sudo()._process_pending_events()
+
+    @api.model
+    def _process_pending_events(self):
         now = fields.Datetime.now()
 
         # Find events ready for retry
         pending_events = self.search(
             [
+                ("company_id", "=", self.env.company.id),
                 ("state", "=", "pending"),
                 ("next_retry_time", "<=", now),
             ],
@@ -130,24 +177,28 @@ class SquareWebhookQueue(models.Model):
             limit=50,  # Process in batches
         )
 
-        _logger.error(
-            f"Processing {len(pending_events)} pending webhook events from queue"
-        )
+        if pending_events:
+            _logger.info("Processing %s pending Square webhook events", len(pending_events))
 
         for event in pending_events:
             try:
                 event._process_queued_event()
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
             except Exception as e:
                 _logger.error(
                     f"Error processing queued event {event.webhook_event_id}: {str(e)}"
                 )
 
-        # Clean up old expired events
-        self._cleanup_expired_events()
+        self._cleanup_completed_events()
 
     def _process_queued_event(self):
         """Process a single queued event"""
         self.ensure_one()
+
+        if not self.verified or self.event_type != "order.updated":
+            self.write({"state": "failed", "error_message": "No verified order update to retry"})
+            return False
 
         # Mark as processing
         self.write({"state": "processing", "retry_count": self.retry_count + 1})
@@ -155,13 +206,16 @@ class SquareWebhookQueue(models.Model):
         try:
             # Parse order data
             order_data = json.loads(self.order_data)
+            if (order_data.get("order_id") or order_data.get("id")) != self.square_order_id:
+                self.write({"state": "failed", "error_message": "The queued order does not match its event"})
+                return False
 
             # Check if dependency is met (order exists)
             if self.depends_on_order and self.square_order_id:
                 order_exists = (
                     self.env["sale.order"]
                     .sudo()
-                    .search([("square_order_id", "=", self.square_order_id)], limit=1)
+                    .search([("square_order_id", "=", self.square_order_id), ("company_id", "=", self.company_id.id)], limit=1)
                 )
 
                 if not order_exists:
@@ -196,24 +250,13 @@ class SquareWebhookQueue(models.Model):
 
                     return False
 
-            if self.event_type in ("order.created", "order.updated"):
-                _logger.info(
-                    f"Processing queued event {self.webhook_event_id} - Order state: {order_data.get('state')}"
-                )
-                result = self.env["square.order.processor"]._process_order_event(
-                    order_data, self.event_type.split(".")[1], self.webhook_event_id
-                )
-            else:
-                _logger.error(
-                    f"Unsupported event type {self.event_type} for queued event {self.webhook_event_id}"
-                )
-                self.write(
-                    {"state": "failed", "error_message": "Unsupported event type"}
-                )
-                return False
+            result = self.env["square.order.processor"].with_company(self.company_id)._process_order_event(
+                order_data, "updated", self.webhook_event_id,
+                merchant_id=self.merchant_id, environment=self.environment,
+            )
 
             # Check result
-            if result.get("status") in ["success", "updated", "already_processed"]:
+            if result.get("status") in ["success", "updated", "already_processed", "ignored"]:
                 self.write(
                     {
                         "state": "completed",
@@ -246,6 +289,8 @@ class SquareWebhookQueue(models.Model):
 
                 return False
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             error_msg = str(e)
             _logger.error(
@@ -271,12 +316,12 @@ class SquareWebhookQueue(models.Model):
             return False
 
     @api.model
-    def _cleanup_expired_events(self):
-        """Clean up old expired or completed events"""
+    def _cleanup_completed_events(self):
+        """Retain unresolved failures for administrator inspection."""
         # Remove completed events older than 7 days
         cutoff_completed = fields.Datetime.now() - timedelta(days=7)
         old_completed = self.search(
-            [("state", "=", "completed"), ("processed_at", "<", cutoff_completed)]
+            [("company_id", "=", self.env.company.id), ("state", "=", "completed"), ("processed_at", "<", cutoff_completed)]
         )
 
         if old_completed:
@@ -285,21 +330,8 @@ class SquareWebhookQueue(models.Model):
             )
             old_completed.unlink()
 
-        # Remove expired/failed events older than 30 days
-        cutoff_failed = fields.Datetime.now() - timedelta(days=30)
-        old_failed = self.search(
-            [
-                ("state", "in", ["expired", "failed"]),
-                ("create_date", "<", cutoff_failed),
-            ]
-        )
-
-        if old_failed:
-            _logger.info(f"Cleaning up {len(old_failed)} old failed queued events")
-            old_failed.unlink()
-
     @api.model
-    def process_pending_for_order(self, square_order_id):
+    def _process_pending_for_order(self, square_order_id):
         """
         Process all pending events for a specific order
         Called after successfully creating an order
@@ -308,7 +340,7 @@ class SquareWebhookQueue(models.Model):
             square_order_id: The Square order ID that was just created
         """
         pending_events = self.search(
-            [("square_order_id", "=", square_order_id), ("state", "=", "pending")],
+            [("company_id", "=", self.env.company.id), ("square_order_id", "=", square_order_id), ("state", "=", "pending")],
             order="order_version asc",
         )
 
@@ -322,6 +354,8 @@ class SquareWebhookQueue(models.Model):
         for event in pending_events:
             try:
                 event._process_queued_event()
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
             except Exception as e:
                 _logger.error(
                     f"Error processing pending event {event.webhook_event_id} for order {square_order_id}: {str(e)}"

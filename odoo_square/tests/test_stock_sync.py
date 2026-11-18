@@ -3,8 +3,9 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from unittest.mock import patch
 
-from odoo import Command
+from odoo import Command, fields
 from odoo.tests import Form, TransactionCase, tagged
+from odoo.tests.common import new_test_user
 
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
 
@@ -55,6 +56,11 @@ class TestStockSync(TransactionCase):
         )
 
     def _square_response(self, endpoint, method="GET", data=None):
+        if endpoint == "/v2/locations":
+            return {"locations": [
+                {"id": "SQ-STOCK-LOCATION", "status": "ACTIVE"},
+                {"id": "OTHER-STOCK-LOCATION", "status": "ACTIVE"},
+            ]}
         if endpoint == "/v2/catalog/search" and method == "POST":
             return {"objects": [{"id": "SYNC-VARIATION"}]}
         if endpoint == "/v2/inventory/changes/batch-create" and method == "POST":
@@ -66,6 +72,8 @@ class TestStockSync(TransactionCase):
         counts = []
         for request in square_requests.call_args_list:
             endpoint = request.args[0]
+            if endpoint == "/v2/locations":
+                continue
             self.assertEqual(request.kwargs["method"], "POST")
             data = request.kwargs["data"]
             if endpoint == "/v2/catalog/search":
@@ -83,7 +91,10 @@ class TestStockSync(TransactionCase):
         self.assertTrue(searches, "Square must be queried for the product's SKU")
         for search in searches:
             self.assertEqual(search, {"attribute_name": "sku", "attribute_value": "SYNC-SKU"})
-        self.assertEqual(set(counts), expected_location_quantities)
+        self.assertCountEqual(counts, expected_location_quantities)
+        keys = [call.kwargs["data"]["idempotency_key"] for call in square_requests.call_args_list
+                if call.args[0] == "/v2/inventory/changes/batch-create"]
+        self.assertEqual(len(set(keys)), len(counts))
 
     def _create_receipt(self, warehouse):
         picking_type = warehouse.in_type_id
@@ -114,13 +125,21 @@ class TestStockSync(TransactionCase):
             }
         )
 
+    def _send_pending_counts(self):
+        action = self.env.ref("odoo_square.ir_cron_square_stock_counts").ir_actions_server_id
+        action.run()  # Resolve the variation.
+        action.run()  # Dispatch the persisted count.
+
     def test_validated_receipt_updates_mapped_square_inventory(self):
         receipt = self._create_receipt(self.warehouse)
+        stock_user = new_test_user(self.env, login="square_stock_operator", groups="stock.group_stock_user")
 
         with patch.object(
             SquareApiClient, "_make_api_request", side_effect=self._square_response
         ) as square_requests:
-            receipt.button_validate()
+            receipt.with_user(stock_user).button_validate()
+            square_requests.assert_not_called()
+            self._send_pending_counts()
 
         self.assertEqual(receipt.state, "done")
         self.assertEqual(
@@ -151,6 +170,7 @@ class TestStockSync(TransactionCase):
             ) as square_requests:
                 quant.inventory_quantity = quantity
                 quant.action_apply_inventory()
+                self._send_pending_counts()
 
                 self.assertEqual(quant.quantity, quantity)
                 self.assertEqual(main_quant.quantity, 12)
@@ -164,7 +184,101 @@ class TestStockSync(TransactionCase):
 
         with patch.object(SquareApiClient, "_make_api_request") as square_requests:
             receipt.button_validate()
+            self._send_pending_counts()
 
         self.assertEqual(receipt.state, "done")
         self.assertEqual(quant.quantity, 6)
         square_requests.assert_not_called()
+
+    def test_transfer_updates_both_locations_once_with_fractional_counts(self):
+        self._create_quant(self.warehouse, 7.25)
+        self._create_quant(self.other_mapped_warehouse, 3)
+        receipt = self.env["stock.picking"].create({
+            "picking_type_id": self.warehouse.int_type_id.id,
+            "location_id": self.warehouse.lot_stock_id.id,
+            "location_dest_id": self.other_mapped_warehouse.lot_stock_id.id,
+            "origin": "Square display stand transfer",
+            "move_ids": [Command.create({"product_id": self.product.id, "product_uom_qty": 4})],
+        })
+        receipt.action_confirm()
+        receipt.action_assign()
+        receipt.move_ids.picked = True
+        with patch.object(SquareApiClient, "_make_api_request", side_effect=self._square_response) as requests:
+            receipt.button_validate()
+            self._send_pending_counts()
+        self.assertEqual(receipt.state, "done")
+        self._assert_physical_counts(requests, [("SQ-STOCK-LOCATION", "3.25"), ("OTHER-STOCK-LOCATION", "7")])
+
+    def test_ambiguous_square_sku_does_not_update_either_variation(self):
+        def duplicate_sku(endpoint, **kwargs):
+            if endpoint == "/v2/catalog/search":
+                return {"objects": [{"id": "A"}, {"id": "B"}]}
+            return self._square_response(endpoint, **kwargs)
+
+        receipt = self._create_receipt(self.warehouse)
+        with patch.object(SquareApiClient, "_make_api_request", side_effect=duplicate_sku) as requests:
+            receipt.button_validate()
+            self._send_pending_counts()
+        self.assertFalse(any(call.args[0] == "/v2/inventory/changes/batch-create"
+                             for call in requests.call_args_list))
+        self.assertEqual(self.env["square.stock.sync"].search([], limit=1).failed_syncs, 1)
+
+    def test_rolled_back_stock_never_reaches_square_and_failed_counts_retry(self):
+        quant = self._create_quant(self.warehouse, 8)
+        jobs = self.env["square.stock.count"]
+        with self.assertRaises(RuntimeError), self.cr.savepoint():
+            quant.quantity = 6
+            self.assertTrue(jobs.search([]))
+            raise RuntimeError("Roll back the warehouse operation")
+        self.assertFalse(jobs.search([]))
+        with patch.object(SquareApiClient, "_make_api_request", return_value={"locations": []}) as unavailable:
+            self._send_pending_counts()
+            unavailable.assert_not_called()
+            quant.quantity = 2.5
+            self._send_pending_counts()
+        pending = jobs.search([])
+        self.assertEqual(len(pending), 1)
+        self.assertGreater(pending.next_attempt, fields.Datetime.now())
+        # Square was unreachable for more than a day. Stock received in a new
+        # bin since this observation must be included in the recovered count.
+        pending.counted_at = fields.Datetime.subtract(fields.Datetime.now(), hours=25)
+        self.env["stock.quant"].create({
+            "product_id": quant.product_id.id,
+            "location_id": self.env["stock.location"].create({
+                "name": "Additional bin", "location_id": self.warehouse.lot_stock_id.id,
+                "usage": "internal",
+            }).id,
+            "quantity": 3,
+        })
+        pending.next_attempt = fields.Datetime.now()
+        with patch.object(SquareApiClient, "_make_api_request", side_effect=self._square_response) as requests:
+            self._send_pending_counts()
+            self._assert_physical_counts(requests, [("SQ-STOCK-LOCATION", "5.5")])
+        self.assertFalse(jobs.search([]))
+
+
+    def test_lost_physical_count_response_replays_the_original_observation(self):
+        quant = self._create_quant(self.warehouse, 8)
+        jobs = self.env["square.stock.count"]
+        for quantity in range(21, 46):
+            quant.quantity = quantity
+        self.assertEqual(jobs.search_count([]), 1)
+        attempts = []
+
+        def lose_response(endpoint, **kwargs):
+            if endpoint == "/v2/inventory/changes/batch-create":
+                attempts.append(kwargs["data"])
+                if len(attempts) == 1:
+                    raise TimeoutError("Response lost after Square accepted the count")
+            return self._square_response(endpoint, **kwargs)
+
+        with patch.object(SquareApiClient, "_make_api_request", side_effect=lose_response):
+            self._send_pending_counts()
+            job = jobs.search([])
+            self.assertTrue(job.catalog_object_id)
+            job.next_attempt = fields.Datetime.now()
+            self._send_pending_counts()
+        self.assertFalse(jobs.search([]))
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(attempts[0]["changes"][0]["physical_count"]["quantity"], "45")

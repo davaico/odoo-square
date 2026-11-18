@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <template id="square_online_method_form" inherit_id="payment.method_form">
+        <xpath expr="//t[@t-set='inline_form_xml_id']" position="attributes">
+            <attribute name="t-value">'payment_square_online.inline_form' if provider_sudo.code == 'square_online' else provider_sudo.inline_form_view_id.xml_id</attribute>
+        </xpath>
+    </template>
+
+    <template id="inline_form">
+        <t t-set="connection" t-value="provider_sudo._square_online_get_connection()"/>
+        <div class="w-100 mt-2"
+             t-attf-id="o_square_online_card_{{provider_sudo.id}}"
+             t-att-data-square-online-cart="sale_order._square_online_cart_token()"
+             t-att-data-application-id="connection.application_id"
+             t-att-data-location-id="connection.location_id.square_id"
+             t-att-data-environment="connection.environment"
+        />
+    </template>
+</odoo>

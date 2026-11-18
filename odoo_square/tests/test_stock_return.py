@@ -216,7 +216,7 @@ class TestStockReturn(SquareHttpCase):
         allocation.product_return_moves.quantity = quantity
         action = allocation.action_create_returns()
         returned = self.env["stock.picking"].browse(action["res_id"])
-        returned.with_context(force_validate=True).button_validate()
+        returned._validate_square_picking()
         self.assertEqual(returned.state, "done")
         self.assertEqual(self._get_stock(self.product, self.warehouse), 4)
         quantity, still_remaining = move._allocate_square_return_quantity(remainder, dozen, unit)
@@ -259,7 +259,7 @@ class TestStockReturn(SquareHttpCase):
             }
         )
 
-        refund.action_process_refund()
+        refund._action_process_refund()
 
         # Return picking should have been created
         self.assertTrue(
@@ -269,7 +269,7 @@ class TestStockReturn(SquareHttpCase):
 
         # Now complete the refund
         refund.write({"status": "completed"})
-        refund.action_process_refund()
+        refund._action_process_refund()
         self.assertAlmostEqual(refund.credit_note_id.amount_total, 110.00, places=2)
 
         # Verify return picking is done
@@ -334,12 +334,12 @@ class TestStockReturn(SquareHttpCase):
         move_line.copy({"quantity": 1})
         self.assertEqual(len(move.move_line_ids), 2)
 
-        return_picking.with_context(force_validate=True).button_validate()
+        return_picking._validate_square_picking()
 
         self.assertEqual(
             return_picking.state,
             "done",
-            "Incoming picking with force_validate should be fully validated",
+            "Square return should be fully validated",
         )
 
         self.assertEqual(move.quantity, 2)
@@ -389,7 +389,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._process_square_order_update(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(
@@ -440,7 +440,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._process_square_order_update(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(
@@ -505,7 +505,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._process_square_order_update(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(
@@ -557,7 +557,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._process_square_order_update(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(

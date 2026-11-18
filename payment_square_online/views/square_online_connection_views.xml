@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="square_online_connection_list" model="ir.ui.view">
+        <field name="name">square.online.connection.list</field>
+        <field name="model">square.online.connection</field>
+        <field name="arch" type="xml">
+            <list string="Square Connections">
+                <field name="name"/>
+                <field name="company_id"/>
+                <field name="environment"/>
+                <field name="merchant_id" optional="show"/>
+                <field name="location_id"/>
+                <field name="oauth_health"/>
+                <field name="token_expires_at" optional="show"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="square_online_connection_form" model="ir.ui.view">
+        <field name="name">square.online.connection.form</field>
+        <field name="model">square.online.connection</field>
+        <field name="arch" type="xml">
+            <form string="Square Connection">
+                <header>
+                    <button name="action_square_online_connect" type="object"
+                            string="Authorize with Square" class="btn-primary"
+                            groups="base.group_system"/>
+                </header>
+                <sheet>
+                    <div class="oe_title">
+                        <h1><field name="name" placeholder="Square Sandbox"/></h1>
+                    </div>
+                    <div class="alert alert-info" role="status" invisible="not oauth_status_message">
+                        <field name="oauth_status_message" nolabel="1"/>
+                    </div>
+                    <div class="alert alert-warning" role="status" invisible="not oauth_reconnect_required">
+                        Square authorization needs attention. Select <strong>Authorize with Square</strong>
+                        and sign in as the original merchant to restore access.
+                    </div>
+                    <field name="oauth_reconnect_required" invisible="1"/>
+                    <group>
+                        <group string="Application">
+                            <field name="company_id" readonly="id"/>
+                            <field name="environment" readonly="id"/>
+                            <field name="application_id" readonly="id"/>
+                            <field name="application_secret" password="True"/>
+                            <field name="redirect_uri"/>
+                        </group>
+                        <group string="Merchant">
+                            <field name="merchant_id"/>
+                            <field name="oauth_health"/>
+                            <field name="token_expires_at"/>
+                            <field name="location_locked" invisible="1"/>
+                            <field name="location_id"
+                                   readonly="not merchant_id or location_locked"
+                                   domain="[('connection_id', '=', id), ('available_for_payment', '=', True)]"
+                                   options="{'no_create': True, 'no_open': True}"/>
+                            <field name="location_country_code"/>
+                            <field name="location_currency_code"/>
+                        </group>
+                    </group>
+                    <group string="Webhook" groups="base.group_system" invisible="not id">
+                        <field name="webhook_route"/>
+                        <field name="webhook_notification_url" placeholder="https://shop.example.com/payment/square_online/webhook/1"/>
+                        <field name="webhook_signature_key" password="True"/>
+                    </group>
+                    <div class="text-muted">
+                        Eligible Square locations process cards in their local currency.
+                        Supported markets are Australia (AUD), Canada (CAD), France, Ireland
+                        and Spain (EUR), Japan (JPY), the United Kingdom (GBP), and the United
+                        States (USD). Create a new connection to switch the merchant or location.
+                    </div>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="square_online_connection_action" model="ir.actions.act_window">
+        <field name="name">Square Connections</field>
+        <field name="res_model">square.online.connection</field>
+        <field name="view_mode">list,form</field>
+    </record>
+</odoo>

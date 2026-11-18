@@ -17,6 +17,7 @@ class SaleOrder(models.Model):
         string="Square Order ID",
         help="The unique identifier from Square for this order",
         index=True,
+        groups="base.group_system,odoo_square.group_square_pos_service",
         copy=False,
     )
 
@@ -24,6 +25,7 @@ class SaleOrder(models.Model):
         string="Square Payment ID",
         help="The unique identifier from Square for the payment associated with this order",
         index=True,
+        groups="base.group_system,odoo_square.group_square_pos_service",
         copy=False,
     )
 
@@ -34,13 +36,15 @@ class SaleOrder(models.Model):
 
     square_order_data = fields.Text(
         string="Square Order Data",
-        help="Raw JSON data from Square webhook for debugging",
+        help="Historical Square order data",
+        groups="base.group_system,odoo_square.group_square_pos_service",
         copy=False,
     )
 
     square_order_version = fields.Integer(
         string="Square Order Version",
         help="Version of the last Square line snapshot applied to this quotation",
+        groups="base.group_system,odoo_square.group_square_pos_service",
         copy=False,
     )
 
@@ -56,12 +60,14 @@ class SaleOrder(models.Model):
         "sale_order_id",
         string="Square Refunds",
         help="Refunds associated with this Square order",
+        groups="base.group_system,odoo_square.group_square_pos_service",
     )
 
     # Refund tracking fields
     total_refunded_amount = fields.Monetary(
         string="Total Refunded Amount",
         compute="_compute_total_refunded_amount",
+        compute_sudo=True,
         currency_field="currency_id",
         help="Total amount refunded for this order",
     )
@@ -102,13 +108,16 @@ class SaleOrder(models.Model):
         for order in self:
             order.is_square_order = bool(order.square_order_id)
 
-    @api.depends("square_refund_ids.refund_amount", "square_refund_ids.status")
+    @api.depends(
+        "square_refund_ids.square_refund_id", "square_refund_ids.refund_amount",
+        "square_refund_ids.status", "square_refund_ids.processed_at",
+    )
     def _compute_total_refunded_amount(self):
         """Compute total refunded amount"""
         for order in self:
             # Get all completed refunds
             completed_refunds = order.square_refund_ids.filtered(
-                lambda r: r.status == "completed"
+                lambda r: r.square_refund_id and r.status == "completed" and r.processed_at
             )
 
             # Calculate total refunded amount
@@ -116,8 +125,10 @@ class SaleOrder(models.Model):
             order.total_refunded_amount = total_refunded
 
     @api.depends(
+        "square_refund_ids.square_refund_id",
         "square_refund_ids.refund_amount",
         "square_refund_ids.status",
+        "square_refund_ids.processed_at",
         "amount_total",
         "invoice_ids.state",
         "invoice_ids.amount_total",
@@ -127,7 +138,7 @@ class SaleOrder(models.Model):
         for order in self:
             # Get all completed refunds
             completed_refunds = order.square_refund_ids.filtered(
-                lambda r: r.status == "completed"
+                lambda r: r.square_refund_id and r.status == "completed" and r.processed_at
             )
 
             # Calculate total refunded amount for status determination
@@ -162,7 +173,7 @@ class SaleOrder(models.Model):
 
     def _get_configured_warehouse(self):
         """Get the configured warehouse from Square configuration (legacy method)"""
-        square_config = self.env["square.config"].search([], limit=1)
+        square_config = self.env["square.config"].search([("company_id", "=", self.env.company.id), ("active", "=", True)], limit=1)
         if square_config:
             warehouse = square_config.get_configured_warehouse()
             if warehouse:
@@ -181,7 +192,7 @@ class SaleOrder(models.Model):
             _logger.warning("No Square location ID provided, using default warehouse")
             return self._get_configured_warehouse()
 
-        square_config = self.env["square.config"].search([], limit=1)
+        square_config = self.env["square.config"].search([("company_id", "=", self.env.company.id), ("active", "=", True)], limit=1)
         if square_config:
             warehouse = square_config.get_warehouse_for_location(square_location_id)
             if warehouse:
@@ -235,7 +246,7 @@ class SaleOrder(models.Model):
         try:
             tid = int(str(raw).strip())
         except (ValueError, TypeError):
-            _logger.warning("Invalid odoo_sales_team_id in Square metadata: %s", raw)
+            _logger.warning("Invalid odoo_sales_team_id in Square metadata")
             return Team.browse()
         team = Team.browse(tid)
         if team.exists() and self._sales_team_matches_company(team, company):
@@ -245,7 +256,7 @@ class SaleOrder(models.Model):
 
     @api.model
     def _get_sales_team_for_square_location(self, square_location_id, company):
-        config = self.env["square.config"].search([], limit=1)
+        config = self.env["square.config"].search([("company_id", "=", self.env.company.id), ("active", "=", True)], limit=1)
         if config:
             return config.get_sales_team_for_location(
                 square_location_id, company=company
@@ -279,7 +290,7 @@ class SaleOrder(models.Model):
                 dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
             return dt
         except Exception:
-            _logger.warning("Could not parse Square created_at: %r", raw)
+            _logger.warning("Could not parse Square order creation date")
             return False
 
     def _square_backdate_sale_order_create_date(self, sale_order, create_dt):
@@ -293,7 +304,7 @@ class SaleOrder(models.Model):
         sale_order.invalidate_recordset(["create_date"])
 
     @api.model
-    def create_from_square(self, square_data):
+    def _create_from_square(self, square_data):
         """
         Create a sale order from Square webhook data.
 
@@ -348,7 +359,6 @@ class SaleOrder(models.Model):
             order_vals = {
                 "partner_id": customer.id,
                 "square_order_id": square_order_id,
-                "square_order_data": str(square_data),
                 "state": "draft",
                 "origin": f"Square Order {square_order_id}",
                 "company_id": company.id,
@@ -370,7 +380,7 @@ class SaleOrder(models.Model):
             # Lines: webhook payload first (tests / offline), else Square API
             if square_data.get("line_items"):
                 payment_id = self._extract_payment_id_from_square_order(square_data)
-                upd = {"square_order_data": str(square_data)}
+                upd = {"square_order_version": self._square_snapshot_version(square_data)}
                 if payment_id:
                     upd["square_payment_id"] = payment_id
                 sale_order.write(upd)
@@ -403,7 +413,7 @@ class SaleOrder(models.Model):
                 )
 
             # Log to integration dashboard
-            self.env["square.integration.log"].log_order_creation(
+            self.env["square.integration.log"]._log_order_creation(
                 sale_order, square_data
             )
 
@@ -414,18 +424,17 @@ class SaleOrder(models.Model):
 
         except Exception as e:
             _logger.error(
-                f"Error creating sale order from Square: {str(e)}", exc_info=True
+                "Square order creation failed (%s)", type(e).__name__
             )
 
             # Log error to integration dashboard
             try:
-                self.env["square.integration.log"].log_error(
+                self.env["square.integration.log"]._log_error(
                     title="Order Creation Error",
-                    error_message=str(e),
+                    error_message=type(e).__name__,
                     square_order_id=(
                         square_data.get("order_id") if square_data else None
                     ),
-                    technical_details=f"Square data: {square_data}\nError: {str(e)}",
                 )
             except:
                 pass  # Don't let logging errors break the main process
@@ -472,13 +481,13 @@ class SaleOrder(models.Model):
         if customer_info.get("email"):
             partner = Partner.search([("email", "=", customer_info["email"])], limit=1)
             if partner:
-                _logger.info(f"Found customer by email: {partner.name}")
+                _logger.info("Matched existing customer by email")
                 return partner, payload
 
         if customer_info.get("phone"):
             partner = Partner.search([("phone", "=", customer_info["phone"])], limit=1)
             if partner:
-                _logger.info(f"Found customer by phone: {partner.name}")
+                _logger.info("Matched existing customer by phone")
                 return partner, payload
 
         if customer_info.get("name"):
@@ -490,7 +499,7 @@ class SaleOrder(models.Model):
 
             partner = Partner.search(domain, limit=1)
             if partner:
-                _logger.info(f"Found customer by name/address: {partner.name}")
+                _logger.info("Matched existing customer by name and address")
                 return partner, payload
 
         return self._create_customer_from_square_info(customer_info), payload
@@ -540,9 +549,6 @@ class SaleOrder(models.Model):
                             customer_info["zip"] = address["postal_code"]
 
                     customer_info["square_customer_id"] = customer_id
-                    _logger.info(
-                        f"Retrieved customer details from Square API: {customer_info}"
-                    )
 
                     # If we got customer info from API, return it directly
                     if (
@@ -626,7 +632,6 @@ class SaleOrder(models.Model):
         if customer_info.get("name"):
             customer_info["name"] = self._normalize_customer_name(customer_info["name"])
 
-        _logger.info(f"Final extracted customer info: {customer_info}")
         return customer_info
 
     def _normalize_phone_number(self, phone):
@@ -688,7 +693,7 @@ class SaleOrder(models.Model):
             vals["zip"] = customer_info["zip"]
 
         partner = self.env["res.partner"].create(vals)
-        _logger.info(f"Created new customer: {partner.name}")
+        _logger.info("Created customer from Square")
         return partner
 
     def _create_anonymous_customer(self):
@@ -700,7 +705,7 @@ class SaleOrder(models.Model):
                 "customer_rank": 1,
             }
         )
-        _logger.info(f"Created anonymous customer: {partner.name}")
+        _logger.info("Created anonymous Square customer")
         return partner
 
     def _fetch_and_create_order_lines(self, sale_order, square_order_id):
@@ -721,8 +726,7 @@ class SaleOrder(models.Model):
             # Extract payment information from full order data
             payment_id = self._extract_payment_id_from_square_order(full_order_data)
 
-            # Update sale order with full data and payment_id
-            update_vals = {"square_order_data": str(full_order_data)}
+            update_vals = {"square_order_version": self._square_snapshot_version(full_order_data)}
             if payment_id:
                 update_vals["square_payment_id"] = payment_id
                 _logger.info(
@@ -762,7 +766,7 @@ class SaleOrder(models.Model):
             tenders = square_order_data.get("tenders", [])
             if tenders and len(tenders) > 0:
                 # Get the first tender's payment_id
-                payment_id = tenders[0].get("id")
+                payment_id = tenders[0].get("payment_id") or tenders[0].get("id")
                 if payment_id:
                     return payment_id
 
@@ -856,7 +860,7 @@ class SaleOrder(models.Model):
                 )
             else:
                 _logger.warning(
-                    f"Could not retrieve catalog object details for '{catalog_object_id}': {catalog_result}"
+                    "Could not retrieve Square catalog object %s", catalog_object_id
                 )
 
         if sku and not product:

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <record id="ir_cron_square_stock_counts" model="ir.cron">
+        <field name="name">Square POS: Send inventory counts</field>
+        <field name="model_id" ref="model_square_stock_count"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_send_counts()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">minutes</field>
+    </record>
+</odoo>

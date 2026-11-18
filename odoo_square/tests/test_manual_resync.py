@@ -3,6 +3,7 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import logging
 from datetime import datetime, timedelta
+from lxml import html
 from unittest.mock import patch, MagicMock
 from odoo.tests import TransactionCase
 from odoo.tests.common import tagged
@@ -120,15 +121,6 @@ class TestSquareManualResync(TransactionCase):
             },
         ]
 
-        # Mock get_order for missing order
-        mock_get_order.side_effect = lambda order_id, **kwargs: {
-            "id": order_id,
-            "state": "COMPLETED",
-            "created_at": "2024-01-02T10:00:00Z",
-            "location_id": "LOC_123",
-            "total_money": {"amount": 20000},
-        }
-
         wizard = self.env["square.manual.resync.wizard"].create(
             {
                 "config_id": self.square_config.id,
@@ -138,6 +130,7 @@ class TestSquareManualResync(TransactionCase):
         wizard._onchange_days_back()
         wizard.action_scan_missing_orders()
 
+        mock_get_order.assert_not_called()
         self.assertEqual(wizard.state, "results")
         self.assertEqual(wizard.square_total, 2)
         self.assertEqual(wizard.odoo_total, 1)
@@ -149,6 +142,27 @@ class TestSquareManualResync(TransactionCase):
         )
         self.assertEqual(len(missing_lines), 1)
         self.assertTrue(missing_lines[0].selected)
+
+    def test_scan_reports_incomplete_search_without_partial_results(self):
+        wizard = self.env["square.manual.resync.wizard"].create({"config_id": self.square_config.id})
+        first_page = {"orders": [{"id": "missing-before-outage"}], "cursor": "next-page"}
+        with patch(
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient._make_api_request",
+            side_effect=[first_page, UserError("Square is unavailable.")],
+        ), self.assertRaisesRegex(UserError, "Could not complete the Square order scan for location LOC_123"):
+            wizard.action_scan_missing_orders()
+        self.assertEqual(wizard.state, "preview")
+        self.assertFalse(wizard.line_ids)
+
+    def test_scan_requires_shorter_range_when_page_limit_reached(self):
+        wizard = self.env["square.manual.resync.wizard"].create({"config_id": self.square_config.id})
+        with patch(
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient._make_api_request",
+            return_value={"orders": [{"id": "missing-order"}], "cursor": "another-page"},
+        ), self.assertRaisesRegex(UserError, "Select a shorter date range"):
+            wizard.action_scan_missing_orders()
+        self.assertEqual(wizard.state, "preview")
+        self.assertFalse(wizard.line_ids)
 
     def test_resync_requires_selection(self):
         """Test that resync requires at least one selected order"""
@@ -163,7 +177,7 @@ class TestSquareManualResync(TransactionCase):
         with self.assertRaises(ValidationError):
             wizard.action_validate_resync()
 
-    @patch("odoo.addons.odoo_square.controllers.square_webhook.SquareWebhookController._process_event")
+    @patch("odoo.addons.odoo_square.models.square_order_processor.SquareOrderProcessor._process_order_event")
     @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order")
     def test_resync_processes_selected_orders(self, mock_get_order, mock_process_event):
         """Test that resync processes selected orders through webhook pipeline"""
@@ -204,12 +218,12 @@ class TestSquareManualResync(TransactionCase):
         self.assertEqual(wizard.processed_count, 1)
         self.assertEqual(wizard.error_count, 0)
 
-    @patch("odoo.addons.odoo_square.controllers.square_webhook.SquareWebhookController._process_event")
+    @patch("odoo.addons.odoo_square.models.square_order_processor.SquareOrderProcessor._process_order_event")
     @patch("odoo.addons.odoo_square.models.square_api_client.SquareApiClient.get_order")
     def test_resync_handles_errors(self, mock_get_order, mock_process_event):
         """Test that resync continues on error and collects error details"""
         # Mock get_order failure
-        mock_get_order.side_effect = Exception("API Error")
+        mock_get_order.side_effect = Exception("Private upstream error body")
 
         wizard = self.env["square.manual.resync.wizard"].create(
             {
@@ -222,7 +236,7 @@ class TestSquareManualResync(TransactionCase):
         self.env["square.manual.resync.line"].create(
             {
                 "wizard_id": wizard.id,
-                "square_order_id": "bad_order",
+                "square_order_id": "bad_order<strong>id</strong>",
                 "selected": True,
             }
         )
@@ -234,6 +248,45 @@ class TestSquareManualResync(TransactionCase):
         self.assertEqual(wizard.processed_count, 0)
         self.assertEqual(wizard.error_count, 1)
         self.assertIn("bad_order", wizard.error_details)
+        warning = self.env["square.integration.log"].search([
+            ("event_type", "=", "manual_resync"), ("status", "=", "warning"),
+        ], order="id desc", limit=1)
+        self.assertIn("Could not fetch order bad_order<strong>id</strong> from Square",
+                      html.fromstring(warning.description).text_content())
+        self.assertNotIn("Private upstream error body", warning.description)
+        self.assertNotIn("Private upstream error body", wizard.error_details)
+
+    def test_resync_rolls_back_order_when_native_invoicing_is_deferred(self):
+        # A draft can appear after the missing-orders scan. A delivered-quantity service
+        # with no recorded delivery cannot yet be invoiced by native Odoo accounting.
+        order_id = "RESYNC-SERVICE-UNDELIVERED"
+        service = self.env["product.product"].create({
+            "name": "Undelivered Square service", "type": "service", "invoice_policy": "delivery",
+        })
+        order = self.env["sale.order"].create({
+            "partner_id": self.env.ref("base.partner_root").id, "square_order_id": order_id,
+            "order_line": [(0, 0, {"product_id": service.id, "product_uom_qty": 1, "price_unit": 25})],
+        })
+        wizard = self.env["square.manual.resync.wizard"].create({
+            "config_id": self.square_config.id, "state": "results",
+            "line_ids": [(0, 0, {"square_order_id": order_id, "selected": True})],
+        })
+        processor = type(self.env["square.order.processor"])
+        with patch.object(
+            type(self.env["square.api.client"]), "get_order",
+            return_value={"id": order_id, "location_id": "LOC_123", "state": "COMPLETED"},
+        ), patch.object(
+            processor, "_process_order_event", autospec=True, side_effect=processor._process_order_event,
+        ) as apply, self.assertLogs("odoo.addons.odoo_square.models.square_order_processor", level="INFO") as messages:
+            wizard.action_validate_resync()
+
+        self.assertTrue(any("Square invoicing failed for" in message for message in messages.output))
+        self.assertEqual([call.args[2] for call in apply.call_args_list], ["created"])
+        self.assertEqual((wizard.processed_count, wizard.error_count), (0, 1))
+        self.assertIn(order_id, wizard.error_details)
+        self.assertEqual(order.state, "draft")
+        self.assertFalse(order.invoice_ids)
+        self.assertFalse(order.picking_ids)
 
     def test_wizard_state_transitions(self):
         """Test wizard state machine transitions"""
@@ -269,7 +322,7 @@ class TestSquareManualResync(TransactionCase):
             return_value={"id": "test_order", "state": "COMPLETED"},
         ):
             with patch(
-                "odoo.addons.odoo_square.controllers.square_webhook.SquareWebhookController._process_event",
+                "odoo.addons.odoo_square.models.square_order_processor.SquareOrderProcessor._process_order_event",
                 return_value={"status": "success"},
             ):
                 wizard.action_validate_resync()
@@ -309,7 +362,7 @@ class TestSquareManualResync(TransactionCase):
             },
         ):
             with patch(
-                "odoo.addons.odoo_square.controllers.square_webhook.SquareWebhookController._process_event",
+                "odoo.addons.odoo_square.models.square_order_processor.SquareOrderProcessor._process_order_event",
                 return_value={"status": "success"},
             ):
                 wizard.action_validate_resync()

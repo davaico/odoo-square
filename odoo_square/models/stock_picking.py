@@ -1,28 +1,20 @@
 from odoo import fields, models
 
+from .stock_move import _SQUARE_MANAGED_PICKING
+
 
 class StockPicking(models.Model):
     _inherit = "stock.picking"
 
     square_exchange_order_id = fields.Char(
-        string="Square Exchange Order ID", copy=False, readonly=True
+        string="Square Exchange Order ID", copy=False, readonly=True,
+        groups="base.group_system,odoo_square.group_square_pos_service",
     )
 
-    def _force_quantity_for_square(self):
-        for move in self.move_ids.filtered(lambda move: move.state not in ("done", "cancel")):
+    def _validate_square_picking(self):
+        """Complete a picking prepared by the Square order or refund workflow."""
+        pickings = self.with_context(square_managed_picking=_SQUARE_MANAGED_PICKING)
+        moves = pickings.filtered(lambda p: p.picking_type_code in ("outgoing", "incoming")).move_ids
+        for move in moves.filtered(lambda m: m.state not in ("done", "cancel")):
             move.quantity = move.product_uom_qty
-
-    def button_validate(self):
-        """
-        Override button_validate to allow validation even with insufficient stock.
-        For Square orders, we force validation by setting done quantities equal to demanded quantities,
-        allowing negative stock if necessary.
-        """
-        force_validate = self.env.context.get("force_validate", False)
-
-        if force_validate:
-            self.filtered(
-                lambda picking: picking.picking_type_code in ("outgoing", "incoming")
-            )._force_quantity_for_square()
-
-        return super().button_validate()
+        return pickings.button_validate()
