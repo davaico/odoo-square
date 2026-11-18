@@ -2,7 +2,9 @@ name: odoo-square-v19
 
 services:
   db:
-    image: postgres:17-alpine
+    build:
+      context: ./config
+      dockerfile: Dockerfile.postgres
     environment:
       POSTGRES_DB: ${DB_NAME:-odoo_square_v19}
       POSTGRES_USER: ${DB_USER:-odoo}
@@ -11,7 +13,8 @@ services:
       - odoo_db_data:/var/lib/postgresql/data
 
   odoo:
-    image: odoo:19.0-20260908
+    build:
+      context: ./config
     depends_on:
       - db
     restart: unless-stopped

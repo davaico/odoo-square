@@ -31,3 +31,4 @@ access_square_location_mapping_service,access_square_location_mapping_service,mo
 access_square_refund_service,access_square_refund_service,model_square_refund,group_square_pos_service,1,1,1,0
 access_square_integration_log_service,access_square_integration_log_service,model_square_integration_log,group_square_pos_service,1,0,1,0
 access_square_stock_count_internal,square.stock.count.internal,model_square_stock_count,base.group_system,0,0,0,0
+access_square_event_receipt_internal,square.event.receipt.internal,model_square_event_receipt,base.group_system,0,0,0,0
