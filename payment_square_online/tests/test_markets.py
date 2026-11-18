@@ -268,6 +268,19 @@ class TestSquareOnlineMarkets(HttpCase):
                     company_amount=company_amount, tax=tax, verification_amount=verification,
                 )
 
+    def test_checkout_hides_square_for_fractional_minor_units(self):
+        currency = self.env.ref("base.CAD")
+        currency.rounding = 0.001
+        connection = self._connect(self.company, "CA", "CAD", "precision")
+        self._enable_provider(self.provider, self.journal, connection)
+        order = self._make_cart(self.website, "CAD", goods_price=23.51)
+        self.assertEqual(order.amount_total, 56.722)
+        with patch(self.square_boundary) as external:
+            page = self._open_payment_page(order)
+            self.assertFalse(page.xpath('.//*[@data-provider-code="square_online"]'))
+            external.assert_not_called()
+        self.assertFalse(order.transaction_ids)
+
     def test_checkout_hides_and_rejects_ineligible_square_configuration(self):
         usd = self._connect(self.company, "US", "USD", "eligible")
         cad = self._connect(self.company, "CA", "CAD", "incompatible")

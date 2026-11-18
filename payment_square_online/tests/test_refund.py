@@ -581,6 +581,30 @@ class TestSquareOnlineRefund(SquareOnlineCheckoutCase):
         self.assertEqual(tx.payment_id.amount_available_for_refund, 15)
 
     @patch(square_boundary)
+    def test_rejected_refund_request_releases_the_reserved_balance(self, external):
+        _, tx, original = self._capture(external)
+        self.authenticate(self.manager.login, self.manager.login)
+        for code in ("INSUFFICIENT_PERMISSIONS_FOR_REFUND", "GENERIC_DECLINE"):
+            with self.subTest(code=code):
+                previous = tx.child_transaction_ids
+                self._call(
+                    "payment.refund.wizard", "action_refund", self._open_refund(tx.payment_id), button=True,
+                )
+                external.reset_mock()
+                external.side_effect = [
+                    self._square_response({"payment": original}),
+                    self._square_response({"errors": [{"code": code}]}, status=400),
+                    self._square_response({"payment": original}),
+                    self._square_response({"refunds": []}),
+                ]
+                self._dispatch()
+                child = tx.child_transaction_ids - previous
+                self.assertEqual(child.state, "error")
+                self.assertFalse(child.payment_id)
+                self.assertEqual(tx.payment_id.amount_available_for_refund, tx.amount)
+                self.assertEqual([call.args[0] for call in external.call_args_list], ["GET", "POST", "GET", "GET"])
+
+    @patch(square_boundary)
     def test_manager_full_refund_posts_native_outbound_payment(self, external):
         self.env["ir.config_parameter"].set_param("sale.automatic_invoice", "True")
         order, tx, original = self._capture(external, self._make_refundable_goods_order())

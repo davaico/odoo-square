@@ -5,6 +5,8 @@ from odoo.http import request
 
 from odoo.addons.payment import utils as payment_utils
 
+from ..square_api import square_amount_in_minor_units
+
 
 _CONNECTION_BY_STATE = {
     "test": "square_online_sandbox_connection_id",
@@ -127,7 +129,19 @@ class PaymentProvider(models.Model):
             website_id=website_id, report=report, **kwargs,
         )
         currency_code = self.env["res.currency"].browse(currency_id).name
-        for provider in providers.filtered(lambda item: item.code == "square_online"):
+        square_providers = providers.filtered(lambda item: item.code == "square_online")
+        if square_providers and currency_code:
+            try:
+                minor = square_amount_in_minor_units(amount, currency_code)
+            except ValueError:
+                minor = 0
+            if not 0 < minor <= 2147483647:  # Odoo stores the Square amount as a PostgreSQL integer.
+                payment_utils.add_to_report(
+                    report, square_providers, available=False,
+                    reason=_("Square cannot process this checkout amount."),
+                )
+                return providers - square_providers
+        for provider in square_providers:
             connection = provider._square_online_get_connection()
             if (
                 provider.company_id.id != company_id
