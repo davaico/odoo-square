@@ -1,6 +1,8 @@
 services:
   db:
-    image: postgres:17.4
+    build:
+      context: config
+      dockerfile: Dockerfile.postgres
     environment:
       POSTGRES_DB: ${DB_NAME:-odoo}
       POSTGRES_USER: ${DB_USER:-odoo}

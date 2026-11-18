@@ -22,7 +22,7 @@ The module processes Square webhooks, creates and updates Odoo sales orders, han
 ## Requirements
 
 - Odoo 17.0 Community or Enterprise
-- PostgreSQL supported by Odoo 17.0
+- PostgreSQL supported by Odoo 17.0. The included Compose stack tracks PostgreSQL 17 on Debian Bookworm.
 - Python package: `requests`
 - Square Developer account with an application, access token, location IDs, and webhook signature key
 - Docker and Docker Compose for the included local development environment
@@ -61,6 +61,7 @@ Edit `.env` and set a non-default `DB_PASSWORD`.
 Start Odoo and PostgreSQL:
 
 ```bash
+docker compose build --pull
 docker compose up -d
 ```
 
@@ -145,7 +146,7 @@ DB_PASSWORD=ci_odoo_test docker compose -f docker-compose.test.yml run --rm odoo
     --test-enable \
     --workers=0 \
     --stop-after-init \
-    --test-tags=odoo_square \
+    --test-tags=/odoo_square \
     --log-level=test
 ```
 
