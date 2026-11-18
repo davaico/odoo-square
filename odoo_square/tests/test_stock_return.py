@@ -1,7 +1,8 @@
 import json
 import logging
 from unittest.mock import patch, MagicMock
-from odoo.tests.common import tagged
+from odoo import Command
+from odoo.tests.common import new_test_user, tagged
 from odoo.tools import mute_logger
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
 
@@ -61,10 +62,10 @@ class TestStockReturn(SquareHttpCase):
 
         # Mock Square API
         self._patcher_order = patch.object(
-            SquareApiClient, "get_order", side_effect=self._mock_get_order_side,
+            SquareApiClient, "_get_order", side_effect=self._mock_get_order_side,
         )
         self._patcher_catalog = patch.object(
-            SquareApiClient, "get_catalog_object", side_effect=self._mock_get_catalog_side,
+            SquareApiClient, "_get_catalog_object", side_effect=self._mock_get_catalog_side,
         )
         self._patcher_order.start()
         self._patcher_catalog.start()
@@ -76,6 +77,44 @@ class TestStockReturn(SquareHttpCase):
             except RuntimeError:
                 pass
         super().tearDown()
+
+    def test_stock_user_cannot_force_unreserved_non_square_delivery_by_rpc(self):
+        product = self.env["product.product"].create({
+            "name": "Unreserved test product", "type": "consu", "is_storable": True,
+        })
+        stock_user = new_test_user(
+            self.env, login="square-picking-stock-user", password="stock-fixture",
+            groups="stock.group_stock_user",
+        )
+        self.authenticate(stock_user.login, "stock-fixture")
+        for context in ({}, {"force_validate": True}):
+            with self.subTest(context=context):
+                picking = self.env["stock.picking"].with_user(stock_user).create({
+                    "picking_type_id": self.warehouse.out_type_id.id,
+                    "location_id": self.warehouse.lot_stock_id.id,
+                    "location_dest_id": self.env.ref("stock.stock_location_customers").id,
+                    "move_ids": [Command.create({
+                        "name": product.name, "product_id": product.id, "product_uom_qty": 2,
+                    })],
+                })
+                picking.action_confirm()
+                picking.action_assign()
+                self.assertEqual(picking.move_ids.quantity, 0)
+                response = self.url_open(
+                    "/web/dataset/call_kw",
+                    data=json.dumps({
+                        "jsonrpc": "2.0", "method": "call", "id": 1,
+                        "params": {
+                            "model": "stock.picking", "method": "button_validate",
+                            "args": [picking.ids], "kwargs": {"context": context},
+                        },
+                    }),
+                    headers={"Content-Type": "application/json"},
+                )
+                self.assertIn("error", response.json())
+                self.assertEqual(response.json()["error"]["data"]["name"], "odoo.exceptions.UserError")
+                self.assertNotEqual(picking.state, "done")
+                self.assertEqual(picking.move_ids.quantity, 0)
 
     # ── helpers ────────────────────────────────────────────────────────
 
@@ -216,7 +255,7 @@ class TestStockReturn(SquareHttpCase):
             }
         )
 
-        refund.action_process_refund()
+        refund._action_process_refund()
 
         # Return picking should have been created
         self.assertTrue(
@@ -226,7 +265,7 @@ class TestStockReturn(SquareHttpCase):
 
         # Now complete the refund
         refund.write({"status": "completed"})
-        refund.action_process_refund()
+        refund._action_process_refund()
 
         # Verify return picking is done
         for picking in refund.return_picking_ids:
@@ -280,13 +319,12 @@ class TestStockReturn(SquareHttpCase):
         if return_picking.state in ("confirmed", "waiting"):
             return_picking.action_assign()
 
-        # This is exactly what _complete_refund does — only with_context(force_validate=True)
-        return_picking.with_context(force_validate=True).button_validate()
+        return_picking._validate_square_picking(so)
 
         self.assertEqual(
             return_picking.state,
             "done",
-            "Incoming picking with force_validate should be fully validated",
+            "Square return should be fully validated",
         )
 
         for move in return_picking.move_ids:
@@ -340,7 +378,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._update_square_order(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(
@@ -391,7 +429,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._update_square_order(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(
@@ -453,7 +491,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        result = processor.process_square_order_update(order_data, so)
+        result = processor._update_square_order(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(result["status"], "updated")
@@ -506,7 +544,7 @@ class TestStockReturn(SquareHttpCase):
             ],
         }
 
-        processor.process_square_order_update(order_data, so)
+        processor._update_square_order(order_data, so)
 
         line.invalidate_recordset()
         self.assertEqual(

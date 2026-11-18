@@ -39,6 +39,18 @@ class SaleOrderLine(models.Model):
         store=True,
     )
 
+    _SQUARE_LINE_METADATA = frozenset({"square_line_id", "square_catalog_id", "returned_qty"})
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        orders = self.env["sale.order"]
+        orders._check_square_metadata_write({
+            name for name in self._SQUARE_LINE_METADATA if self.env.context.get(f"default_{name}")
+        })
+        for vals in vals_list:
+            orders._check_square_metadata_write(self._SQUARE_LINE_METADATA.intersection(vals))
+        return super().create(vals_list)
+
     @api.depends("product_uom_qty", "discount", "price_unit", "tax_id")
     def _compute_amount(self):
         """
@@ -55,6 +67,7 @@ class SaleOrderLine(models.Model):
 
     def write(self, vals):
         """Override write to handle Square tax amount setting"""
+        self.env["sale.order"]._check_square_metadata_write(self._SQUARE_LINE_METADATA.intersection(vals))
         # If we're setting exact amounts from Square, skip tax recalculation
         if self.env.context.get("skip_tax_calculation"):
             # Temporarily disable tax computation
@@ -70,7 +83,7 @@ class SaleOrderLine(models.Model):
         for line in self:
             line.effective_qty = line.product_uom_qty - line.returned_qty
 
-    def update_returned_quantity(self, returned_qty):
+    def _update_returned_quantity(self, returned_qty):
         """
         Update the returned quantity for this order line
         Called during refund processing to track returned items

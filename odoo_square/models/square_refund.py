@@ -32,7 +32,11 @@ class SquareRefund(models.Model):
 
     # Square Data
     square_refund_id = fields.Char(
-        string="Square Refund ID", required=True, index=True, copy=False
+        string="Square Refund ID", index=True, copy=False
+    )
+    unverified_square_refund_id = fields.Char(
+        string="Unverified Legacy Refund ID", readonly=True, copy=False,
+        help="Original identifier retained with historical documents after the refund was quarantined.",
     )
     square_order_id = fields.Char(string="Square Order ID", required=True, index=True)
 
@@ -87,11 +91,13 @@ class SquareRefund(models.Model):
     )
 
     # Processing Information
+    integrity_hold = fields.Boolean(readonly=True, copy=False)
+    legacy_processed = fields.Boolean(readonly=True, copy=False)
     processed_at = fields.Datetime(string="Processed At")
     processing_errors = fields.Text(string="Processing Errors")
 
     # Metadata
-    square_data = fields.Json(string="Square Data", help="Raw Square webhook data")
+    square_data = fields.Json(string="Square Data", help="Redacted Square status metadata")
     webhook_event_id = fields.Char(string="Webhook Event ID")
 
     _sql_constraints = [
@@ -99,6 +105,11 @@ class SquareRefund(models.Model):
             "square_refund_id_unique",
             "UNIQUE(square_refund_id)",
             "Square Refund ID must be unique.",
+        ),
+        (
+            "square_refund_identity",
+            "CHECK ((square_refund_id IS NULL) <> (unverified_square_refund_id IS NULL))",
+            "A refund must have either a Square refund ID or an unverified legacy refund ID.",
         ),
     ]
 
@@ -114,10 +125,12 @@ class SquareRefund(models.Model):
             }
         }
 
-    @api.depends("square_refund_id", "status", "refund_amount")
+    @api.depends("square_refund_id", "unverified_square_refund_id", "status", "refund_amount")
     def _compute_display_name(self):
         for record in self:
-            if record.square_refund_id:
+            if record.unverified_square_refund_id:
+                record.display_name = f"Unverified legacy refund {record.unverified_square_refund_id}"
+            elif record.square_refund_id:
                 record.display_name = f"Refund {record.square_refund_id} - {record.status.title()} - {record.refund_amount} {record.currency_id.name}"
             else:
                 record.display_name = f"Refund - {record.status.title()}"
@@ -148,7 +161,7 @@ class SquareRefund(models.Model):
         if result:
             return self.browse(result[0])
 
-    def create_from_square_data(self, refund_data, sale_order):
+    def _create_from_square_data(self, refund_data, sale_order):
         """Create or update a refund record from Square webhook data."""
         refund, _details_changed = self._upsert_from_square_data(refund_data, sale_order)
         return refund
@@ -186,14 +199,45 @@ class SquareRefund(models.Model):
             "status": status,
             "refund_amount": refund_amount,
             "currency_id": currency.id,
-            "square_data": refund_data,
+            "square_data": {"status": refund_data.get("status")},
         }
-        if "reason" in refund_data:
-            vals["refund_reason"] = refund_data["reason"]
         if "refunded_line_ids" in refund_data:
             vals["refunded_line_ids"] = refund_data["refunded_line_ids"]
 
         existing_refund = self._check_existing_refund(square_refund_id)
+        if existing_refund and (existing_refund.integrity_hold or existing_refund.legacy_processed):
+            credit = existing_refund.credit_note_id
+            posted_credit = (
+                credit.state == "posted" and credit.move_type == "out_refund"
+                and credit.reversed_entry_id in sale_order.invoice_ids
+                and (credit.ref or "").endswith(f"Square Refund: {square_refund_id}")
+            )
+            if posted_credit:
+                if status == "completed" and (
+                    credit.currency_id != currency
+                    or currency.compare_amounts(credit.amount_total, refund_amount)
+                ):
+                    raise RefundProcessingDeferred("A legacy Square refund requires accounting reconciliation.")
+                if not existing_refund.integrity_hold and existing_refund.sale_order_id == sale_order:
+                    if status == "completed":
+                        existing_refund.legacy_processed = False
+                    return existing_refund, False
+                raise RefundProcessingDeferred("A legacy Square refund requires accounting reconciliation.")
+            if any(
+                picking.state == "done" and picking.return_id in sale_order.picking_ids
+                for picking in existing_refund.return_picking_ids
+            ):
+                raise RefundProcessingDeferred("A legacy Square refund requires stock reconciliation.")
+            # Untrusted legacy data cannot suppress the provider's status or
+            # instruct the service to reuse its draft documents or relations.
+            existing_refund.write({
+                "unverified_square_refund_id": square_refund_id,
+                "square_refund_id": False,
+                "integrity_hold": True,
+            })
+            # Release the unique provider ID before inserting the verified refund.
+            existing_refund.flush_recordset(["square_refund_id", "unverified_square_refund_id"])
+            existing_refund = self.browse()
         if existing_refund:
             if existing_refund.sale_order_id != sale_order:
                 raise ValidationError("Square refund is already linked to a different sale order")
@@ -210,12 +254,12 @@ class SquareRefund(models.Model):
 
         vals.update({
             "square_refund_id": square_refund_id,
-            "square_order_id": refund_data.get("order_id"),
+            "square_order_id": sale_order.square_order_id,
             "sale_order_id": sale_order.id,
             "webhook_event_id": refund_data.get("webhook_event_id"),
         })
         try:
-            return self.with_user(self._get_bot_user()).create(vals), False
+            return self.with_user(self._get_bot_user()).sudo().create(vals), False
         except errors.UniqueViolation as error:
             if error.diag.constraint_name != f"{self._table}_square_refund_id_unique":
                 raise
@@ -225,6 +269,9 @@ class SquareRefund(models.Model):
 
     def _process_webhook_refund(self, refund_data, sale_order, event_type, webhook_event_id):
         """Apply a Square refund event atomically and preserve completed refunds on replay."""
+        if not sale_order.square_order_id or sale_order.company_id != self.env.company:
+            raise AccessError("This sale is outside the Square integration's company.")
+        sale_order.with_user(self._get_bot_user()).check_access("read")
         refund_id = refund_data.get("id")
         order_id = refund_data.get("order_id")
         refund_status = (refund_data.get("status") or "PENDING").strip().upper()
@@ -246,7 +293,7 @@ class SquareRefund(models.Model):
 
         try:
             with self.env.cr.savepoint():
-                refund_record, details_changed = self.with_user(self._get_bot_user())._upsert_from_square_data(
+                refund_record, details_changed = self.with_user(self._get_bot_user()).sudo()._upsert_from_square_data(
                     refund_data, sale_order
                 )
 
@@ -259,13 +306,13 @@ class SquareRefund(models.Model):
 
                 if webhook_event_id:
                     refund_record.webhook_event_id = webhook_event_id
-                refund_record.with_context(square_refund_details_changed=details_changed).action_process_refund()
+                refund_record.with_context(square_refund_details_changed=details_changed)._action_process_refund()
         except RefundProcessingDeferred as error:
             _logger.warning("Deferring Square refund %s: %s", refund_id, error)
             return {"status": "retry", "message": str(error), "refund_id": refund_id}
 
         # Log webhook processing
-        self.env["square.integration.log"].log_square_event(
+        self.env["square.integration.log"]._log_square_event(
             event_type=f"refund_{event_type}",
             title=f"Remboursement {event_type} traité pour la commande {sale_order.name}",
             description=f"""
@@ -294,14 +341,7 @@ class SquareRefund(models.Model):
         }
 
     def _get_bot_user(self):
-        """Get the Square integration bot user"""
-        try:
-            bot_user = self.env.ref("odoo_square.user_square_bot")
-            return bot_user
-        except ValueError:
-            # Fallback to admin user if bot user doesn't exist
-            _logger.warning("Square bot user not found, falling back to admin user")
-            return self.env.ref("base.user_admin")
+        return self.env["square.order.processor"]._get_square_bot_user()
 
     def _add_adjustment_line(self, original_line, qty, bot_user):
         """Create or update a negative adjustment line for a refunded quantity.
@@ -344,7 +384,7 @@ class SquareRefund(models.Model):
         )
         return created
 
-    def action_process_refund(self):
+    def _action_process_refund(self):
         """
         Process the refund based on current status
         """
@@ -381,7 +421,7 @@ class SquareRefund(models.Model):
                     self.credit_note_id = self._create_credit_note()
 
                 # Log the pending refund actions
-                self.env["square.integration.log"].log_square_event(
+                self.env["square.integration.log"]._log_square_event(
                     event_type="refund_processed",
                     title=f"Actions de remboursement en attente créées pour {sale_order.name}",
                     description=f"""
@@ -410,7 +450,7 @@ class SquareRefund(models.Model):
                 raise
             except Exception as e:
                 _logger.error(f"Error creating pending refund actions: {str(e)}")
-                self.processing_errors = str(e)
+                self.processing_errors = "Square refund processing failed."
                 raise UserError(
                     f"Erreur lors de la création des actions de remboursement : {str(e)}"
                 )
@@ -460,10 +500,9 @@ class SquareRefund(models.Model):
                         picking.action_assign()
                     if picking.state in ("assigned", "confirmed", "waiting"):
                         picking.with_context(
-                            force_validate=True,
                             mail_auto_subscribe_no_notify=True,
                             mail_create_nosubscribe=True,
-                        ).button_validate()
+                        )._validate_square_picking(self.sale_order_id)
                     if picking.state != "done":
                         raise UserError(f"Le retour {picking.name} n'a pas été validé")
 
@@ -474,7 +513,7 @@ class SquareRefund(models.Model):
                             qty = move.product_uom._compute_quantity(
                                 move.quantity, line.product_uom
                             )
-                            returned_qty = line.update_returned_quantity(qty)
+                            returned_qty = line._update_returned_quantity(qty)
                             self._add_adjustment_line(line, returned_qty, bot_user)
                 elif not self._get_completed_deliveries():
                     self._update_order_line_quantities_from_square(
@@ -503,12 +542,12 @@ class SquareRefund(models.Model):
                     },
                 }
 
-                self.env["square.integration.log"].log_refund_processed(
+                self.env["square.integration.log"]._log_refund_processed(
                     sale_order=self.sale_order_id, refund_data=refund_data
                 )
 
                 # Log completion
-                self.env["square.integration.log"].log_square_event(
+                self.env["square.integration.log"]._log_square_event(
                     event_type="refund_processed",
                     title=f"Remboursement finalisé pour {self.sale_order_id.name}",
                     description=f"""
@@ -536,7 +575,7 @@ class SquareRefund(models.Model):
                 raise
             except Exception as e:
                 _logger.error(f"Error completing refund: {str(e)}")
-                self.processing_errors = str(e)
+                self.processing_errors = "Square refund processing failed."
                 raise UserError(
                     f"Erreur lors de la finalisation du remboursement : {str(e)}"
                 )
@@ -883,7 +922,7 @@ class SquareRefund(models.Model):
             if returned_qty > 0:
                 max_returnable = single_line.product_uom_qty - single_line.returned_qty
                 returned_qty = min(returned_qty, max_returnable)
-                actual_returned = single_line.update_returned_quantity(returned_qty)
+                actual_returned = single_line._update_returned_quantity(returned_qty)
                 self._add_adjustment_line(single_line, returned_qty, bot_user)
                 _logger.info(
                     f"Single line refund - Created adjustment line for {single_line.product_id.name}: qty -{returned_qty}, returned {actual_returned} units"
@@ -911,7 +950,7 @@ class SquareRefund(models.Model):
                 returned_qty = min(product_data["count"], line.product_uom_qty - line.returned_qty)
                 if returned_qty <= 0:
                     continue
-                actual_returned = line.update_returned_quantity(returned_qty)
+                actual_returned = line._update_returned_quantity(returned_qty)
                 self._add_adjustment_line(line, returned_qty, bot_user)
                 _logger.info(
                     f"Multi-line refund - Adjustment line for {line.product_id.name}: qty -{returned_qty}, returned {actual_returned} units"
@@ -968,7 +1007,7 @@ class SquareRefund(models.Model):
             returned_qty = min(alloc["allocated"], alloc["remaining_qty"])
             if returned_qty <= 0:
                 continue
-            actual_returned = alloc["line"].update_returned_quantity(returned_qty)
+            actual_returned = alloc["line"]._update_returned_quantity(returned_qty)
             self._add_adjustment_line(alloc["line"], returned_qty, bot_user)
             _logger.info(
                 f"Proportional refund - Adjustment line for {alloc['line'].product_id.name}: qty -{returned_qty}, returned {actual_returned} units (exact={alloc['exact']:.2f})"
@@ -1061,7 +1100,7 @@ class SquareRefund(models.Model):
         """
         try:
             square_api = self.env["square.api.client"]
-            order_data = square_api.get_order(self.square_order_id)
+            order_data = square_api._get_order(self.square_order_id)
 
             if not order_data:
                 _logger.warning(
@@ -1162,7 +1201,7 @@ class SquareRefund(models.Model):
 
                     if current_quantity < original_qty:
                         returned_qty = original_qty - current_quantity
-                        actual_returned = matching_line.update_returned_quantity(
+                        actual_returned = matching_line._update_returned_quantity(
                             returned_qty
                         )
 
@@ -1245,7 +1284,7 @@ class SquareRefund(models.Model):
             effective_qty = min(refunded_quantity, refundable_left)
             if effective_qty <= 0:
                 continue
-            actual_returned = line.update_returned_quantity(effective_qty)
+            actual_returned = line._update_returned_quantity(effective_qty)
             self._add_adjustment_line(line, effective_qty, bot_user)
             total_returned_qty += actual_returned
             _logger.info(
@@ -1430,7 +1469,7 @@ class SquareRefund(models.Model):
                 self.credit_note_id.button_cancel()
 
             # Log failure
-            self.env["square.integration.log"].log_square_event(
+            self.env["square.integration.log"]._log_square_event(
                 event_type="refund_processed",
                 title=f"Remboursement échoué pour {self.sale_order_id.name}",
                 description=f"""
@@ -1466,7 +1505,7 @@ class SquareRefund(models.Model):
                 self.credit_note_id.button_cancel()
 
             # Log cancellation
-            self.env["square.integration.log"].log_square_event(
+            self.env["square.integration.log"]._log_square_event(
                 event_type="refund_processed",
                 title=f"Remboursement annulé pour {self.sale_order_id.name}",
                 description=f"""

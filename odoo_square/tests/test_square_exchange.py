@@ -29,6 +29,7 @@ class TestSquareExchange(SquareHttpCase):
             {
                 "name": "Exchange Integration",
                 "square_application_id": "test_app_id",
+                "square_webhook_signature_key": "test-pos-webhook-key",
                 "square_access_token": "test_access_token",
                 "payment_journal_id": self.journal.id,
             }
@@ -93,6 +94,8 @@ class TestSquareExchange(SquareHttpCase):
             "tenders": [
                 {
                     "id": "original-square-payment",
+                    "type": "CARD",
+                    "card_details": {"status": "CAPTURED"},
                     "amount_money": {"amount": 2400, "currency": "EUR"},
                 }
             ],
@@ -115,28 +118,27 @@ class TestSquareExchange(SquareHttpCase):
             ],
         }
         orders = {order["id"]: order for order in (self.original_order, self.exchange_order)}
-        get_order = patch.object(SquareApiClient, "get_order", side_effect=orders.get)
+        get_order = patch.object(SquareApiClient, "_get_order", side_effect=orders.get)
         self.catalog = {
             "ORIGINAL-CATALOG": {"success": True, "sku": "ORIGINAL-SKU"},
             "REPLACEMENT-CATALOG": {"success": True, "sku": "REPLACEMENT-SKU"},
         }
         get_catalog = patch.object(
-            SquareApiClient, "get_catalog_object", side_effect=self.catalog.__getitem__
+            SquareApiClient, "_get_catalog_object", side_effect=self.catalog.__getitem__
         )
         get_order.start()
         self.addCleanup(get_order.stop)
         get_catalog.start()
         self.addCleanup(get_catalog.stop)
 
-    def _send_webhook(self, event_type, event_id, data, expected_status):
-        response = self.url_open(
-            "/square/webhook",
+    def _send_webhook(self, event_type, event_id, data, expected_status, *, http_status=200):
+        response = self.post_square_webhook(
             data=json.dumps(
                 {"type": event_type, "event_id": event_id, "data": {"object": data}}
             ),
             headers={"Content-Type": "application/json"},
         )
-        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.status_code, http_status, response.text)
         self.assertEqual(response.json()["status"], expected_status, response.text)
         return response.json()
 
@@ -366,6 +368,21 @@ class TestSquareExchange(SquareHttpCase):
     def test_lower_price_exchange_records_only_the_refund_difference(self):
         self._set_replacement_price(amount=600, tax=100)
         self._exercise_exchange(payment_amount=0, invoice_total=6, payment_direction="outbound", delta=6)
+
+    def test_exchange_waits_for_source_order_and_square_lookup(self):
+        self._set_replacement_price(amount=1200, tax=200)
+        payment = {"payment": self._payment_notice("COMPLETED", 0)}
+        with patch.object(SquareApiClient, "_get_order", return_value=None):
+            self._send_webhook("payment.updated", "early-exchange", payment, "retry", http_status=503)
+        self._send_webhook("payment.updated", "early-exchange", payment, "retry", http_status=503)
+        self.assertFalse(self._exchange_orders())
+        self.assertFalse(self._payments())
+        _, _, original_payment, delivery = self._import_original_sale()
+        for status in ("success", "already_processed"):
+            self._send_webhook("payment.updated", "early-exchange", payment, status)
+            self.assertEqual(len(self._exchange_orders()), 2)
+            self.assertEqual(self._payments(), original_payment)
+            self._assert_movement(delivery.return_ids, "incoming", self.original_product, 1)
 
     def test_failed_exchange_rolls_back_and_the_same_event_can_retry(self):
         self._set_replacement_price(amount=1200, tax=200)

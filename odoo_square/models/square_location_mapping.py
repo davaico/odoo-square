@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 # Copyright 2024 Davai
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
-import logging
 from odoo import models, fields, api
-
-_logger = logging.getLogger(__name__)
+from odoo.exceptions import AccessError, ValidationError
 
 
 class SquareLocationMapping(models.Model):
@@ -62,58 +60,24 @@ class SquareLocationMapping(models.Model):
         ),
     ]
 
-    @api.model_create_multi
-    def create(self, vals_list):
-        """Override create to validate warehouse selection"""
-        records = super().create(vals_list)
-
-        # Handle single record case
-        if not isinstance(records, list):
-            records = [records]
-
-        # Validate each record
-        for record in records:
-            # Validate that the selected warehouse is not already mapped in this config
-            existing_mapping = self.search(
-                [
-                    ("config_id", "=", record.config_id.id),
-                    ("warehouse_id", "=", record.warehouse_id.id),
-                    ("id", "!=", record.id),
-                ]
-            )
-
-            if existing_mapping:
-                raise models.ValidationError(
-                    f"Warehouse '{record.warehouse_id.name}' is already mapped to another Square location in this configuration."
-                )
-
-            _logger.info(
-                f"Created mapping: Square location '{record.square_location_name}' -> "
-                f"Odoo warehouse '{record.warehouse_id.name}'"
-            )
-
-        return records[0] if len(records) == 1 else records
-
-    def write(self, vals):
-        """Override write to validate warehouse selection"""
-        result = super().write(vals)
-
-        if "warehouse_id" in vals:
-            # Validate that the selected warehouse is not already mapped in this config
-            existing_mapping = self.search(
-                [
-                    ("config_id", "=", self.config_id.id),
-                    ("warehouse_id", "=", self.warehouse_id.id),
-                    ("id", "!=", self.id),
-                ]
-            )
-
-            if existing_mapping:
-                raise models.ValidationError(
-                    f"Warehouse '{self.warehouse_id.name}' is already mapped to another Square location in this configuration."
-                )
-
-        return result
+    @api.constrains("config_id", "warehouse_id", "sales_team_id", "square_location_id", "active")
+    def _check_mapping_scope(self):
+        for mapping in self:
+            mapping.config_id.check_access("write")
+            company = mapping.config_id.company_id
+            if not company or mapping.warehouse_id.company_id != company:
+                raise ValidationError("The warehouse must belong to the Square configuration's company.")
+            if mapping.sales_team_id.company_id and mapping.sales_team_id.company_id != company:
+                raise ValidationError("The sales team must belong to the Square configuration's company.")
+            location_id = mapping.square_location_id
+            if not location_id or not location_id.strip() or location_id != location_id.strip():
+                raise ValidationError("Enter a valid Square location ID.")
+            if mapping.active and self.with_context(active_test=True).search_count([
+                ("config_id", "=", mapping.config_id.id),
+                ("warehouse_id", "=", mapping.warehouse_id.id),
+                ("id", "!=", mapping.id),
+            ], limit=1):
+                raise ValidationError("A warehouse can only have one active mapping per Square configuration.")
 
     @api.depends("square_location_name", "warehouse_id.name")
     def _compute_display_name(self):
@@ -133,28 +97,17 @@ class SquareLocationMapping(models.Model):
     @api.model
     def _get_square_locations(self, config):
         """Get available Square locations from API"""
-        try:
-            square_api = self.env["square.api.client"]
-            locations = square_api.get_locations()
-
-            if not locations:
-                return []
-
-            # Format for selection: [{"id": "location_id", "name": "Location Name"}]
-            formatted_locations = []
-            for location in locations:
-                formatted_locations.append(
-                    {
-                        "id": location.get("id"),
-                        "name": location.get("name", "Unknown Location"),
-                    }
-                )
-
-            return formatted_locations
-
-        except Exception as e:
-            _logger.error(f"Error fetching Square locations: {str(e)}")
-            return []
+        # The form can call onchange on a virtual record before any ACL is checked.
+        if not self.env.is_system():
+            raise AccessError("Only Square administrators can read available Square locations.")
+        if config._origin:
+            config._origin.check_access("read")
+        locations = self.env["square.api.client"]._get_locations(square_config=config)
+        return [
+            {"id": location["id"], "name": location.get("name", "Unknown Location")}
+            for location in locations
+            if isinstance(location, dict) and location.get("id")
+        ]
 
     @api.onchange("square_location_id")
     def _onchange_square_location_id(self):

@@ -2,8 +2,10 @@
 # Copyright 2024 Davai
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import logging
-from odoo import api, fields, models
-from odoo.exceptions import ValidationError
+from odoo import Command, api, fields, models
+from odoo.exceptions import AccessError, ValidationError
+
+from .square_order_processor import SquareOrderProcessingDeferred
 
 _logger = logging.getLogger(__name__)
 
@@ -12,8 +14,14 @@ class SquareConfig(models.Model):
     _name = "square.config"
     _description = "Square Configuration"
     _rec_name = "name"
+    _check_company_auto = True
 
     name = fields.Char(string="Name", default="Square Configuration", required=True)
+
+    company_id = fields.Many2one(
+        "res.company", default=lambda self: self.env.company, required=True,
+        readonly=True, index=True,
+    )
 
     # Square API Configuration
     square_application_id = fields.Char(
@@ -25,6 +33,7 @@ class SquareConfig(models.Model):
     square_access_token = fields.Char(
         string="Square Access Token",
         help="Your Square Access Token for API authentication",
+        groups="base.group_system",
         required=True,
     )
 
@@ -39,6 +48,7 @@ class SquareConfig(models.Model):
     square_webhook_signature_key = fields.Char(
         string="Webhook Signature Key",
         help="Webhook signature key for secure webhook verification",
+        groups="base.group_system",
     )
 
     # Location to Warehouse Mapping
@@ -52,6 +62,7 @@ class SquareConfig(models.Model):
     default_sales_team_id = fields.Many2one(
         "crm.team",
         string="Default Sales Team",
+        check_company=True,
         help="Used when a location mapping has no Sales Team, or for unknown locations "
         "(same fallback order as warehouse).",
     )
@@ -60,6 +71,7 @@ class SquareConfig(models.Model):
     payment_journal_id = fields.Many2one(
         "account.journal",
         string="Payment Journal",
+        check_company=True,
         help="Select the journal where Square payments will be recorded",
         context={"create": True},
     )
@@ -103,24 +115,42 @@ class SquareConfig(models.Model):
             return ".".join(parts[2:5])
         return version
 
-    def get_warehouse_for_location(self, square_location_id):
+    def _company_location_mappings(self):
+        self.ensure_one()
+        return self.sudo().location_mapping_ids.filtered(
+            lambda mapping: mapping.warehouse_id.company_id == self.company_id
+        )
+
+    def _default_warehouse(self):
+        self.ensure_one()
+        return self.env["stock.warehouse"].search(
+            [("company_id", "=", self.company_id.id)], limit=1
+        )
+
+    def _get_warehouse_for_location(self, square_location_id):
         """Get the configured warehouse for a specific Square location"""
         self.ensure_one()
 
-        # Find mapping for this location
-        mapping = self.location_mapping_ids.filtered(
+        # Refuse an explicit cross-company mapping retained from an earlier
+        # installation; falling back would fulfill at an arbitrary warehouse.
+        mapping = self.sudo().with_context(active_test=False).location_mapping_ids.filtered(
             lambda m: m.square_location_id == square_location_id
         )
 
         if mapping:
+            if not mapping.active:
+                raise SquareOrderProcessingDeferred("The warehouse mapping for this Square location is archived.")
+            if mapping.warehouse_id.company_id != self.company_id:
+                raise SquareOrderProcessingDeferred("The Square location is mapped to a warehouse in another company.")
             _logger.info(
                 f"Using mapped warehouse '{mapping.warehouse_id.name}' for Square location '{square_location_id}'"
             )
             return mapping.warehouse_id
 
         # Fallback: try to find any mapping (useful for single-location setups)
-        if self.location_mapping_ids:
-            first_mapping = self.location_mapping_ids[0]
+        mappings = self._company_location_mappings()
+        if mappings:
+            first_mapping = mappings[0]
             _logger.warning(
                 f"No specific mapping found for Square location '{square_location_id}', "
                 f"using first available warehouse: {first_mapping.warehouse_id.name}"
@@ -128,7 +158,7 @@ class SquareConfig(models.Model):
             return first_mapping.warehouse_id
 
         # Last resort: use first available warehouse
-        warehouse = self.env["stock.warehouse"].search([], limit=1)
+        warehouse = self._default_warehouse()
         if warehouse:
             _logger.warning(
                 f"No warehouse mappings configured for Square, using default warehouse: {warehouse.name}"
@@ -145,7 +175,7 @@ class SquareConfig(models.Model):
             return True
         return team.company_id.id == company.id
 
-    def get_sales_team_for_location(self, square_location_id, company=None):
+    def _get_sales_team_for_location(self, square_location_id, company=None):
         """Sales Team for a Square location: mapping → first mapping → default."""
         self.ensure_one()
         company = company or self.env.company
@@ -153,7 +183,7 @@ class SquareConfig(models.Model):
         def pick(team):
             return team if self._sales_team_matches_company(team, company) else False
 
-        mapping = self.location_mapping_ids.filtered(
+        mapping = self._company_location_mappings().filtered(
             lambda m: m.square_location_id == square_location_id
         )[:1]
 
@@ -167,8 +197,9 @@ class SquareConfig(models.Model):
                 )
                 return team
 
-        if self.location_mapping_ids:
-            first = self.location_mapping_ids[0]
+        mappings = self._company_location_mappings()
+        if mappings:
+            first = mappings[0]
             if first.sales_team_id:
                 team = pick(first.sales_team_id)
                 if team:
@@ -191,20 +222,21 @@ class SquareConfig(models.Model):
 
         return self.env["crm.team"].browse()
 
-    def get_configured_warehouse(self):
+    def _get_configured_warehouse(self):
         """Get the configured warehouse for Square operations (legacy method)"""
         self.ensure_one()
 
         # For backward compatibility, return first mapped warehouse or default
-        if self.location_mapping_ids:
-            first_mapping = self.location_mapping_ids[0]
+        mappings = self._company_location_mappings()
+        if mappings:
+            first_mapping = mappings[0]
             _logger.info(
                 f"Using first mapped warehouse: {first_mapping.warehouse_id.name}"
             )
             return first_mapping.warehouse_id
 
         # Fallback to first warehouse if none configured
-        warehouse = self.env["stock.warehouse"].search([], limit=1)
+        warehouse = self._default_warehouse()
         if warehouse:
             _logger.warning(
                 f"No warehouse mappings configured for Square, using default warehouse: {warehouse.name}"
@@ -212,10 +244,10 @@ class SquareConfig(models.Model):
             return warehouse
         return None
 
-    def get_payment_journal(self):
+    def _get_payment_journal(self):
         """Get the configured payment journal for Square payments"""
         self.ensure_one()
-        if self.payment_journal_id:
+        if self.payment_journal_id.company_id == self.company_id:
             _logger.info(
                 f"Using configured payment journal: {self.payment_journal_id.name}"
             )
@@ -223,7 +255,7 @@ class SquareConfig(models.Model):
         else:
             # Fallback to first available bank journal if none configured
             bank_journal = self.env["account.journal"].search(
-                [("type", "=", "bank")], limit=1
+                [("type", "=", "bank"), ("company_id", "=", self.company_id.id)], limit=1
             )
             if bank_journal:
                 _logger.warning(
@@ -235,19 +267,53 @@ class SquareConfig(models.Model):
     @api.model_create_multi
     def create(self, vals_list):
         # Ensure only one configuration exists
-        if self.search_count([]) > 0:
+        if len(vals_list) != 1 or self.sudo().with_context(active_test=False).search_count([]):
             raise ValidationError(
                 "Only one Square configuration is allowed. Please modify the existing configuration."
             )
-        return super().create(vals_list)
+        config = super().create(vals_list)
+        config._authorize_company_for_bot()
+        return config
+
+    def _authorize_company_for_bot(self):
+        self.ensure_one()
+        bot = self.env.ref("odoo_square.user_square_bot").sudo()
+        if self.company_id not in bot.company_ids:
+            bot.write({"company_ids": [Command.link(self.company_id.id)]})
+
+    def write(self, vals):
+        self.check_access("write")
+        if "company_id" in vals and any(config.company_id.id != vals["company_id"] for config in self):
+            raise ValidationError("The company of an existing Square configuration cannot be changed.")
+        routing_fields = {"square_access_token", "square_environment", "square_webhook_signature_key", "active"}
+        changed = self.filtered(lambda config: any(
+            config.sudo()[key] != vals[key] for key in routing_fields.intersection(vals)
+        ))
+        result = super().write(vals)
+        if changed:
+            self.env["square.webhook.queue"].sudo().search([
+                ("config_id", "in", changed.ids), ("state", "in", ("pending", "processing")),
+            ]).write({
+                "state": "failed", "order_data": "{}", "signature_verified": False,
+                "error_message": "Square credentials or configuration changed; waiting for signed delivery.",
+            })
+        return result
+
+    def _check_square_operator(self):
+        self.ensure_one()
+        if not self.env.user.has_group("base.group_system"):
+            raise AccessError("Only administrators can operate the Square integration.")
+        self.check_access("read")
+        if not self.active or self.company_id != self.env.company:
+            raise AccessError("Switch to the active Square configuration's company.")
 
     def test_square_connection(self):
         """Test the connection to Square API"""
-        self.ensure_one()
+        self._check_square_operator()
 
         try:
             square_api = self.env["square.api.client"]
-            result = square_api.test_connection()
+            result = square_api._test_connection()
 
             if result["success"]:
                 self.connection_status = "connected"
@@ -289,64 +355,44 @@ class SquareConfig(models.Model):
 
     def sync_square_locations(self):
         """Sync Square locations and create mappings for unmapped locations"""
-        self.ensure_one()
+        self._check_square_operator()
 
-        try:
-            # Get Square API client
-            square_api = self.env["square.api.client"]
-            locations = square_api.get_locations()
-
-            if not locations:
-                _logger.warning("No Square locations found to sync")
-                return False
-
-            # Get existing mappings
-            existing_location_ids = set(
-                self.location_mapping_ids.mapped("square_location_id")
-            )
-
-            # Create mappings for new locations
-            new_mappings = []
-            for location in locations:
-                location_id = location.get("id")
-                location_name = location.get("name", "Unknown Location")
-
-                if location_id not in existing_location_ids:
-                    # Try to find a matching warehouse by name similarity or use first available
-                    suggested_warehouse = self._suggest_warehouse_for_location(
-                        location_name
-                    )
-
-                    new_mappings.append(
-                        {
-                            "square_location_id": location_id,
-                            "square_location_name": location_name,
-                            "warehouse_id": (
-                                suggested_warehouse.id if suggested_warehouse else False
-                            ),
-                        }
-                    )
-
-            # Create the new mappings
-            if new_mappings:
-                for mapping_vals in new_mappings:
-                    self.env["square.location.mapping"].create(
-                        {"config_id": self.id, **mapping_vals}
-                    )
-
-                _logger.info(f"Created {len(new_mappings)} new location mappings")
-
-            return True
-
-        except Exception as e:
-            _logger.error(f"Error syncing Square locations: {str(e)}")
+        locations = self.env["square.api.client"]._get_locations()
+        if not locations:
+            _logger.warning("No Square locations found to sync")
             return False
+
+        existing_ids = set(
+            self.with_context(active_test=False).location_mapping_ids.mapped("square_location_id")
+        )
+        mappings = []
+        for location in locations:
+            location_id = location["id"]
+            if location_id in existing_ids:
+                continue
+            name = location.get("name") or "Unknown Location"
+            warehouse = self._suggest_warehouse_for_location(name)
+            mappings.append({
+                "config_id": self.id,
+                "square_location_id": location_id,
+                "square_location_name": name,
+                "warehouse_id": warehouse.id,
+            })
+            existing_ids.add(location_id)
+
+        if mappings:
+            with self.env.cr.savepoint():
+                self.env["square.location.mapping"].create(mappings)
+            _logger.info("Created %s new location mappings", len(mappings))
+        return True
 
     def _suggest_warehouse_for_location(self, location_name):
         """Suggest a warehouse for a Square location based on name similarity"""
+        company_domain = [("company_id", "=", self.company_id.id)]
+
         # First, try exact name match
         exact_match = self.env["stock.warehouse"].search(
-            [("name", "ilike", location_name)], limit=1
+            company_domain + [("name", "ilike", location_name)], limit=1
         )
 
         if exact_match:
@@ -354,7 +400,7 @@ class SquareConfig(models.Model):
 
         # Try partial name match
         partial_matches = self.env["stock.warehouse"].search(
-            [("name", "ilike", f"%{location_name}%")]
+            company_domain + [("name", "ilike", f"%{location_name}%")]
         )
 
         if partial_matches:
@@ -365,17 +411,17 @@ class SquareConfig(models.Model):
         for word in location_words:
             if len(word) > 3:  # Only check meaningful words
                 word_match = self.env["stock.warehouse"].search(
-                    [("name", "ilike", f"%{word}%")], limit=1
+                    company_domain + [("name", "ilike", f"%{word}%")], limit=1
                 )
                 if word_match:
                     return word_match
 
         # Fallback to first available warehouse
-        return self.env["stock.warehouse"].search([], limit=1)
+        return self._default_warehouse()
 
     def action_open_manual_resync_wizard(self):
         """Open the manual resync wizard for missing orders"""
-        self.ensure_one()
+        self._check_square_operator()
 
         # Create or get the wizard
         wizard = self.env["square.manual.resync.wizard"].create(

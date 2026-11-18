@@ -4,9 +4,14 @@ from odoo import fields, models
 from odoo.exceptions import UserError
 from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo.tools.float_utils import float_is_zero
+import json
 import logging
 
 _logger = logging.getLogger(__name__)
+
+
+class SquareOrderProcessingDeferred(UserError):
+    """The signed order event needs to be retried after rolling back business effects."""
 
 
 class SquareOrderProcessor(models.Model):
@@ -14,20 +19,11 @@ class SquareOrderProcessor(models.Model):
     _description = "Square Order Processor"
 
     def _get_square_bot_user(self):
-        """Get the Square integration bot user"""
-        try:
-            bot_user = self.env.ref("odoo_square.user_square_bot")
-            # Ensure the bot user has a partner_id
-            if not bot_user.partner_id:
-                _logger.warning(
-                    f"Square bot user {bot_user.name} has no partner_id, this may cause issues"
-                )
-            return bot_user
-        except ValueError:
-            # Fallback to admin user if bot user doesn't exist
-            _logger.warning("Square bot user not found, falling back to admin user")
-            admin_user = self.env.ref("base.user_admin")
-            return admin_user
+        """Require the integration identity to be authorized for this company."""
+        bot = self.env.ref("odoo_square.user_square_bot", raise_if_not_found=False)
+        if not bot or not bot.sudo().active or self.env.company not in bot.sudo().company_ids:
+            raise UserError("The Square integration bot is not authorized for this company.")
+        return bot
 
     def _check_existing_order(self, square_order_id):
         """
@@ -43,10 +39,10 @@ class SquareOrderProcessor(models.Model):
             self.env.cr.execute(
                 """
                 SELECT id FROM sale_order 
-                WHERE square_order_id = %s 
+                WHERE square_order_id = %s AND company_id = %s
                 FOR UPDATE NOWAIT
                 """,
-                (square_order_id,),
+                (square_order_id, self.env.company.id),
             )
             result = self.env.cr.fetchone()
 
@@ -57,6 +53,8 @@ class SquareOrderProcessor(models.Model):
                 )
                 return existing_order
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except Exception as e:
             # If we can't acquire the lock immediately, another process is creating this order
             # Fall back to regular search which might find the order if it was just created
@@ -64,7 +62,7 @@ class SquareOrderProcessor(models.Model):
                 f"Could not acquire lock for Square order {square_order_id}, checking normally: {str(e)}"
             )
             existing_order = self.env["sale.order"].search(
-                [("square_order_id", "=", square_order_id)], limit=1
+                [("square_order_id", "=", square_order_id), ("company_id", "=", self.env.company.id)], limit=1
             )
 
             if existing_order:
@@ -75,53 +73,208 @@ class SquareOrderProcessor(models.Model):
 
         return None
 
-    def _get_webhook_replay_result(self, order_id, order_state, event_type, event_id):
-        """Identify replayed order states and previously successful event IDs."""
-        logs = self.env["square.integration.log"].sudo()
-        # Open orders can receive several distinct updates before changing state.
-        # Deduplicate those updates by event ID so each change can be applied.
-        if event_type != "updated" or order_state not in ("OPEN", "DRAFT"):
-            state_domain = [("description", "ilike", f"state: {order_state}")]
-            if event_type == "updated" and str(order_state).upper() in (
-                "CANCELED",
-                "CANCELLED",
-            ):
-                # Match historical success logs for either spelling.
-                state_domain = [
-                    ("event_type", "=", "order_updated"),
-                    "|",
-                    ("description", "ilike", "state: CANCELED"),
-                    ("description", "ilike", "state: CANCELLED"),
-                ]
-            existing_log = logs.search(
-                [
-                    ("square_order_id", "=", order_id),
-                    ("status", "=", "success"),
-                ] + state_domain,
-                limit=1,
+    def _process_webhook_order(
+        self, order_data, event_type, event_id=None, *,
+        square_config=None, verified_order=None, requires_existing=False, signed=False,
+    ):
+        """Apply a trusted notification or an order read by the resync wizard."""
+        order_data = dict(order_data or {})
+        order_id = order_data.get("order_id") or order_data.get("id")
+        if not order_id:
+            return {"status": "error", "message": "Square order ID is missing"}
+        order_data["order_id"] = order_id
+        order_state = order_data.get("state")
+        normalized = "CANCELED" if str(order_state).upper() in ("CANCELED", "CANCELLED") else order_state
+        state_key = None
+        if normalized in ("COMPLETED", "CANCELED"):
+            state_key = "order:" + json.dumps([order_id, event_type, normalized])
+
+        return self.env["square.webhook.event"]._apply_once(
+            square_config, state_key,
+            lambda: self._apply_webhook_order(
+                order_data, order_id, order_state, event_type, event_id,
+                square_config, verified_order, requires_existing, signed,
+            ),
+        )
+
+    def _apply_webhook_order(
+        self, order_data, order_id, order_state, event_type, event_id,
+        square_config, verified_order, requires_existing, signed,
+    ):
+        api_client = self.env["square.api.client"].sudo()
+        config = api_client._website_routing_config(square_config)
+        routing, order_payload = api_client._route_website_order(order_id, config, order=verified_order)
+        if routing:
+            return routing
+
+        if requires_existing and order_id and not self.env["sale.order"].sudo().search_count(
+            [("square_order_id", "=", order_id), ("company_id", "=", self.env.company.id)], limit=1,
+        ):
+            return {"status": "waiting_for_order"}
+
+        bot_user = None
+        try:
+            # Get bot user in separate transaction
+            with self.env.cr.savepoint():
+                bot_user = self._get_square_bot_user()
+
+            # Main processing in separate transaction
+            try:
+                with self.env.cr.savepoint():
+                    square_processor = self.with_user(bot_user)
+
+                    # Handle the order based on event type
+                    if event_type == "created":
+                        result = square_processor._process_square_order(
+                            order_data, order_payload=order_payload
+                        )
+
+                        # After successfully creating order, process any pending queued events
+                        if result.get("status") == "success":
+                            try:
+                                self.env[
+                                    "square.webhook.queue"
+                                ].sudo()._process_pending_for_order(order_id, config)
+                            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                                raise
+                            except Exception as queue_error:
+                                _logger.warning(
+                                    f"Error processing queued events after order creation: {str(queue_error)}"
+                                )
+
+                    elif event_type == "updated":
+                        # For updates, we need to find the existing order first
+                        existing_order = (
+                            self.env["sale.order"]
+                            .sudo()
+                            .search([("square_order_id", "=", order_id), ("company_id", "=", self.env.company.id)], limit=1)
+                        )
+                        if existing_order:
+                            result = square_processor._process_square_order_update(
+                                order_data, existing_order, order_payload=order_payload
+                            )
+                        elif order_state == "COMPLETED":
+                            # Square may send order.updated(COMPLETED) before order.created in tests
+                            # or without a prior Odoo record — create + complete from payload.
+                            result = square_processor._process_square_order(
+                                order_data, order_payload=order_payload
+                            )
+                        else:
+                            # Order doesn't exist yet - queue this update event for retry
+                            _logger.info(
+                                f"Order {order_id} not found for update, queueing event {event_id} for retry"
+                            )
+
+                            # Only the authenticated webhook can seed a retry.
+                            if not signed:
+                                return {"status": "waiting_for_order"}
+                            try:
+                                # Build the full event data structure for queuing
+                                self.env["square.webhook.queue"].sudo()._queue_event(
+                                    webhook_event_id=event_id,
+                                    event_type="order.updated",
+                                    order_data=order_data,
+                                    square_order_id=order_id,
+                                    square_config=config,
+                                )
+
+                                _logger.info(
+                                    f"Event {event_id} queued for retry - will process after order {order_id} is created"
+                                )
+
+                                result = {
+                                    "status": "queued",
+                                    "order_id": order_id,
+                                    "state": order_state,
+                                    "message": "Order not found - event queued for retry",
+                                }
+                            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                                raise
+                            except Exception as queue_error:
+                                _logger.error(
+                                    f"Failed to queue event {event_id}: {str(queue_error)}"
+                                )
+                                result = {
+                                    "status": "error",
+                                    "order_id": order_id,
+                                    "message": f"Order not found and failed to queue: {str(queue_error)}",
+                                }
+                    else:
+                        result = {
+                            "status": "error",
+                            "message": f"Unknown event type: {event_type}",
+                        }
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
+            except Exception as e:
+                # Handle transaction aborted errors gracefully
+                error_str = str(e)
+                if (
+                    "current transaction is aborted" in error_str
+                    or "InFailedSqlTransaction" in error_str
+                ):
+                    _logger.warning(
+                        f"Transaction aborted during order processing: {error_str}"
+                    )
+                    result = {
+                        "status": "error",
+                        "order_id": order_id,
+                        "message": "Database transaction error - order may be partially processed",
+                    }
+                else:
+                    raise
+
+            if event_id and result.get("status") in ("success", "updated"):
+                self.env["square.integration.log"]._log_square_event(
+                    event_type="order_created" if event_type == "created" else "order_updated",
+                    status="success",
+                    title=f"Square order processed (state: {order_state})",
+                    square_order_id=order_id,
+                    webhook_event_id=event_id,
+                )
+
+            return result
+        except SquareOrderProcessingDeferred as error:
+            return {"status": "retry", "message": str(error)}
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except Exception as e:
+            # Simple error logging - just log to Python logger, don't try DB logging in failed transaction
+            _logger.error(
+                f"Square webhook processing failed for event {event_id}: {str(e)}",
+                exc_info=True,
             )
 
-            if existing_log:
-                _logger.info(
-                    f"Order {order_id} with state {order_state} already processed successfully, skipping event {event_id}"
+            # Check if this is a transaction aborted error
+            error_str = str(e)
+            if (
+                "current transaction is aborted" in error_str
+                or "InFailedSqlTransaction" in error_str
+            ):
+                _logger.warning(
+                    f"Transaction was aborted, this may be due to a previous database error"
                 )
+                # Don't raise the exception for transaction aborted errors
                 return {
-                    "status": "already_processed",
-                    "order_id": order_id,
-                    "state": order_state,
+                    "status": "error",
+                    "message": "Database transaction error occurred",
                 }
+            else:
+                raise
 
-        if event_id and logs.search(
-            [("webhook_event_id", "=", event_id), ("status", "=", "success")], limit=1
-        ):
-            _logger.info(f"Event {event_id} already processed successfully, skipping")
-            return {"status": "already_processed", "event_id": event_id}
-
-    def process_square_order(self, square_order_data):
+    def _import_square_order(self, square_order_data):
         """
         Main entry point for processing Square order data from webhooks
         Creates new orders only, keeps them in draft state
         """
+        square_order_data = dict(square_order_data or {})
+        order_id = square_order_data.get("order_id") or square_order_data.get("id")
+        api_client = self.env["square.api.client"].sudo()
+        config = api_client._website_routing_config()
+        routing, order_payload = api_client._route_website_order(order_id, config)
+        return routing or self._process_square_order(square_order_data, order_payload=order_payload)
+
+    def _process_square_order(self, square_order_data, *, order_payload=None):
         square_order_data = dict(square_order_data or {})
         if square_order_data.get("id") and not square_order_data.get("order_id"):
             square_order_data["order_id"] = square_order_data["id"]
@@ -158,7 +311,10 @@ class SquareOrderProcessor(models.Model):
 
         bot_user = self._get_square_bot_user()
         sale_orders = self.env["sale.order"].with_user(bot_user)
-        order_payload = sale_orders._fetch_square_order_payload(square_order_data)
+        if order_payload:
+            order_payload = {**order_payload, "order_id": square_order_id}
+        else:
+            order_payload = sale_orders._fetch_square_order_payload(square_order_data)
         # Exchange notifications may contain only metadata. The retrieved order
         # lets us defer the exchange to payment.updated before creating a sale.
         returns = square_order_data.get("returns") or order_payload.get("returns", [])
@@ -177,7 +333,7 @@ class SquareOrderProcessor(models.Model):
                 )
 
                 # Log to integration dashboard
-                self.env["square.integration.log"].log_square_event(
+                self.env["square.integration.log"]._log_square_event(
                     event_type="order_created",
                     title=f"Exchange order detected - {square_order_id}",
                     description=f"""
@@ -203,7 +359,7 @@ class SquareOrderProcessor(models.Model):
 
 
         try:
-            sale_order = sale_orders.create_from_square(order_payload, order_data_fetched=True)
+            sale_order = sale_orders._create_from_square(order_payload, order_data_fetched=True)
 
             if not sale_order:
                 raise ValueError("Failed to create sale order")
@@ -213,7 +369,7 @@ class SquareOrderProcessor(models.Model):
             )
 
             if square_order_state == "COMPLETED":
-                self.process_square_order_update(square_order_data, sale_order)
+                self._process_square_order_update(square_order_data, sale_order, order_payload=order_payload)
 
             return {
                 "status": "success",
@@ -256,11 +412,21 @@ class SquareOrderProcessor(models.Model):
             )
             raise
 
-    def process_square_order_update(self, square_order_data, sale_order):
+    def _update_square_order(self, square_order_data, sale_order):
         """
         Process updates to existing Square orders
         Only create invoice and stock moves when order state is COMPLETED
         """
+        square_order_data = dict(square_order_data or {})
+        order_id = square_order_data.get("order_id") or square_order_data.get("id")
+        api_client = self.env["square.api.client"].sudo()
+        config = api_client._website_routing_config()
+        routing, order_payload = api_client._route_website_order(order_id, config)
+        return routing or self._process_square_order_update(
+            square_order_data, sale_order, order_payload=order_payload,
+        )
+
+    def _process_square_order_update(self, square_order_data, sale_order, *, order_payload=None):
         square_order_data = dict(square_order_data or {})
         if square_order_data.get("id") and not square_order_data.get("order_id"):
             square_order_data["order_id"] = square_order_data["id"]
@@ -299,7 +465,7 @@ class SquareOrderProcessor(models.Model):
                     key in square_order_data
                     for key in ("line_items", "returns", "return_line_items")
                 ):
-                    fetched_order = self.env["square.api.client"].get_order(square_order_id)
+                    fetched_order = order_payload or self.env["square.api.client"]._get_order(square_order_id)
                     if not fetched_order:
                         raise ValueError(f"Could not retrieve Square order {square_order_id}")
                     snapshot_version = sale_order._square_snapshot_version(fetched_order)
@@ -341,7 +507,7 @@ class SquareOrderProcessor(models.Model):
                 )
 
                 # Log to integration dashboard
-                self.env["square.integration.log"].log_square_event(
+                self.env["square.integration.log"]._log_square_event(
                     event_type="order_updated",
                     title=f"Order update received for {sale_order.name}",
                     description=f"""
@@ -406,15 +572,13 @@ class SquareOrderProcessor(models.Model):
         square_location_id = square_order_data.get("location_id")
         self._create_stock_movements(sale_order, square_location_id)
 
-        if not sale_order.invoice_ids.filtered(lambda inv: inv.state == "posted"):
-            self._create_and_validate_invoice(sale_order)
-
-        # TODO: fix TTC ammout
-        # Step 4: Recalculate totals
-        # sale_order._amount_all()
+        if sale_order.invoice_ids.filtered(lambda inv: inv.state == "posted"):
+            self._settle_existing_order_invoice(sale_order, square_order_data)
+        else:
+            self._create_and_validate_invoice(sale_order, square_order_data)
 
         # Log to integration dashboard
-        self.env["square.integration.log"].log_square_event(
+        self.env["square.integration.log"]._log_square_event(
             event_type="order_updated",
             title=f"Order completed and processed",
             description=f"""
@@ -489,7 +653,7 @@ class SquareOrderProcessor(models.Model):
 
         # Log changes if any
         if added_lines or updated_lines or removed_lines:
-            self.env["square.integration.log"].log_square_event(
+            self.env["square.integration.log"]._log_square_event(
                 event_type="order_updated",
                 title=f"Line changes synchronized for {sale_order.name}",
                 description=f"""
@@ -532,20 +696,25 @@ class SquareOrderProcessor(models.Model):
             for line in lines_to_deliver
         )
 
-        # Handle different order states
         if sale_order.state == "cancel":
-            _logger.info(f"Order {sale_order.name} is already cancelled")
             return
 
-        elif sale_order.state == "done" or (
+        reason = f"Square Order Cancellation - {square_order_id}"
+        posted_invoices = sale_order.invoice_ids.filtered(
+            lambda move: move.move_type == "out_invoice" and move.state == "posted"
+        )
+        reversed_invoices = self.env["account.move"].search([
+            ("reversed_entry_id", "in", posted_invoices.ids),
+            ("move_type", "=", "out_refund"), ("state", "=", "posted"),
+        ]).filtered(lambda move: (move.ref or "").endswith(reason)).reversed_entry_id
+
+        # An older installation may already have posted this cancellation without a receipt.
+        if reversed_invoices or sale_order.state == "done" or (
             sale_order.state == "sale"
             and sale_order.invoice_status == "invoiced"
             and fully_delivered
         ):
-            _logger.warning(
-                f"Order {sale_order.name} is invoiced and fulfilled — processing refund/credit note"
-            )
-            self._process_completed_order_cancellation(sale_order, square_order_data)
+            self._process_completed_order_cancellation(sale_order, posted_invoices - reversed_invoices, reason)
             return
 
         # For draft and open sale states (not fully delivered/invoiced), standard cancel
@@ -560,7 +729,7 @@ class SquareOrderProcessor(models.Model):
                 _logger.info(f"Successfully cancelled order {sale_order.name}")
 
                 # Log successful cancellation
-                self.env["square.integration.log"].log_square_event(
+                self.env["square.integration.log"]._log_square_event(
                     event_type="order_updated",
                     title=f"order cancelled",
                     description=f"""
@@ -581,7 +750,7 @@ class SquareOrderProcessor(models.Model):
             except Exception as e:
                 _logger.error(f"Failed to cancel order {sale_order.name}: {str(e)}")
                 # Log the error
-                self.env["square.integration.log"].log_square_event(
+                self.env["square.integration.log"]._log_square_event(
                     event_type="order_updated",
                     title=f"Failed to cancel order {sale_order.name}",
                     description=f"""
@@ -604,7 +773,7 @@ class SquareOrderProcessor(models.Model):
                 f"Order {sale_order.name} in unexpected state: {sale_order.state}"
             )
             # Log this as an issue
-            self.env["square.integration.log"].log_square_event(
+            self.env["square.integration.log"]._log_square_event(
                 event_type="order_updated",
                 title=f"État de commande inattendu pour l'annulation: {sale_order.name}",
                 description=f"""
@@ -622,148 +791,186 @@ class SquareOrderProcessor(models.Model):
                 sale_order_id=sale_order.id,
             )
 
-    def _process_completed_order_cancellation(self, sale_order, square_order_data):
-        """
-        Process cancellation of a completed order by creating a credit note/refund
-        """
-        square_order_id = square_order_data.get("order_id")
-
-        _logger.info(f"Processing refund for completed order {sale_order.name}")
-
-        try:
-            # Get bot user
-            bot_user = self._get_square_bot_user()
-
-            # Check if the order has invoices that need to be refunded
-            if not sale_order.invoice_ids:
-                _logger.warning(
-                    f"No invoices found for completed order {sale_order.name}"
-                )
-                self.env["square.integration.log"].log_square_event(
-                    event_type="order_updated",
-                    title=f"Aucune facture à rembourser pour {sale_order.name}",
-                    description=f"""
-                        <p><strong>Annulation Commande Square - Aucune Facture</strong></p>
-                        <ul>
-                            <li>ID Commande Square: <strong>{square_order_id}</strong></li>
-                            <li>Commande Odoo: <strong>{sale_order.name}</strong></li>
-                            <li>État: Terminé (Complété)</li>
-                            <li>Problème: Aucune facture trouvée pour créer l'avoir</li>
-                            <li>Action: Une intervention manuelle peut être nécessaire</li>
-                        </ul>
-                    """,
-                    status="warning",
-                    square_order_id=square_order_id,
-                    sale_order_id=sale_order.id,
-                )
-                return
-
-            # Get posted invoices
-            posted_invoices = sale_order.invoice_ids.filtered(
-                lambda inv: inv.state == "posted"
-            )
-
-            if not posted_invoices:
-                _logger.warning(f"No posted invoices found for order {sale_order.name}")
-                return
-
-            # Create credit notes for posted invoices
-            for invoice in posted_invoices:
-                try:
-                    # Create credit note using Odoo's standard method
-                    credit_note_wizard = (
-                        self.env["account.move.reversal"]
-                        .with_user(bot_user)
-                        .create(
-                            {
-                                "move_ids": [(6, 0, invoice.ids)],
-                                "journal_id": invoice.journal_id.id,
-                                "reason": f"Square Order Cancellation - {square_order_id}",
-                            }
-                        )
-                    )
-
-                    # Generate the credit note
-                    credit_note_result = credit_note_wizard.reverse_moves()
-                    credit_note = self.env["account.move"].browse(
-                        credit_note_result["res_id"]
-                    )
-
-                    # Validate the credit note
-                    if credit_note.state == "draft":
-                        credit_note.with_user(bot_user).action_post()
-
-                    _logger.info(
-                        f"Created credit note {credit_note.name} for invoice {invoice.name}"
-                    )
-
-                    # Log the credit note creation
-                    self.env["square.integration.log"].log_square_event(
-                        event_type="order_updated",
-                        title=f"Avoir créé pour la commande annulée {sale_order.name}",
-                        description=f"""
-                            <p><strong>Annulation Commande Square - Avoir Créé</strong></p>
-                            <ul>
-                                <li>ID Commande Square: <strong>{square_order_id}</strong></li>
-                                <li>Commande Odoo: <strong>{sale_order.name}</strong></li>
-                                <li>Facture Originale: <strong>{invoice.name}</strong></li>
-                                <li>Avoir: <strong>{credit_note.name}</strong></li>
-                                <li>Montant: {credit_note.amount_total} {credit_note.currency_id.name}</li>
-                                <li>Action: Avoir créé et comptabilisé</li>
-                            </ul>
-                        """,
-                        status="info",
-                        square_order_id=square_order_id,
-                        sale_order_id=sale_order.id,
-                    )
-
-                except Exception as e:
-                    _logger.error(
-                        f"Failed to create credit note for invoice {invoice.name}: {str(e)}"
-                    )
-                    # Log the error but continue with other invoices
-                    self.env["square.integration.log"].log_square_event(
-                        event_type="order_updated",
-                        title=f"Échec de création d'avoir pour {sale_order.name}",
-                        description=f"""
-                            <p><strong>Annulation Commande Square - Échec Avoir</strong></p>
-                            <ul>
-                                <li>ID Commande Square: <strong>{square_order_id}</strong></li>
-                                <li>Commande Odoo: <strong>{sale_order.name}</strong></li>
-                                <li>Facture: <strong>{invoice.name}</strong></li>
-                                <li>Erreur: {str(e)}</li>
-                                <li>Action: Création manuelle d'avoir nécessaire</li>
-                            </ul>
-                        """,
-                        status="error",
-                        square_order_id=square_order_id,
-                        sale_order_id=sale_order.id,
-                    )
-
-        except Exception as e:
-            _logger.error(
-                f"Error processing completed order cancellation for {sale_order.name}: {str(e)}"
-            )
-            # Log the overall error
-            self.env["square.integration.log"].log_square_event(
+    def _process_completed_order_cancellation(self, sale_order, invoices, reason):
+        """Reverse each remaining invoice within the order event's savepoint."""
+        bot_user = self._get_square_bot_user()
+        for invoice in invoices:
+            try:
+                reversal = self.env["account.move.reversal"].with_user(bot_user).create({
+                    "move_ids": [(6, 0, invoice.ids)],
+                    "journal_id": invoice.journal_id.id,
+                    "reason": reason,
+                })
+                result = reversal.reverse_moves()
+                credit = self.env["account.move"].with_user(bot_user).browse(result["res_id"])
+                if credit.state == "draft":
+                    credit.action_post()
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
+            except Exception as error:
+                _logger.exception("Square cancellation failed for invoice %s", invoice.name)
+                raise SquareOrderProcessingDeferred("Could not post the Square cancellation credit.") from error
+            self.env["square.integration.log"]._log_square_event(
                 event_type="order_updated",
-                title=f"Échec de l'annulation de commande terminée pour {sale_order.name}",
-                description=f"""
-                    <p><strong>Erreur d'Annulation de Commande Square</strong></p>
-                    <ul>
-                        <li>ID Commande Square: <strong>{square_order_id}</strong></li>
-                        <li>Commande Odoo: <strong>{sale_order.name}</strong></li>
-                        <li>Erreur: {str(e)}</li>
-                        <li>Action: Traitement manuel de remboursement nécessaire</li>
-                    </ul>
-                """,
-                status="error",
-                square_order_id=square_order_id,
+                title=f"Avoir créé pour la commande annulée {sale_order.name}",
+                description=f"Facture originale : {invoice.name}. Avoir : {credit.name}.",
+                status="info",
+                square_order_id=sale_order.square_order_id,
                 sale_order_id=sale_order.id,
             )
-            raise
 
-    def process_product_exchange(self, sale_order, order_data, payment_data):
+    def _process_payment(self, payment_data, event_type, webhook_event_id=None):
+        """
+        Process payment.updated webhook to detect and handle exchanges
+        """
+        try:
+            payment_id = payment_data.get("id")
+            order_id = payment_data.get("order_id")
+            payment_status = payment_data.get("status")
+
+            _logger.info(
+                f"Processing payment.updated webhook: payment_id={payment_id}, order_id={order_id}, status={payment_status}"
+            )
+
+            if not order_id:
+                return {"status": "ignored", "message": "Payment has no Square order."}
+
+            # Only process COMPLETED payments
+            if payment_status != "COMPLETED":
+                _logger.info(
+                    f"Payment {payment_id} status is {payment_status}, not COMPLETED - skipping"
+                )
+                return {
+                    "status": "ignored",
+                    "message": f"Payment status {payment_status} not processed",
+                }
+
+            # Fetch full order details from Square API to check for exchanges
+            api_client = self.env["square.api.client"].sudo()
+            routing, order_data = api_client._read_pos_order(order_id)
+            if routing:
+                return routing
+
+            if not order_data:
+                _logger.error(
+                    f"Failed to fetch order {order_id} from Square API for payment {payment_id}"
+                )
+                return {
+                    "status": "retry",
+                    "message": f"Failed to fetch order {order_id} from Square API",
+                }
+
+            # Check if this is an exchange (has returns in line items)
+            has_returns = self._detect_exchange(order_data)
+
+            if has_returns:
+                _logger.info(
+                    f"Exchange detected for order {order_id}, processing exchange flow"
+                )
+
+                # Get the source_order_id from returns - this is the original order to update
+                returns = order_data.get("returns", [])
+                if not returns:
+                    _logger.error(
+                        f"Exchange detected but no returns array found in order {order_id}"
+                    )
+                    return {
+                        "status": "error",
+                        "message": f"Exchange detected but no returns array in order {order_id}",
+                    }
+
+                source_order_id = returns[0].get("source_order_id")
+                if not source_order_id:
+                    _logger.error(
+                        f"No source_order_id found in returns for order {order_id}"
+                    )
+                    return {
+                        "status": "error",
+                        "message": f"No source_order_id in returns for order {order_id}",
+                    }
+
+                _logger.info(
+                    f"Exchange: source_order_id={source_order_id}, current_order_id={order_id}"
+                )
+
+                # Process the exchange
+                bot_user = self._get_square_bot_user()
+                square_processor = self.with_user(bot_user)
+
+                # Find existing sale order using source_order_id (the original order)
+                # Important: Load with bot_user context so it has a user throughout processing
+                sale_order = (
+                    self.env["sale.order"]
+                    .with_user(bot_user)
+                    .search([("square_order_id", "=", source_order_id), ("company_id", "=", self.env.company.id)], limit=1)
+                )
+
+                if not sale_order:
+                    _logger.error(
+                        f"Sale order not found for Square source order {source_order_id} during exchange processing"
+                    )
+                    return {
+                        "status": "retry",
+                        "message": f"Sale order not found for source order {source_order_id}",
+                    }
+
+                # Process the exchange
+                config = api_client._website_routing_config()
+                result = self.env["square.webhook.event"]._apply_once(
+                    config, "exchange:" + order_id,
+                    lambda: square_processor._process_product_exchange(sale_order, order_data, payment_data),
+                    duplicate_status="skipped",
+                )
+
+                return result
+            else:
+                processor = self.with_user(self._get_square_bot_user())
+                sale_order = processor._check_existing_order(order_id)
+                if sale_order:
+                    with self.env.cr.savepoint():
+                        processor._settle_existing_order_invoice(sale_order, payment_data, square_order=order_data)
+                return {
+                    "status": "success",
+                    "message": "Payment processed, no exchange detected",
+                    "payment_id": payment_id,
+                }
+
+        except SquareOrderProcessingDeferred as error:
+            return {"status": "retry", "message": str(error)}
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except Exception as e:
+            _logger.error(
+                f"Error processing payment.updated event: {str(e)}", exc_info=True
+            )
+            return {"status": "error", "message": str(e)}
+
+    def _detect_exchange(self, order_data):
+        """
+        Detect if an order contains returns (indicating an exchange)
+
+        Args:
+            order_data: Full order data from Square API
+
+        Returns:
+            bool: True if order contains returns, False otherwise
+        """
+        line_items = order_data.get("line_items", [])
+
+        # Check if any line item has a returns field
+        for line_item in line_items:
+            if "return_line_items" in order_data or line_item.get("quantity_unit", {}).get(
+                "measurement_unit", {}
+            ).get("type") == "TYPE_RETURN":
+                return True
+
+        # Also check for explicit returns field at order level
+        if order_data.get("returns") or order_data.get("return_line_items"):
+            return True
+
+        return False
+
+    def _process_product_exchange(self, sale_order, order_data, payment_data):
         """Complete the return, replacement, and accounting for a Square exchange."""
         exchange_order_id = order_data.get("id") or order_data.get("order_id")
 
@@ -775,25 +982,8 @@ class SquareOrderProcessor(models.Model):
         logs = self.env["square.integration.log"]
         try:
             existing_exchange_so = self.env["sale.order"].search(
-                [("square_order_id", "=", exchange_order_id)], limit=1
+                [("square_order_id", "=", exchange_order_id), ("company_id", "=", sale_order.company_id.id)], limit=1
             )
-            processed = logs.search(
-                [
-                    ("event_type", "=", "exchange_processed"),
-                    ("status", "=", "success"),
-                    ("square_order_id", "=", exchange_order_id),
-                    ("sale_order_id", "=", sale_order.id),
-                ],
-                limit=1,
-            )
-            if processed:
-                return {
-                    "status": "skipped",
-                    "message": f"Exchange {exchange_order_id} already processed",
-                    "sale_order_id": existing_exchange_so.id,
-                    "sale_order_name": existing_exchange_so.name,
-                }
-
             # Previously imported replacements may already have a reconciled credit.
             replacement_receivables = existing_exchange_so.invoice_ids.line_ids.filtered(
                 lambda line: line.account_type == "asset_receivable"
@@ -930,7 +1120,7 @@ class SquareOrderProcessor(models.Model):
                 credit_note_name = credit_note.name if credit_note else "N/A"
                 new_invoice_name = new_invoice.name if new_invoice else "N/A"
 
-                log = logs.log_square_event(
+                log = logs._log_square_event(
                     event_type="exchange_processed",
                     title=f"Échange traité: {sale_order.name} → {new_so_name}",
                     description=f"""
@@ -974,7 +1164,7 @@ class SquareOrderProcessor(models.Model):
                 exc_info=True,
             )
 
-            self.env["square.integration.log"].log_square_event(
+            self.env["square.integration.log"]._log_square_event(
                 event_type="exchange_processed",
                 title=f"Échec du traitement d'échange pour {sale_order.name}",
                 description=f"""
@@ -1020,6 +1210,7 @@ class SquareOrderProcessor(models.Model):
                 "location_dest_id": warehouse.lot_stock_id.id,
                 "origin": sale_order.name,
                 "partner_id": sale_order.partner_id.id,
+                "sale_id": sale_order.id,
             }
         )
         for catalog_id, quantity in returned_products.items():
@@ -1043,7 +1234,7 @@ class SquareOrderProcessor(models.Model):
 
         return_picking.action_confirm()
         return_picking.action_assign()
-        return_picking.with_context(force_validate=True).button_validate()
+        return_picking._validate_square_picking(sale_order)
         if return_picking.state != "done":
             raise UserError(f"Exchange return {return_picking.name} could not be completed.")
         return return_picking
@@ -1068,7 +1259,7 @@ class SquareOrderProcessor(models.Model):
 
         action = wizard.action_create_returns()
         return_picking = self.env["stock.picking"].browse(action["res_id"])
-        return_picking.with_context(force_validate=True).button_validate()
+        return_picking._validate_square_picking(delivery_picking.sale_id)
         if return_picking.state != "done":
             raise UserError(f"Exchange return {return_picking.name} could not be completed.")
         return return_picking
@@ -1215,7 +1406,7 @@ class SquareOrderProcessor(models.Model):
 
             # Add order lines for each new product
             for catalog_id, product_info in new_products.items():
-                catalog_result = api_client.get_catalog_object(catalog_id)
+                catalog_result = api_client._get_catalog_object(catalog_id)
                 if not catalog_result.get("success"):
                     _logger.error(
                         f"Failed to fetch catalog object {catalog_id} from Square"
@@ -1232,7 +1423,7 @@ class SquareOrderProcessor(models.Model):
                 )
                 if not product:
                     _logger.error(f"Product with SKU {sku} not found in Odoo")
-                    self.env["square.integration.log"].log_square_event(
+                    self.env["square.integration.log"]._log_square_event(
                         event_type="order_updated",
                         title=f"Produit non trouvé pour l'échange: SKU {sku}",
                         description=f"""
@@ -1308,10 +1499,9 @@ class SquareOrderProcessor(models.Model):
 
                     if picking.state in ["assigned", "confirmed", "waiting"]:
                         picking.with_user(bot_user).with_context(
-                            force_validate=True,
                             mail_auto_subscribe_no_notify=True,
                             mail_create_nosubscribe=True,
-                        ).button_validate()
+                        )._validate_square_picking(new_sale_order)
                     if picking.state != "done":
                         raise UserError(f"Exchange delivery {picking.name} could not be completed.")
                     _logger.info(f"Validated exchange picking {picking.name}")
@@ -1364,7 +1554,73 @@ class SquareOrderProcessor(models.Model):
         elif not credit_note.currency_id.is_zero(credit_note.amount_residual):
             self._create_payment_for_credit_note(credit_note, original_sale_order, bot_user)
 
-    def _create_and_validate_invoice(self, sale_order):
+    def _settle_existing_order_invoice(self, sale_order, notification, *, square_order=None):
+        invoices = sale_order.invoice_ids.filtered(
+            lambda invoice: invoice.state == "posted" and invoice.move_type == "out_invoice"
+        )
+        if len(invoices) != 1:
+            return False
+        invoice = invoices
+        if (
+            invoice.amount_total <= 0
+            or invoice.reconciled_payment_ids
+            or invoice.currency_id.compare_amounts(invoice.amount_residual, invoice.amount_total)
+        ):
+            return False
+        if self._has_verified_order_payment(invoice, sale_order, notification, square_order=square_order):
+            if not self._create_payment_for_invoice(invoice, sale_order, self._get_square_bot_user()):
+                raise SquareOrderProcessingDeferred("Could not register the Square payment.")
+            return True
+        return False
+
+    def _has_verified_order_payment(self, invoice, sale_order, notification, *, square_order=None):
+        client = self.env["square.api.client"]
+        order = square_order if square_order is not None else client.sudo()._get_order(sale_order.square_order_id)
+        if not order:
+            raise SquareOrderProcessingDeferred("Could not verify the Square order payment.")
+        if (order.get("id") or order.get("order_id")) != sale_order.square_order_id:
+            return False
+        if order.get("state") != "COMPLETED":
+            return False
+        if notification.get("location_id") and order.get("location_id") != notification["location_id"]:
+            return False
+
+        currency = invoice.currency_id
+        paid_minor = 0
+        payment_ids = set()
+        for tender in order.get("tenders") or []:
+            payment_id = tender.get("payment_id") or tender.get("id")
+            if not payment_id or payment_id in payment_ids:
+                continue
+            payment_ids.add(payment_id)
+            money = tender.get("amount_money") or {}
+            tip = (tender.get("tip_money") or {}).get("amount", 0)
+            tender_type = tender.get("type")
+            card_status = (tender.get("card_details") or {}).get("status")
+            if not (tender_type in ("CASH", "OTHER") or (tender_type == "CARD" and card_status == "CAPTURED")):
+                payment = client.sudo()._get_payment(payment_id)
+                if not payment:
+                    raise SquareOrderProcessingDeferred("Could not verify the Square tender payment.")
+                if (
+                    payment.get("id") != payment_id
+                    or payment.get("order_id") != sale_order.square_order_id
+                    or payment.get("location_id") != order.get("location_id")
+                    or payment.get("status") != "COMPLETED"
+                ):
+                    continue
+                money = payment.get("amount_money") or {}
+                tip = 0
+            amount = money.get("amount")
+            if (
+                money.get("currency") == currency.name
+                and type(amount) is int and type(tip) is int and 0 <= tip < amount
+            ):
+                paid_minor += amount - tip
+        return paid_minor > 0 and currency.compare_amounts(
+            paid_minor / 10 ** currency.decimal_places, invoice.amount_total,
+        ) == 0
+
+    def _create_and_validate_invoice(self, sale_order, notification):
         """Create and validate invoice for the sale order"""
         try:
             # Check if sale order has lines before creating invoice
@@ -1402,10 +1658,11 @@ class SquareOrderProcessor(models.Model):
                     f"Current currency: {invoice.currency_id.name}"
                 )
 
-            # Create payment for the invoice (Square orders are already paid)
-            payment_created = self._create_payment_for_invoice(
-                invoice, sale_order, bot_user
-            )
+            payment_created = False
+            if invoice.amount_total > 0 and self._has_verified_order_payment(invoice, sale_order, notification):
+                payment_created = self._create_payment_for_invoice(invoice, sale_order, bot_user)
+                if not payment_created:
+                    raise SquareOrderProcessingDeferred("Could not register the Square payment.")
 
             # Determine payment status for messaging
             payment_status = (
@@ -1430,7 +1687,7 @@ class SquareOrderProcessor(models.Model):
                 if payment_created
                 else "Erreur lors de la création du paiement"
             )
-            self.env["square.integration.log"].log_square_event(
+            self.env["square.integration.log"]._log_square_event(
                 event_type="order_updated",
                 title=f"Facture créée pour la commande {sale_order.name}",
                 description=f"""
@@ -1454,25 +1711,13 @@ class SquareOrderProcessor(models.Model):
             )
             return invoice
 
-        except Exception as e:
-            _logger.error(
-                f"Error creating invoice for sale order {sale_order.name}: {str(e)}",
-                exc_info=True,
-            )
-
-            # Log error to integration dashboard
-            try:
-                self.env["square.integration.log"].log_error(
-                    title=f"Erreur création facture pour {sale_order.name}",
-                    error_message=f"Impossible de créer la facture pour la commande {sale_order.name}",
-                    technical_details=f"Commande: {sale_order.name}, Erreur: {str(e)}",
-                    square_order_id=sale_order.square_order_id,
-                    sale_order_id=sale_order.id,
-                )
-            except:
-                pass  # Don't let logging errors break the process
-
-            return None
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except SquareOrderProcessingDeferred:
+            raise
+        except Exception as error:
+            _logger.exception("Square invoice processing failed for %s", sale_order.name)
+            raise SquareOrderProcessingDeferred("Could not invoice the Square order.") from error
 
     def _create_payment_for_invoice(self, invoice, sale_order, bot_user):
         """Create and register payment for Square invoice (already paid orders)"""
@@ -1658,7 +1903,7 @@ class SquareOrderProcessor(models.Model):
             # Get the Square configuration
             square_config = self.env["square.config"].search([], limit=1)
             if square_config:
-                payment_journal = square_config.get_payment_journal()
+                payment_journal = square_config._get_payment_journal()
                 if payment_journal:
                     return payment_journal
                 else:
@@ -1787,15 +2032,15 @@ class SquareOrderProcessor(models.Model):
                     if picking.state in ["assigned", "confirmed", "waiting"]:
                         _logger.info(
                             f"Validating picking {picking.name} in state {picking.state} "
-                            f"with force_validate context"
+                            f"for Square fulfillment"
                         )
                         # Use bot user context and avoid mail subscription issues
-                        # force_validate=True allows validation even with negative stock
                         picking.with_user(bot_user).with_context(
-                            force_validate=True,
                             mail_auto_subscribe_no_notify=True,
                             mail_create_nosubscribe=True,
-                        ).button_validate()
+                        )._validate_square_picking(sale_order)
+                    if picking.state != "done":
+                        raise SquareOrderProcessingDeferred("Could not complete the Square delivery.")
 
             # Add chatter message for stock movements
             processed_pickings = sale_order.picking_ids.filtered(
@@ -1823,7 +2068,7 @@ class SquareOrderProcessor(models.Model):
                     )
 
                 # Log to integration dashboard
-                self.env["square.integration.log"].log_square_event(
+                self.env["square.integration.log"]._log_square_event(
                     event_type="stock_sync",
                     title=f"Mouvements de stock traités pour la commande {sale_order.name}",
                     description=f"""
@@ -1843,33 +2088,20 @@ class SquareOrderProcessor(models.Model):
 
             _logger.info(f"Processed stock movements for sale order {sale_order.name}")
 
-        except Exception as e:
-            error_msg = str(e)
-            _logger.error(
-                f"Error creating stock movements for sale order {sale_order.name}: {error_msg}",
-                exc_info=True,
-            )
-
-            # If it's a mail follower issue, provide a more specific error
-            if (
-                "operator does not exist: integer = boolean" in error_msg
-                or "mail_followers" in error_msg
-            ):
-                _logger.warning(
-                    f"Mail follower issue detected for sale order {sale_order.name}. "
-                    f"This may be due to user/partner configuration issues. "
-                    f"The order has been processed but stock movements may need manual validation."
-                )
-
-            # Don't re-raise the exception to avoid aborting the entire transaction
-            # The order processing should continue even if stock movements fail
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except SquareOrderProcessingDeferred:
+            raise
+        except Exception as error:
+            _logger.exception("Square delivery failed for order %s", sale_order.name)
+            raise SquareOrderProcessingDeferred("Could not deliver the Square order.") from error
 
     def _get_configured_warehouse(self):
         """Get the configured warehouse from Square configuration (legacy method)"""
         square_config = self.env["square.config"].search([], limit=1)
         if square_config:
             _logger.info(f"Square configuration found: {square_config.name}")
-            return square_config.get_configured_warehouse()
+            return square_config._get_configured_warehouse()
         else:
             # Fallback to first warehouse if no config found
             warehouse = self.env["stock.warehouse"].search([], limit=1)
@@ -1885,5 +2117,5 @@ class SquareOrderProcessor(models.Model):
         """Get the warehouse mapped to a specific Square location"""
         square_config = self.env["square.config"].search([], limit=1)
         if square_config:
-            return square_config.get_warehouse_for_location(square_location_id)
+            return square_config._get_warehouse_for_location(square_location_id)
         return self._get_configured_warehouse()

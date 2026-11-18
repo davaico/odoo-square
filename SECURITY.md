@@ -2,11 +2,13 @@
 
 ## Supported Versions
 
-Security fixes are accepted for the active Odoo 17.0 addon series.
+Security fixes are accepted for these Odoo addon series.
 
-| Odoo series | Addon series | Supported |
+| Odoo series | Release branch | Addons |
 | --- | --- | --- |
-| 17.0 | 17.0.x.y.z | Yes |
+| 17.0 | `17.0` | Square POS Integration |
+| 18.0 | `18.0` | Square POS Integration, Square Online Payments |
+| 19.0 | `19.0` | Square POS Integration, Square Online Payments |
 
 ## Reporting a Vulnerability
 

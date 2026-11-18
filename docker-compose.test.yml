@@ -18,7 +18,10 @@ services:
       - odoo-test-net
 
   odoo:
-    build: .
+    image: ${ODOO_TEST_IMAGE:-odoo-square-v18-test}
+    build:
+      context: .
+      dockerfile: ${ODOO_TEST_DOCKERFILE:-Dockerfile}
     depends_on:
       db:
         condition: service_healthy
@@ -28,12 +31,13 @@ services:
       - PASSWORD=${DB_PASSWORD:?DB_PASSWORD is required}
     volumes:
       - odoo_square_test_data:/var/lib/odoo
-      - ./config:/etc/odoo:ro
-      - .:/mnt/extra-addons:ro
+      - ./config/odoo.conf:/etc/odoo/odoo.conf:ro
+      - ./odoo_square:/mnt/extra-addons/odoo_square:ro
+      - ./payment_square_online:/mnt/extra-addons/payment_square_online:ro
     command:
       - odoo
       - --database=${DB_NAME:-odoo_square_v18_test}
-      - --init=odoo_square
+      - --init=${ODOO_INIT_MODULES:-odoo_square}
       - --test-tags=${ODOO_TEST_TAGS:-/odoo_square}
       - --workers=0
       - --stop-after-init

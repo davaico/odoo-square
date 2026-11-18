@@ -6,6 +6,7 @@ import logging
 
 from dateutil import parser as dt_parser
 from odoo import api, fields, models
+from odoo.exceptions import AccessError
 
 _logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ class SaleOrder(models.Model):
 
     square_order_data = fields.Text(
         string="Square Order Data",
-        help="Raw JSON data from Square webhook for debugging",
+        help="Minimal Square snapshot for legacy line matching",
         copy=False,
     )
 
@@ -59,6 +60,7 @@ class SaleOrder(models.Model):
         "square.refund",
         "sale_order_id",
         string="Square Refunds",
+        groups="base.group_system",
         help="Refunds associated with this Square order",
     )
 
@@ -66,6 +68,7 @@ class SaleOrder(models.Model):
     total_refunded_amount = fields.Monetary(
         string="Total Refunded Amount",
         compute="_compute_total_refunded_amount",
+        compute_sudo=True,
         currency_field="currency_id",
         help="Total amount refunded for this order",
     )
@@ -81,6 +84,41 @@ class SaleOrder(models.Model):
         store=True,
         help="Current refund status of the order",
     )
+
+    _SQUARE_METADATA = frozenset({
+        "square_order_id", "square_payment_id", "square_order_data", "square_order_version",
+    })
+
+    def _check_square_metadata_write(self, protected_values):
+        if protected_values and not (
+            self.env.su or self.env.user == self.env.ref("odoo_square.user_square_bot")
+        ):
+            raise AccessError("Square order metadata is managed by the integration.")
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        self._check_square_metadata_write({
+            field for field in self._SQUARE_METADATA if self.env.context.get(f"default_{field}")
+        })
+        for vals in vals_list:
+            self._check_square_metadata_write(self._SQUARE_METADATA.intersection(vals))
+        return super().create(vals_list)
+
+    def write(self, vals):
+        self._check_square_metadata_write(self._SQUARE_METADATA.intersection(vals))
+        return super().write(vals)
+
+    @staticmethod
+    def _square_snapshot_for_storage(order_data):
+        snapshot = {
+            key: order_data[key] for key in ("id", "order_id", "version") if key in order_data
+        }
+        if isinstance(order_data.get("line_items"), list):
+            snapshot["line_items"] = [
+                {key: line[key] for key in ("uid", "catalog_object_id", "name") if key in line}
+                for line in order_data["line_items"] if isinstance(line, dict)
+            ]
+        return snapshot
 
     @staticmethod
     def _square_snapshot_version(order_data):
@@ -114,13 +152,13 @@ class SaleOrder(models.Model):
         for order in self:
             order.is_square_order = bool(order.square_order_id)
 
-    @api.depends("square_refund_ids.refund_amount", "square_refund_ids.status")
+    @api.depends("square_refund_ids.refund_amount", "square_refund_ids.status", "square_refund_ids.integrity_hold")
     def _compute_total_refunded_amount(self):
         """Compute total refunded amount"""
         for order in self:
             # Get all completed refunds
             completed_refunds = order.square_refund_ids.filtered(
-                lambda r: r.status == "completed"
+                lambda r: r.status == "completed" and not r.integrity_hold
             )
 
             # Calculate total refunded amount
@@ -136,7 +174,7 @@ class SaleOrder(models.Model):
         return sum(invoices.mapped("amount_total")) if invoices else self.amount_total
 
     @api.depends(
-        "square_refund_ids.refund_amount", "square_refund_ids.status", "amount_total",
+        "square_refund_ids.refund_amount", "square_refund_ids.status", "square_refund_ids.integrity_hold", "amount_total",
         "invoice_ids.amount_total", "invoice_ids.state", "invoice_ids.move_type",
     )
     def _compute_refund_status(self):
@@ -144,7 +182,7 @@ class SaleOrder(models.Model):
         for order in self:
             # Get all completed refunds
             completed_refunds = order.square_refund_ids.filtered(
-                lambda r: r.status == "completed"
+                lambda r: r.status == "completed" and not r.integrity_hold
             )
 
             # Calculate total refunded amount for status determination
@@ -173,7 +211,7 @@ class SaleOrder(models.Model):
         """Get the configured warehouse from Square configuration (legacy method)"""
         square_config = self.env["square.config"].search([], limit=1)
         if square_config:
-            warehouse = square_config.get_configured_warehouse()
+            warehouse = square_config._get_configured_warehouse()
             if warehouse:
                 _logger.info(f"Using configured Square warehouse: {warehouse.name}")
                 return warehouse
@@ -192,7 +230,7 @@ class SaleOrder(models.Model):
 
         square_config = self.env["square.config"].search([], limit=1)
         if square_config:
-            warehouse = square_config.get_warehouse_for_location(square_location_id)
+            warehouse = square_config._get_warehouse_for_location(square_location_id)
             if warehouse:
                 _logger.info(
                     f"Using warehouse '{warehouse.name}' for Square location '{square_location_id}'"
@@ -244,7 +282,7 @@ class SaleOrder(models.Model):
         try:
             tid = int(str(raw).strip())
         except (ValueError, TypeError):
-            _logger.warning("Invalid odoo_sales_team_id in Square metadata: %s", raw)
+            _logger.warning("Invalid odoo_sales_team_id in Square metadata")
             return Team.browse()
         team = Team.browse(tid)
         if team.exists() and self._sales_team_matches_company(team, company):
@@ -256,7 +294,7 @@ class SaleOrder(models.Model):
     def _get_sales_team_for_square_location(self, square_location_id, company):
         config = self.env["square.config"].search([], limit=1)
         if config:
-            return config.get_sales_team_for_location(
+            return config._get_sales_team_for_location(
                 square_location_id, company=company
             )
         return self.env["crm.team"].browse()
@@ -288,7 +326,7 @@ class SaleOrder(models.Model):
                 dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
             return dt
         except Exception:
-            _logger.warning("Could not parse Square created_at: %r", raw)
+            _logger.warning("Could not parse Square order creation date")
             return False
 
     def _square_backdate_sale_order_create_date(self, sale_order, create_dt):
@@ -302,7 +340,7 @@ class SaleOrder(models.Model):
         sale_order.invalidate_recordset(["create_date"])
 
     @api.model
-    def create_from_square(self, square_data, *, order_data_fetched=False):
+    def _create_from_square(self, square_data, *, order_data_fetched=False):
         """
         Create a sale order from Square webhook data.
 
@@ -359,7 +397,7 @@ class SaleOrder(models.Model):
             order_vals = {
                 "partner_id": customer.id,
                 "square_order_id": square_order_id,
-                "square_order_data": str(square_data),
+                "square_order_data": str(self._square_snapshot_for_storage(square_data)),
                 "state": "draft",
                 "origin": f"Square Order {square_order_id}",
                 "company_id": company.id,
@@ -381,7 +419,7 @@ class SaleOrder(models.Model):
             # Lines: webhook payload first (tests / offline), else Square API
             if square_data.get("line_items"):
                 payment_id = self._extract_payment_id_from_square_order(square_data)
-                upd = {"square_order_data": str(square_data)}
+                upd = {"square_order_data": str(self._square_snapshot_for_storage(square_data))}
                 if payment_id:
                     upd["square_payment_id"] = payment_id
                 sale_order.write(upd)
@@ -414,7 +452,7 @@ class SaleOrder(models.Model):
                 )
 
             # Log to integration dashboard
-            self.env["square.integration.log"].log_order_creation(
+            self.env["square.integration.log"]._log_order_creation(
                 sale_order, square_data
             )
 
@@ -425,18 +463,17 @@ class SaleOrder(models.Model):
 
         except Exception as e:
             _logger.error(
-                f"Error creating sale order from Square: {str(e)}", exc_info=True
+                "Square order creation failed (%s)", type(e).__name__
             )
 
             # Log error to integration dashboard
             try:
-                self.env["square.integration.log"].log_error(
+                self.env["square.integration.log"]._log_error(
                     title="Order Creation Error",
-                    error_message=str(e),
+                    error_message=type(e).__name__,
                     square_order_id=(
                         square_data.get("order_id") if square_data else None
                     ),
-                    technical_details=f"Square data: {square_data}\nError: {str(e)}",
                 )
             except:
                 pass  # Don't let logging errors break the main process
@@ -455,7 +492,7 @@ class SaleOrder(models.Model):
             )
             try:
                 square_api = self.env["square.api.client"]
-                full_order_data = square_api.get_order(square_order_id)
+                full_order_data = square_api._get_order(square_order_id)
                 if full_order_data:
                     payload = dict(full_order_data)
                     payload.setdefault("order_id", payload.get("id") or square_order_id)
@@ -489,13 +526,13 @@ class SaleOrder(models.Model):
         if customer_info.get("email"):
             partner = Partner.search([("email", "=", customer_info["email"])], limit=1)
             if partner:
-                _logger.info(f"Found customer by email: {partner.name}")
+                _logger.info("Matched Square customer to partner %s by email", partner.id)
                 return partner, payload
 
         if customer_info.get("phone"):
             partner = Partner.search([("phone", "=", customer_info["phone"])], limit=1)
             if partner:
-                _logger.info(f"Found customer by phone: {partner.name}")
+                _logger.info("Matched Square customer to partner %s by phone", partner.id)
                 return partner, payload
 
         if customer_info.get("name"):
@@ -507,7 +544,7 @@ class SaleOrder(models.Model):
 
             partner = Partner.search(domain, limit=1)
             if partner:
-                _logger.info(f"Found customer by name/address: {partner.name}")
+                _logger.info("Matched Square customer to partner %s by name and address", partner.id)
                 return partner, payload
 
         return self._create_customer_from_square_info(customer_info), payload
@@ -522,7 +559,7 @@ class SaleOrder(models.Model):
             _logger.info(f"Found customer_id in order: {customer_id}")
             try:
                 square_api = self.env["square.api.client"]
-                customer_data = square_api.get_customer(customer_id)
+                customer_data = square_api._get_customer(customer_id)
                 if customer_data:
                     # Extract customer details from Square Customers API
                     if customer_data.get("given_name") or customer_data.get(
@@ -557,9 +594,6 @@ class SaleOrder(models.Model):
                             customer_info["zip"] = address["postal_code"]
 
                     customer_info["square_customer_id"] = customer_id
-                    _logger.info(
-                        f"Retrieved customer details from Square API: {customer_info}"
-                    )
 
                     # If we got customer info from API, return it directly
                     if (
@@ -643,7 +677,6 @@ class SaleOrder(models.Model):
         if customer_info.get("name"):
             customer_info["name"] = self._normalize_customer_name(customer_info["name"])
 
-        _logger.info(f"Final extracted customer info: {customer_info}")
         return customer_info
 
     def _normalize_phone_number(self, phone):
@@ -705,7 +738,7 @@ class SaleOrder(models.Model):
             vals["zip"] = customer_info["zip"]
 
         partner = self.env["res.partner"].create(vals)
-        _logger.info(f"Created new customer: {partner.name}")
+        _logger.info("Created partner %s from Square", partner.id)
         return partner
 
     def _create_anonymous_customer(self):
@@ -717,7 +750,7 @@ class SaleOrder(models.Model):
                 "customer_rank": 1,
             }
         )
-        _logger.info(f"Created anonymous customer: {partner.name}")
+        _logger.info("Created anonymous Square partner %s", partner.id)
         return partner
 
     def _fetch_and_create_order_lines(self, sale_order, square_order_id):
@@ -727,7 +760,7 @@ class SaleOrder(models.Model):
         try:
             # Use Square API client to fetch full order details
             square_api = self.env["square.api.client"]
-            full_order_data = square_api.get_order(square_order_id)
+            full_order_data = square_api._get_order(square_order_id)
 
             if not full_order_data:
                 _logger.warning(
@@ -739,7 +772,7 @@ class SaleOrder(models.Model):
             payment_id = self._extract_payment_id_from_square_order(full_order_data)
 
             # Update sale order with full data and payment_id
-            update_vals = {"square_order_data": str(full_order_data)}
+            update_vals = {"square_order_data": str(self._square_snapshot_for_storage(full_order_data))}
             if payment_id:
                 update_vals["square_payment_id"] = payment_id
                 _logger.info(
@@ -864,7 +897,7 @@ class SaleOrder(models.Model):
 
         if catalog_object_id and not product:
             square_api = self.env["square.api.client"]
-            catalog_result = square_api.get_catalog_object(catalog_object_id)
+            catalog_result = square_api._get_catalog_object(catalog_object_id)
 
             if catalog_result["success"] and not catalog_result.get("not_found"):
                 sku = catalog_result.get("sku")
@@ -873,7 +906,7 @@ class SaleOrder(models.Model):
                 )
             else:
                 _logger.warning(
-                    f"Could not retrieve catalog object details for '{catalog_object_id}': {catalog_result}"
+                    "Could not retrieve Square catalog object %s", catalog_object_id
                 )
 
         if sku and not product:
