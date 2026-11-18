@@ -5,13 +5,14 @@ import json
 from unittest.mock import patch
 
 from odoo import Command, release
-from odoo.exceptions import AccessError
+from odoo.exceptions import AccessError, ValidationError
 from odoo.modules.module import get_manifest
 from odoo.tests import Form, TransactionCase
 from odoo.tests.common import new_test_user, tagged
 
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
 
+from odoo.addons.odoo_square.models.square_order_processor import SquareOrderProcessingDeferred
 
 @tagged("post_install", "-at_install", "TestSquareModuleContracts")
 class TestSquareModuleContracts(TransactionCase):
@@ -22,7 +23,7 @@ class TestSquareModuleContracts(TransactionCase):
 
         self.assertEqual(manifest["license"], "AGPL-3")
         self.assertEqual(release.series, "18.0")
-        self.assertEqual(manifest["version"], "18.0.1.4.1")
+        self.assertEqual(manifest["version"], "18.0.1.4.2")
         self.assertTrue(manifest["installable"])
         self.assertTrue(manifest["application"])
         self.assertIn("sale_stock", manifest["depends"])
@@ -72,7 +73,7 @@ class TestSquareModuleContracts(TransactionCase):
         self.assertEqual(saved.square_webhook_signature_key, "square-signature")
         self.assertEqual(saved.payment_journal_id, journal)
         self.assertEqual(saved.default_sales_team_id, default_team)
-        self.assertEqual(saved.module_version_display, "1.4.1")
+        self.assertEqual(saved.module_version_display, "1.4.2")
         self.assertEqual(len(saved.location_mapping_ids), 1)
         mapping = config.location_mapping_ids
         self.assertEqual(mapping.square_location_id, "DOWNTOWN")
@@ -82,6 +83,50 @@ class TestSquareModuleContracts(TransactionCase):
         self.assertEqual(mapping.sales_team_id, location_team)
         self.assertEqual(config._get_warehouse_for_location("DOWNTOWN"), warehouse)
         self.assertEqual(config._get_sales_team_for_location("DOWNTOWN"), location_team)
+
+    def test_sync_locations_keeps_archived_mappings(self):
+        config = self.env["square.config"].create({
+            "square_application_id": "square-app",
+            "square_access_token": "square-token",
+        })
+        warehouse = self.env["stock.warehouse"].search([("company_id", "=", config.company_id.id)], limit=1)
+        archived = self.env["square.location.mapping"].create({
+            "config_id": config.id,
+            "square_location_id": "OLD",
+            "square_location_name": "Old Store",
+            "warehouse_id": warehouse.id,
+            "active": False,
+        })
+        locations = [{"id": "OLD", "name": "Old Store"}, {"id": "NEW", "name": "New Store"}]
+        with patch(
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient._get_locations", return_value=locations,
+        ):
+            self.assertTrue(config.sync_square_locations())
+
+        self.assertFalse(archived.active)
+        self.assertEqual(config.location_mapping_ids.square_location_id, "NEW")
+        self.assertEqual(config.location_mapping_ids.warehouse_id, warehouse)
+
+        self.env["stock.warehouse"].create({"name": "Uptown Store", "code": "SQUP"})
+        conflicting = [{"id": "UPTOWN", "name": "Uptown Store"}, {"id": "DUPLICATE", "name": warehouse.name}]
+        with patch(
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient._get_locations", return_value=conflicting,
+        ), self.assertRaises(ValidationError):
+            config.sync_square_locations()
+        self.assertEqual(config.location_mapping_ids.square_location_id, "NEW")
+
+        foreign = self.env["res.company"].create({"name": "Other Square Company"})
+        foreign_warehouse = self.env["stock.warehouse"].search([("company_id", "=", foreign.id)], limit=1)
+        # Existing databases may contain a mapping saved before the company constraint.
+        mapping = config.location_mapping_ids
+        mapping.flush_recordset(["warehouse_id"])
+        self.env.cr.execute(
+            "UPDATE square_location_mapping SET warehouse_id = %s WHERE id = %s", (foreign_warehouse.id, mapping.id),
+        )
+        mapping.invalidate_recordset(["warehouse_id"])
+        bot = self.env.ref("odoo_square.user_square_bot")
+        with self.assertRaisesRegex(SquareOrderProcessingDeferred, "another company"):
+            self.env["sale.order"].with_user(bot)._get_warehouse_for_square_location("NEW")
 
     def test_salesperson_can_read_but_cannot_edit_square_configuration(self):
         config = self.env["square.config"].create(

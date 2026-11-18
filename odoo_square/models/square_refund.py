@@ -32,7 +32,11 @@ class SquareRefund(models.Model):
 
     # Square Data
     square_refund_id = fields.Char(
-        string="Square Refund ID", required=True, index=True, copy=False
+        string="Square Refund ID", index=True, copy=False
+    )
+    unverified_square_refund_id = fields.Char(
+        string="Unverified Legacy Refund ID", readonly=True, copy=False,
+        help="Original identifier retained with historical documents after the refund was quarantined.",
     )
     square_order_id = fields.Char(string="Square Order ID", required=True, index=True)
 
@@ -102,6 +106,11 @@ class SquareRefund(models.Model):
             "UNIQUE(square_refund_id)",
             "Square Refund ID must be unique.",
         ),
+        (
+            "square_refund_identity",
+            "CHECK ((square_refund_id IS NULL) <> (unverified_square_refund_id IS NULL))",
+            "A refund must have either a Square refund ID or an unverified legacy refund ID.",
+        ),
     ]
 
     @api.model
@@ -116,10 +125,12 @@ class SquareRefund(models.Model):
             }
         }
 
-    @api.depends("square_refund_id", "status", "refund_amount")
+    @api.depends("square_refund_id", "unverified_square_refund_id", "status", "refund_amount")
     def _compute_display_name(self):
         for record in self:
-            if record.square_refund_id:
+            if record.unverified_square_refund_id:
+                record.display_name = f"Unverified legacy refund {record.unverified_square_refund_id}"
+            elif record.square_refund_id:
                 record.display_name = f"Refund {record.square_refund_id} - {record.status.title()} - {record.refund_amount} {record.currency_id.name}"
             else:
                 record.display_name = f"Refund - {record.status.title()}"
@@ -219,7 +230,13 @@ class SquareRefund(models.Model):
                 raise RefundProcessingDeferred("A legacy Square refund requires stock reconciliation.")
             # Untrusted legacy data cannot suppress the provider's status or
             # instruct the service to reuse its draft documents or relations.
-            existing_refund.unlink()
+            existing_refund.write({
+                "unverified_square_refund_id": square_refund_id,
+                "square_refund_id": False,
+                "integrity_hold": True,
+            })
+            # Release the unique provider ID before inserting the verified refund.
+            existing_refund.flush_recordset(["square_refund_id", "unverified_square_refund_id"])
             existing_refund = self.browse()
         if existing_refund:
             if existing_refund.sale_order_id != sale_order:

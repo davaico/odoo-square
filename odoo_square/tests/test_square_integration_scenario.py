@@ -539,6 +539,36 @@ class TestSquareIntegrationScenario(SquareHttpCase):
         ]), payment)
         self._assert_warehouse_stock(50)
 
+    def test_held_refund_retains_its_documents_on_signed_replay(self):
+        self._test_sale_processing()
+        self._test_stock_updates()
+        order = self.created_sale_order
+        invoice = order.invoice_ids
+        refund_data = {
+            "id": "legacy-held-refund",
+            "order_id": order.square_order_id,
+            "amount_money": {"amount": 120, "currency": "EUR"},
+            "refunded_line_ids": ["line_1"],
+        }
+        historical = self.env["square.refund"].create({
+            "square_refund_id": refund_data["id"],
+            "square_order_id": order.square_order_id,
+            "sale_order_id": order.id,
+            "invoice_id": invoice.id,
+            "refund_amount": 2.40,
+            "status": "completed",
+            "integrity_hold": True,
+        })
+        self._send_refund_webhook(refund_data, "updated", "COMPLETED", "evt-legacy-held")
+        self.assertTrue(historical.exists())
+        self.assertEqual(historical.unverified_square_refund_id, refund_data["id"])
+        self.assertFalse(historical.square_refund_id)
+        self.assertEqual(historical.invoice_id, invoice)
+        settled = order.square_refund_ids - historical
+        self.assertEqual(settled.square_refund_id, refund_data["id"])
+        self.assertEqual(order.total_refunded_amount, 1.20)
+        self.assert_reconciled_payment(settled.credit_note_id, "outbound", 1.20)
+
     def test_completed_refund_can_prepare_a_return_after_its_credit_note(self):
         self._test_sale_processing()
         self._test_stock_updates()

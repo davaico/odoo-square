@@ -8,6 +8,8 @@ Odoo 18 Community addon for integrating Square POS with Odoo Sales, Accounting, 
 
 Checkout, payment collection, and refund initiation take place in Square POS. The addon reflects that activity in Odoo sales orders, accounting records, and stock movements.
 
+For Odoo website checkout, install **Square Online Payments**. You can use either addon on its own or install both in the same database. See the [website setup and coexistence guide](payment_square_online/README.md).
+
 ## Features
 
 - Secure Square webhook endpoint at `/square/webhook` with HMAC-SHA256 validation when a webhook signature key is configured.
@@ -28,7 +30,7 @@ Checkout, payment collection, and refund initiation take place in Square POS. Th
 
 ## Compatibility
 
-This repository follows Odoo addon versioning. The current manifest version is `18.0.1.4.0`, where `18.0` is the Odoo series and `1.4.0` is the addon release version.
+This repository follows Odoo addon versioning. The current manifest version is `18.0.1.4.2`, where `18.0` is the Odoo series and `1.4.2` is the addon release version.
 
 The addon manifest declares the following Odoo dependencies:
 
@@ -193,9 +195,12 @@ flowchart TB
 
 ## Operational Notes
 
+When upgrading Square POS Integration to `18.0.1.4.2`, update the installed module to apply the refund schema change. Unverified legacy refunds retain their claimed Square ID and document links for review. Confirmed Square deliveries can use the same ID to record the verified refund. If your installation processed a signed replay on 18.0.1.4.1 and a historical refund was removed, consult a backup taken before that operation for its original links.
+
 - Configure the webhook signature key in Odoo before exposing the endpoint publicly.
 - Keep Square access tokens out of Git. Use Odoo configuration records, environment-specific secrets management, or encrypted backups.
 - Map every active Square location to the intended Odoo warehouse before enabling production inventory sync.
+- Automatic stock counts are queued with the stock change. The **Square POS: Send inventory counts** scheduled action sends committed warehouse quantities every minute and retries failed requests after five minutes. A newer observation replaces an older queued count for the same SKU and location. Square accepts observations up to 24 hours old. After that, or after correcting an ambiguous SKU, use **Synchronize All Products** to send a fresh count.
 - Review the integration logs under **Square > Activity** and inspect out-of-order events under **Square > Webhook Queue**.
 - To recover orders missing from Odoo, open the configuration and choose **Manual Resync Orders**. Set a date range, choose **Scan Missing Orders**, select the orders to recover, then choose **Validate and Resync**.
 

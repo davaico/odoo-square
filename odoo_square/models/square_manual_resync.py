@@ -2,10 +2,12 @@
 # Copyright 2024 Davai
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import logging
+from html import escape
 from datetime import datetime, timedelta, timezone
 from dateutil import parser as dt_parser
 from odoo import _, api, fields, models
 from odoo.exceptions import AccessError, UserError, ValidationError
+from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 
 _logger = logging.getLogger(__name__)
 
@@ -98,7 +100,7 @@ class SquareManualResyncWizard(models.TransientModel):
         default=0,
     )
     missing_total = fields.Integer(
-        string="Missing Orders",
+        string="Missing Order Count",
         compute="_compute_counters",
         readonly=True,
     )
@@ -361,7 +363,6 @@ class SquareManualResyncWizard(models.TransientModel):
             api_client = self.env["square.api.client"]
 
             processed_count = 0
-            error_count = 0
             error_details = []
 
             # Update state to syncing
@@ -369,71 +370,45 @@ class SquareManualResyncWizard(models.TransientModel):
 
             # Process each selected order
             for line in selected_lines:
+                order_id = line.square_order_id
+                failure = f"Could not fetch order {order_id} from Square"
                 try:
-                    order_id = line.square_order_id
-                    _logger.info(f"Fetching full order data for {order_id}")
-
-                    # Fetch full order from Square
-                    order_data = api_client._get_order(
-                        order_id, square_config=self.config_id
-                    )
-                    if not order_data or (order_data.get("id") or order_data.get("order_id")) != order_id:
-                        raise UserError(f"Could not fetch order {order_id} from Square")
-
-                    # Normalize order_id
-                    if order_data.get("id") and not order_data.get("order_id"):
-                        order_data["order_id"] = order_data["id"]
-
                     with self.env.cr.savepoint():
-                        result = order_processor._process_webhook_order(
-                            order_data, "created", square_config=self.config_id, verified_order=order_data,
-                        )
+                        order_data = api_client._get_order(order_id, square_config=self.config_id)
+                        if not order_data or (order_data.get("id") or order_data.get("order_id")) != order_id:
+                            raise UserError(failure)
 
-                    if result.get("status") == "ignored":
-                        continue
-                    if result.get("status") in ["success", "already_processed"]:
+                        events = ("created", "updated") if order_data.get("state") == "COMPLETED" else ("created",)
+                        for event_type in events:
+                            stage = "import" if event_type == "created" else "complete"
+                            failure = f"Could not {stage} Square order {order_id} in Odoo"
+                            result = order_processor._process_webhook_order(
+                                order_data, event_type, square_config=self.config_id, verified_order=order_data,
+                            )
+                            status = result.get("status")
+                            if status == "ignored" or result.get("is_exchange"):
+                                break
+                            if status not in ("success", "already_processed", "updated", "skipped"):
+                                if status in ("retry", "queued", "waiting_for_order"):
+                                    failure = f"Square order {order_id} needs another {stage} attempt"
+                                raise UserError(failure)
+                except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                    raise
+                except Exception as error:
+                    error_details.append(failure)
+                    _logger.warning("%s (%s)", failure, type(error).__name__)
+                else:
+                    if status != "ignored":
                         processed_count += 1
-                        _logger.info(
-                            f"Successfully processed order {order_id}: {result}"
-                        )
-                    else:
-                        error_count += 1
-                        error_msg = f"Order {order_id}: {result.get('message', 'Unknown error')}"
-                        error_details.append(error_msg)
-                        _logger.warning(error_msg)
-                        continue
-
-                    # If order is already completed, also process completion
-                    order_state = order_data.get("state")
-                    if order_state == "COMPLETED":
-                        _logger.info(
-                            f"Order {order_id} is COMPLETED, processing completion event"
-                        )
-                        with self.env.cr.savepoint():
-                            result_update = order_processor._process_webhook_order(
-                                order_data, "updated", square_config=self.config_id, verified_order=order_data,
-                            )
-
-                        if result_update.get("status") not in ["error"]:
-                            _logger.info(
-                                f"Successfully processed completion for {order_id}"
-                            )
-                        else:
-                            _logger.warning(
-                                f"Completion processing had issues for {order_id}: {result_update}"
-                            )
-
-                except Exception as e:
-                    error_count += 1
-                    error_msg = f"Order {line.square_order_id}: {str(e)}"
-                    error_details.append(error_msg)
-                    _logger.error(error_msg, exc_info=True)
 
             # Update final counts and move to done state
             self.processed_count = processed_count
+            error_count = len(error_details)
             self.error_count = error_count
             self.error_details = "\n".join(error_details)
             self.state = "done"
+
+            errors_html = f"<pre>{escape(self.error_details)}</pre>" if error_details else ""
 
             # Log batch operation
             self.env["square.integration.log"]._log_square_event(
@@ -447,7 +422,7 @@ class SquareManualResyncWizard(models.TransientModel):
                         <li>Errors: {error_count}</li>
                         <li>Date Range: {self.start_at} to {self.end_at}</li>
                     </ul>
-                    {f"<p><strong>Errors:</strong></p><pre>{self.error_details}</pre>" if error_details else ""}
+                    {errors_html}
                 """,
                 status="success" if error_count == 0 else "warning",
             )
@@ -458,6 +433,8 @@ class SquareManualResyncWizard(models.TransientModel):
 
             return self._reopen_wizard_action()
 
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
         except ValidationError:
             raise
         except Exception as e:

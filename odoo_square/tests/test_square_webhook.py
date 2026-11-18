@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 import json
+from datetime import timedelta
 from html import unescape
 from unittest.mock import patch
+from requests import Response
 import logging
+from odoo import fields
 from odoo.tests.common import new_test_user, tagged
 from odoo.tools import mute_logger
 from odoo.addons.odoo_square.controllers.square_webhook import SquareWebhookController
@@ -519,6 +522,46 @@ class TestSquareWebhook(SquareHttpCase):
         self.assertEqual(response_data["status"], "ignored")
         self.assertIn("not handled", response_data["message"])
 
+    def test_customer_import_logs_keep_contact_and_http_response_private(self):
+        order_id = "square-order-log-test"
+        customer_id = "square-customer-log-test"
+        customer = {
+            "given_name": "Logprivate", "family_name": "Customer",
+            "email_address": self.partner.email, "phone_number": self.partner.phone,
+            "address": {"address_line_1": "7 Private Road"},
+        }
+        order = {"id": order_id, "customer_id": customer_id, "fulfillments": [{
+            "pickup_details": {"recipient": {"display_name": "Logprivate Customer", **customer}},
+        }]}
+        order_response = Response()
+        order_response.status_code = 200
+        order_response._content = json.dumps({"order": order}).encode()
+        customer_response = Response()
+        customer_response.status_code = 200
+        customer_response._content = json.dumps({"customer": customer}).encode()
+        failure = Response()
+        failure.status_code = 503
+        failure.reason = "Private upstream reason"
+        failure._content = b'{"errors":[{"detail":"Private upstream response"}]}'
+
+        with self.assertLogs("odoo.addons.odoo_square", level="INFO") as captured, patch(
+            "odoo.addons.odoo_square.models.square_api_client.requests.get",
+            side_effect=[order_response, customer_response, order_response, failure],
+        ) as get:
+            for _ in range(2):
+                matched, _payload = self.env["sale.order"]._get_or_create_customer_from_square({"id": order_id})
+                self.assertEqual(matched, self.partner)
+            self.assertEqual(get.call_count, 4)
+
+        messages = "\n".join(captured.output)
+        self.assertIn(order_id, messages)
+        self.assertIn("503", messages)
+        for private in (
+            "Logprivate", self.partner.name, self.partner.email, self.partner.phone, "7 Private Road",
+            failure.reason, "Private upstream response", self.square_config.square_access_token,
+        ):
+            self.assertNotIn(private, messages)
+
     def test_customer_matching_by_email(self):
         """Test customer matching by email"""
 
@@ -856,7 +899,7 @@ class TestSquareWebhook(SquareHttpCase):
 
         self.assertFalse(full_refund._is_partial_refund())
 
-    def _send_order_event(self, event_type, event_id, order_data, expected_status):
+    def _send_order_event(self, event_type, event_id, order_data, expected_status, *, http_status=200):
         response = self.post_square_webhook(
             data=json.dumps(
                 {
@@ -867,7 +910,7 @@ class TestSquareWebhook(SquareHttpCase):
             ),
             headers={"Content-Type": "application/json"},
         )
-        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.status_code, http_status, response.text)
         self.assertEqual(response.json()["status"], expected_status, response.text)
 
     def test_order_line_changes_sync(self):
@@ -987,6 +1030,28 @@ class TestSquareWebhook(SquareHttpCase):
         changes = unescape(" ".join(update_logs.mapped("description")))
         self.assertIn("2 -> 3", changes)
         self.assertIn("3 -> 4", changes)
+
+    def test_cron_retries_due_signed_order_without_another_webhook(self):
+        order_id = "test_scheduled_cancellation"
+        self._send_order_event("order.updated", "evt_scheduled_cancel", {"id": order_id, "state": "CANCELED"}, "queued")
+        queue = self.env["square.webhook.queue"]
+        queued = queue.search([("webhook_event_id", "=", "evt_scheduled_cancel")])
+        sale = self.env["sale.order"].create({"partner_id": self.partner.id, "square_order_id": order_id})
+        cron = self.env.ref("odoo_square.cron_square_webhook_queue")
+        now = fields.Datetime.now()
+        queued.next_retry_time = now + timedelta(hours=1)
+        failed = queued.copy({"webhook_event_id": "old_failed_event", "state": "failed"})
+        self.env.cr.execute("UPDATE square_webhook_queue SET create_date = %s WHERE id = %s", (now - timedelta(days=45), failed.id))
+        cron.method_direct_trigger()
+        self.assertEqual(queued.state, "pending")
+        self.assertEqual(sale.state, "draft")
+
+        queued.next_retry_time = now
+        cron.method_direct_trigger()
+        self.assertEqual(queued.state, "completed")
+        self.assertEqual(queued.retry_count, 1)
+        self.assertEqual(sale.state, "cancel")
+        self.assertTrue(failed.exists())
 
     def test_queued_open_update_older_than_imported_order(self):
         self.env.company.currency_id = self.env.ref("base.EUR")
@@ -1457,6 +1522,13 @@ class TestSquareWebhook(SquareHttpCase):
         payment_receivable = original_payment_move.line_ids.filtered(
             lambda line: line.account_type == "asset_receivable"
         )
+        with patch.object(type(account_moves), "action_post", side_effect=ValueError("Posting unavailable")):
+            self._send_order_event(
+                "order.updated", "evt_completed_cancel", {"id": order_id, "state": "CANCELED"},
+                "retry", http_status=503,
+            )
+        self.assertFalse(account_moves.search(account_domain + [("move_type", "=", "out_refund")]))
+
         credit_note = account_moves.browse()
         for state, event_id, status in (
             ("CANCELED", "evt_completed_cancel", "updated"),
@@ -1510,6 +1582,14 @@ class TestSquareWebhook(SquareHttpCase):
             self.assertEqual(delivery.move_ids.product_id, self.product)
             self.assertEqual(delivery.move_ids.quantity, 2)
             self.assertEqual(stock.qty_available, 8)
+
+        # On upgrade, an earlier cancellation can have its posted credit but no receipt.
+        self.env["square.webhook.event"].search([]).unlink()
+        self._send_order_event(
+            "order.updated", "evt_pre_receipt_replay", {"id": order_id, "state": "Cancelled"}, "updated",
+        )
+        self.assertEqual(account_moves.search(account_domain + [("move_type", "=", "out_refund")]), credit_note)
+        self.assertEqual(sale_order.state, "sale")
 
         logs = self.env["square.integration.log"].search(
             [

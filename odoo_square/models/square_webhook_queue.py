@@ -144,6 +144,12 @@ class SquareWebhookQueue(models.Model):
         return data
 
     @api.model
+    def _cron_retry_webhook_queue(self):
+        for config in self.env["square.config"].search([("active", "=", True)]):
+            scoped_queue = self.with_context(allowed_company_ids=config.company_id.ids)
+            scoped_queue._process_pending_events(config)
+
+    @api.model
     def process_pending_events(self):
         """Run the retry schedule as the configured company's administrator."""
         config = self.env["square.config"].search([("company_id", "=", self.env.company.id)], limit=1)
@@ -168,9 +174,8 @@ class SquareWebhookQueue(models.Model):
             limit=50,  # Process in batches
         )
 
-        _logger.error(
-            f"Processing {len(pending_events)} pending webhook events from queue"
-        )
+        if pending_events:
+            _logger.info("Processing %s pending Square webhook events", len(pending_events))
 
         for event in pending_events:
             try:
@@ -182,8 +187,7 @@ class SquareWebhookQueue(models.Model):
                     f"Error processing queued event {event.webhook_event_id}: {str(e)}"
                 )
 
-        # Clean up old expired events
-        self._cleanup_expired_events(config)
+        self._cleanup_completed_events(config)
 
     def _process_queued_event(self):
         """Process a single queued event"""
@@ -293,8 +297,8 @@ class SquareWebhookQueue(models.Model):
             return False
 
     @api.model
-    def _cleanup_expired_events(self, config):
-        """Clean up old expired or completed events"""
+    def _cleanup_completed_events(self, config):
+        """Retain unresolved failures for administrator inspection."""
         # Remove completed events older than 7 days
         cutoff_completed = fields.Datetime.now() - timedelta(days=7)
         old_completed = self.search(
@@ -306,20 +310,6 @@ class SquareWebhookQueue(models.Model):
                 f"Cleaning up {len(old_completed)} old completed queued events"
             )
             old_completed.unlink()
-
-        # Remove expired/failed events older than 30 days
-        cutoff_failed = fields.Datetime.now() - timedelta(days=30)
-        old_failed = self.search(
-            [
-                ("config_id", "=", config.id),
-                ("state", "in", ["expired", "failed"]),
-                ("create_date", "<", cutoff_failed),
-            ]
-        )
-
-        if old_failed:
-            _logger.info(f"Cleaning up {len(old_failed)} old failed queued events")
-            old_failed.unlink()
 
     @api.model
     def _process_pending_for_order(self, square_order_id, config):

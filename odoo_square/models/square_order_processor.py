@@ -10,6 +10,10 @@ import logging
 _logger = logging.getLogger(__name__)
 
 
+class SquareOrderProcessingDeferred(UserError):
+    """The signed order event needs to be retried after rolling back business effects."""
+
+
 class SquareOrderProcessor(models.Model):
     _name = "square.order.processor"
     _description = "Square Order Processor"
@@ -80,7 +84,7 @@ class SquareOrderProcessor(models.Model):
             return {"status": "error", "message": "Square order ID is missing"}
         order_data["order_id"] = order_id
         order_state = order_data.get("state")
-        normalized = "CANCELED" if order_state == "CANCELLED" else order_state
+        normalized = "CANCELED" if str(order_state).upper() in ("CANCELED", "CANCELLED") else order_state
         state_key = None
         if normalized in ("COMPLETED", "CANCELED"):
             state_key = "order:" + json.dumps([order_id, event_type, normalized])
@@ -230,6 +234,8 @@ class SquareOrderProcessor(models.Model):
                 )
 
             return result
+        except SquareOrderProcessingDeferred as error:
+            return {"status": "retry", "message": str(error)}
         except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
             raise
         except Exception as e:
@@ -569,10 +575,6 @@ class SquareOrderProcessor(models.Model):
         if not sale_order.invoice_ids.filtered(lambda inv: inv.state == "posted"):
             self._create_and_validate_invoice(sale_order)
 
-        # TODO: fix TTC ammout
-        # Step 4: Recalculate totals
-        # sale_order._amount_all()
-
         # Log to integration dashboard
         self.env["square.integration.log"]._log_square_event(
             event_type="order_updated",
@@ -692,20 +694,25 @@ class SquareOrderProcessor(models.Model):
             for line in lines_to_deliver
         )
 
-        # Handle different order states
         if sale_order.state == "cancel":
-            _logger.info(f"Order {sale_order.name} is already cancelled")
             return
 
-        elif sale_order.state == "done" or (
+        reason = f"Square Order Cancellation - {square_order_id}"
+        posted_invoices = sale_order.invoice_ids.filtered(
+            lambda move: move.move_type == "out_invoice" and move.state == "posted"
+        )
+        reversed_invoices = self.env["account.move"].search([
+            ("reversed_entry_id", "in", posted_invoices.ids),
+            ("move_type", "=", "out_refund"), ("state", "=", "posted"),
+        ]).filtered(lambda move: (move.ref or "").endswith(reason)).reversed_entry_id
+
+        # An older installation may already have posted this cancellation without a receipt.
+        if reversed_invoices or sale_order.state == "done" or (
             sale_order.state == "sale"
             and sale_order.invoice_status == "invoiced"
             and fully_delivered
         ):
-            _logger.warning(
-                f"Order {sale_order.name} is invoiced and fulfilled — processing refund/credit note"
-            )
-            self._process_completed_order_cancellation(sale_order, square_order_data)
+            self._process_completed_order_cancellation(sale_order, posted_invoices - reversed_invoices, reason)
             return
 
         # For draft and open sale states (not fully delivered/invoiced), standard cancel
@@ -782,146 +789,33 @@ class SquareOrderProcessor(models.Model):
                 sale_order_id=sale_order.id,
             )
 
-    def _process_completed_order_cancellation(self, sale_order, square_order_data):
-        """
-        Process cancellation of a completed order by creating a credit note/refund
-        """
-        square_order_id = square_order_data.get("order_id")
-
-        _logger.info(f"Processing refund for completed order {sale_order.name}")
-
-        try:
-            # Get bot user
-            bot_user = self._get_square_bot_user()
-
-            # Check if the order has invoices that need to be refunded
-            if not sale_order.invoice_ids:
-                _logger.warning(
-                    f"No invoices found for completed order {sale_order.name}"
-                )
-                self.env["square.integration.log"]._log_square_event(
-                    event_type="order_updated",
-                    title=f"Aucune facture à rembourser pour {sale_order.name}",
-                    description=f"""
-                        <p><strong>Annulation Commande Square - Aucune Facture</strong></p>
-                        <ul>
-                            <li>ID Commande Square: <strong>{square_order_id}</strong></li>
-                            <li>Commande Odoo: <strong>{sale_order.name}</strong></li>
-                            <li>État: Terminé (Complété)</li>
-                            <li>Problème: Aucune facture trouvée pour créer l'avoir</li>
-                            <li>Action: Une intervention manuelle peut être nécessaire</li>
-                        </ul>
-                    """,
-                    status="warning",
-                    square_order_id=square_order_id,
-                    sale_order_id=sale_order.id,
-                )
-                return
-
-            # Get posted invoices
-            posted_invoices = sale_order.invoice_ids.filtered(
-                lambda inv: inv.state == "posted"
-            )
-
-            if not posted_invoices:
-                _logger.warning(f"No posted invoices found for order {sale_order.name}")
-                return
-
-            # Create credit notes for posted invoices
-            for invoice in posted_invoices:
-                try:
-                    # Create credit note using Odoo's standard method
-                    credit_note_wizard = (
-                        self.env["account.move.reversal"]
-                        .with_user(bot_user)
-                        .create(
-                            {
-                                "move_ids": [(6, 0, invoice.ids)],
-                                "journal_id": invoice.journal_id.id,
-                                "reason": f"Square Order Cancellation - {square_order_id}",
-                            }
-                        )
-                    )
-
-                    # Generate the credit note
-                    credit_note_result = credit_note_wizard.reverse_moves()
-                    credit_note = self.env["account.move"].browse(
-                        credit_note_result["res_id"]
-                    )
-
-                    # Validate the credit note
-                    if credit_note.state == "draft":
-                        credit_note.with_user(bot_user).action_post()
-
-                    _logger.info(
-                        f"Created credit note {credit_note.name} for invoice {invoice.name}"
-                    )
-
-                    # Log the credit note creation
-                    self.env["square.integration.log"]._log_square_event(
-                        event_type="order_updated",
-                        title=f"Avoir créé pour la commande annulée {sale_order.name}",
-                        description=f"""
-                            <p><strong>Annulation Commande Square - Avoir Créé</strong></p>
-                            <ul>
-                                <li>ID Commande Square: <strong>{square_order_id}</strong></li>
-                                <li>Commande Odoo: <strong>{sale_order.name}</strong></li>
-                                <li>Facture Originale: <strong>{invoice.name}</strong></li>
-                                <li>Avoir: <strong>{credit_note.name}</strong></li>
-                                <li>Montant: {credit_note.amount_total} {credit_note.currency_id.name}</li>
-                                <li>Action: Avoir créé et comptabilisé</li>
-                            </ul>
-                        """,
-                        status="info",
-                        square_order_id=square_order_id,
-                        sale_order_id=sale_order.id,
-                    )
-
-                except Exception as e:
-                    _logger.error(
-                        f"Failed to create credit note for invoice {invoice.name}: {str(e)}"
-                    )
-                    # Log the error but continue with other invoices
-                    self.env["square.integration.log"]._log_square_event(
-                        event_type="order_updated",
-                        title=f"Échec de création d'avoir pour {sale_order.name}",
-                        description=f"""
-                            <p><strong>Annulation Commande Square - Échec Avoir</strong></p>
-                            <ul>
-                                <li>ID Commande Square: <strong>{square_order_id}</strong></li>
-                                <li>Commande Odoo: <strong>{sale_order.name}</strong></li>
-                                <li>Facture: <strong>{invoice.name}</strong></li>
-                                <li>Erreur: {str(e)}</li>
-                                <li>Action: Création manuelle d'avoir nécessaire</li>
-                            </ul>
-                        """,
-                        status="error",
-                        square_order_id=square_order_id,
-                        sale_order_id=sale_order.id,
-                    )
-
-        except Exception as e:
-            _logger.error(
-                f"Error processing completed order cancellation for {sale_order.name}: {str(e)}"
-            )
-            # Log the overall error
+    def _process_completed_order_cancellation(self, sale_order, invoices, reason):
+        """Reverse each remaining invoice within the order event's savepoint."""
+        bot_user = self._get_square_bot_user()
+        for invoice in invoices:
+            try:
+                reversal = self.env["account.move.reversal"].with_user(bot_user).create({
+                    "move_ids": [(6, 0, invoice.ids)],
+                    "journal_id": invoice.journal_id.id,
+                    "reason": reason,
+                })
+                result = reversal.reverse_moves()
+                credit = self.env["account.move"].with_user(bot_user).browse(result["res_id"])
+                if credit.state == "draft":
+                    credit.action_post()
+            except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+                raise
+            except Exception as error:
+                _logger.exception("Square cancellation failed for invoice %s", invoice.name)
+                raise SquareOrderProcessingDeferred("Could not post the Square cancellation credit.") from error
             self.env["square.integration.log"]._log_square_event(
                 event_type="order_updated",
-                title=f"Échec de l'annulation de commande terminée pour {sale_order.name}",
-                description=f"""
-                    <p><strong>Erreur d'Annulation de Commande Square</strong></p>
-                    <ul>
-                        <li>ID Commande Square: <strong>{square_order_id}</strong></li>
-                        <li>Commande Odoo: <strong>{sale_order.name}</strong></li>
-                        <li>Erreur: {str(e)}</li>
-                        <li>Action: Traitement manuel de remboursement nécessaire</li>
-                    </ul>
-                """,
-                status="error",
-                square_order_id=square_order_id,
+                title=f"Avoir créé pour la commande annulée {sale_order.name}",
+                description=f"Facture originale : {invoice.name}. Avoir : {credit.name}.",
+                status="info",
+                square_order_id=sale_order.square_order_id,
                 sale_order_id=sale_order.id,
             )
-            raise
 
     def _process_product_exchange(self, sale_order, order_data, payment_data):
         """Complete the return, replacement, and accounting for a Square exchange."""
@@ -1550,6 +1444,9 @@ class SquareOrderProcessor(models.Model):
                 invoice, sale_order, bot_user
             )
 
+            if invoice.amount_total > 0 and not payment_created:
+                raise SquareOrderProcessingDeferred("Could not register the Square payment.")
+
             # Determine payment status for messaging
             payment_status = (
                 "Payée" if payment_created else "Créée (paiement en attente)"
@@ -1597,25 +1494,13 @@ class SquareOrderProcessor(models.Model):
             )
             return invoice
 
-        except Exception as e:
-            _logger.error(
-                f"Error creating invoice for sale order {sale_order.name}: {str(e)}",
-                exc_info=True,
-            )
-
-            # Log error to integration dashboard
-            try:
-                self.env["square.integration.log"]._log_error(
-                    title=f"Erreur création facture pour {sale_order.name}",
-                    error_message=f"Impossible de créer la facture pour la commande {sale_order.name}",
-                    technical_details=f"Commande: {sale_order.name}, Erreur: {str(e)}",
-                    square_order_id=sale_order.square_order_id,
-                    sale_order_id=sale_order.id,
-                )
-            except:
-                pass  # Don't let logging errors break the process
-
-            return None
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except SquareOrderProcessingDeferred:
+            raise
+        except Exception as error:
+            _logger.exception("Square invoice processing failed for %s", sale_order.name)
+            raise SquareOrderProcessingDeferred("Could not invoice the Square order.") from error
 
     def _create_payment_for_invoice(self, invoice, sale_order, bot_user):
         """Create and register payment for Square invoice (already paid orders)"""
@@ -1937,6 +1822,8 @@ class SquareOrderProcessor(models.Model):
                             mail_auto_subscribe_no_notify=True,
                             mail_create_nosubscribe=True,
                         )._validate_square_picking(sale_order)
+                    if picking.state != "done":
+                        raise SquareOrderProcessingDeferred("Could not complete the Square delivery.")
 
             # Add chatter message for stock movements
             processed_pickings = sale_order.picking_ids.filtered(
@@ -1984,26 +1871,13 @@ class SquareOrderProcessor(models.Model):
 
             _logger.info(f"Processed stock movements for sale order {sale_order.name}")
 
-        except Exception as e:
-            error_msg = str(e)
-            _logger.error(
-                f"Error creating stock movements for sale order {sale_order.name}: {error_msg}",
-                exc_info=True,
-            )
-
-            # If it's a mail follower issue, provide a more specific error
-            if (
-                "operator does not exist: integer = boolean" in error_msg
-                or "mail_followers" in error_msg
-            ):
-                _logger.warning(
-                    f"Mail follower issue detected for sale order {sale_order.name}. "
-                    f"This may be due to user/partner configuration issues. "
-                    f"The order has been processed but stock movements may need manual validation."
-                )
-
-            # Don't re-raise the exception to avoid aborting the entire transaction
-            # The order processing should continue even if stock movements fail
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except SquareOrderProcessingDeferred:
+            raise
+        except Exception as error:
+            _logger.exception("Square delivery failed for order %s", sale_order.name)
+            raise SquareOrderProcessingDeferred("Could not deliver the Square order.") from error
 
     def _get_configured_warehouse(self):
         """Get the configured warehouse from Square configuration (legacy method)"""

@@ -123,7 +123,7 @@ class SquareStockSync(models.Model):
         mappings = self._get_location_mappings(config).filtered(
             lambda mapping: mapping.warehouse_id in warehouses
         )
-        self._sync_mapped_product(move.product_id, config, mappings)
+        self._queue_mapped_product(move.product_id, mappings)
 
     def _sync_quant_change(self, quant, config):
         if not self._should_sync_product(quant.product_id, config.company_id):
@@ -131,17 +131,13 @@ class SquareStockSync(models.Model):
         mappings = self._get_location_mappings(config).filtered(
             lambda mapping: mapping.warehouse_id == quant.location_id.warehouse_id
         )
-        self._sync_mapped_product(quant.product_id, config, mappings)
+        self._queue_mapped_product(quant.product_id, mappings)
 
-    def _sync_mapped_product(self, product, config, mappings):
-        if not mappings:
-            return
-        merchant_location_ids = self._merchant_location_ids(config)
+    def _queue_mapped_product(self, product, mappings):
+        counts = self.env["square.stock.count"]
         for mapping in mappings:
-            if mapping.square_location_id not in merchant_location_ids:
-                _logger.warning("Skipping a Square stock mapping outside the configured merchant's active locations")
-                continue
-            self._sync_product_to_location(product, mapping.warehouse_id, mapping.square_location_id)
+            quantity = self._get_warehouse_stock(product, mapping.warehouse_id)
+            counts._queue_count(product, mapping, quantity)
 
     def manual_sync_all_products(self):
         """Synchronize stock from the configured company and its mapped warehouses."""
@@ -198,7 +194,6 @@ class SquareStockSync(models.Model):
         quants = self.env["stock.quant"].search([
             ("company_id", "=", warehouse.company_id.id),
             ("location_id", "child_of", warehouse.lot_stock_id.id),
-            ("quantity", ">", 0),
         ])
         products = quants.product_id.filtered(
             lambda product: self._should_sync_product(product, warehouse.company_id)
@@ -220,7 +215,7 @@ class SquareStockSync(models.Model):
 
             success = search["success"] and api_client._set_physical_count(
                 search["catalog_object_id"], square_location_id,
-                int(self._get_warehouse_stock(product, warehouse)), sku,
+                self._get_warehouse_stock(product, warehouse), sku,
             )
         except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
             raise
@@ -228,6 +223,10 @@ class SquareStockSync(models.Model):
             _logger.exception("Square could not synchronize stock")
             success = False
 
+        self._record_count_result(product, square_location_id, success)
+        return success
+
+    def _record_count_result(self, product, square_location_id, success):
         self.write({
             "total_syncs": self.total_syncs + 1,
             "successful_syncs": self.successful_syncs + int(success),
@@ -240,4 +239,3 @@ class SquareStockSync(models.Model):
             description=f"Square location: {square_location_id}",
             status="success" if success else "error",
         )
-        return success

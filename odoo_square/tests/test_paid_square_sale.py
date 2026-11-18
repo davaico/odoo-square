@@ -64,7 +64,7 @@ class TestPaidSquareSale(SquareHttpCase):
                 "payment_journal_id": journal.id,
             }
         )
-        self.env["square.location.mapping"].create(
+        mapping = self.env["square.location.mapping"].create(
             {
                 "config_id": config.id,
                 "square_location_id": "checkout-location",
@@ -128,6 +128,34 @@ class TestPaidSquareSale(SquareHttpCase):
                 return_value={"success": True, "sku": "CHECKOUT-SKU"},
             ),
         ):
+            mapping.active = False
+            archived = self.post_square_webhook(data=webhook_data)
+            self.assertEqual(archived.status_code, 503, archived.text)
+            self.assertFalse(self.env["sale.order"].search(order_domain))
+            self.assertEqual(other_stock.qty_available, 7)
+            mapping.active = True
+
+            product.invoice_policy = "order"
+            with patch.object(type(self.env["stock.picking"]), "button_validate", side_effect=ValueError("Delivery blocked")):
+                failed = self.post_square_webhook(data=webhook_data)
+            self.assertEqual(failed.status_code, 503, failed.text)
+            self.assertFalse(self.env["sale.order"].search(order_domain))
+            self.assertFalse(self.env["account.move"].search(invoice_domain))
+            self.assertEqual(mapped_stock.qty_available, 2)
+            product.invoice_policy = "delivery"
+
+            # A native accounting failure must release both event and order receipts.
+            with patch.object(
+                type(self.env["account.payment.register"]), "action_create_payments",
+                side_effect=ValueError("Temporary journal failure"),
+            ):
+                failed = self.post_square_webhook(data=webhook_data)
+            self.assertEqual(failed.status_code, 503, failed.text)
+            self.assertFalse(self.env["sale.order"].search(order_domain))
+            self.assertFalse(self.env["account.move"].search(invoice_domain))
+            self.assertFalse(self.env["account.payment"].search(payment_domain))
+            self.assertEqual(mapped_stock.qty_available, 2)
+
             records = None
             for expected_status in ("success", "already_processed"):
                 response = self.post_square_webhook(

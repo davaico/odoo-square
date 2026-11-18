@@ -41,10 +41,6 @@ class StockMove(models.Model):
         if self.env.context.get("square_move_in_progress") is _STOCK_MOVE_IN_PROGRESS:
             return moves
 
-        # Ensure moves is always a recordset
-        if not isinstance(moves, models.BaseModel):
-            moves = self.browse(moves) if isinstance(moves, (int, list)) else moves
-
         # Trigger sync for completed moves
         for move in moves:
             if move.exists() and move.state == "done":
