@@ -13,7 +13,7 @@
     "author": "Davai",
     "website": "https://github.com/davaico/odoo-square",
     "support": "support@davai.co",
-    "images": ["static/description/square-online-payments.png"],
+    "images": ["static/description/online-card-payment.jpg"],
     "license": "AGPL-3",
     "depends": ["account_payment", "website_sale"],
     "external_dependencies": {"python": ["cryptography", "requests"]},
