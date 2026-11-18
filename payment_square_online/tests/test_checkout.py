@@ -1121,7 +1121,14 @@ class TestSquareCheckout(SquareCheckoutCase):
         order = self._cart()
         values = self._prepare(order)
         second_tab = self._prepare(order)
-        other_provider = self.env['payment.provider'].search([('code', '!=', 'square_online')], limit=1)
+        other_provider = self.env['payment.provider'].create({
+            'name': 'Alternative payment provider',
+            'company_id': self.company.id,
+            'journal_id': self.journal.id,
+            'payment_method_ids': [Command.set(self.env.ref('payment.payment_method_card').ids)],
+            'state': 'test',
+            'is_published': True,
+        })
 
         def response_lost(method, url, **kwargs):
             if url.endswith('/v2/payments'):
@@ -1146,6 +1153,7 @@ class TestSquareCheckout(SquareCheckoutCase):
             self.assertEqual(square.call_count, 2)
         self.assertEqual(self._result('/payment/status/poll')['state'], 'pending')
         self.assertIn(order.state, ('draft', 'sent'))
+        self.assertNotIn(other_provider, order.transaction_ids.provider_id)
         self.assertFalse(order.transaction_ids.payment_id)
 
     def test_late_payment_does_not_confirm_or_invoice_an_order_changed_by_staff(self):

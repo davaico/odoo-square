@@ -9,11 +9,13 @@
                 <form string="Square Configuration">
                     <header>
                         <button name="test_square_connection"
+                                groups="base.group_system"
                                 string="Test Connection"
                                 type="object"
                                 class="oe_highlight"
                                 invisible="not square_application_id or not square_access_token"/>
                         <button name="sync_square_locations"
+                                groups="base.group_system"
                                 string="Synchronize Locations"
                                 type="object"
                                 class="btn-secondary"

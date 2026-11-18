@@ -2,7 +2,9 @@ name: odoo-square-v18
 
 services:
   db:
-    image: postgres:17.4@sha256:304ab813518754228f9f792f79d6da36359b82d8ecf418096c636725f8c930ad
+    build:
+      context: config
+      dockerfile: Dockerfile.postgres
     environment:
       POSTGRES_DB: ${DB_NAME:-odoo_square_v18}
       POSTGRES_USER: ${DB_USER:-odoo}
