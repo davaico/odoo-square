@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from odoo import SUPERUSER_ID, _, api, fields, models
 from odoo.exceptions import AccessError, ValidationError
+from odoo.http import request
 from odoo.tools import SQL
 
 from odoo.addons.payment import utils as payment_utils
@@ -44,7 +45,9 @@ _DEFINITIVE_CHARGE_CODES = (
 class PaymentTransaction(models.Model):
     _inherit = "payment.transaction"
 
-    square_online_order_id = fields.Many2one("sale.order", readonly=True, copy=False, ondelete="restrict")
+    square_online_order_id = fields.Many2one(
+        "sale.order", readonly=True, copy=False, ondelete="restrict", index="btree_not_null",
+    )
     square_online_website_id = fields.Many2one("website", readonly=True, copy=False, ondelete="restrict")
     square_online_connection_id = fields.Many2one(
         "square.online.connection", readonly=True, copy=False, ondelete="restrict",
@@ -114,9 +117,17 @@ class PaymentTransaction(models.Model):
         self.ensure_one()
         provider = self.provider_id
         connection = provider._square_online_get_connection()
+        # Match the native sale portal's buyer even when the invoice has a different contact.
+        buyer = order.partner_id
+        if request and not request.env.user._is_public():
+            buyer = request.env.user.partner_id
         providers = provider.with_context(square_online_website_checkout=True)._get_compatible_providers(
-            order.company_id.id, order.partner_invoice_id.id, order.amount_total,
+            order.company_id.id, buyer.id, order.amount_total,
             currency_id=order.currency_id.id, website_id=website_id, sale_order_id=order.id,
+        )
+        methods = self.env["payment.method"]._get_compatible_payment_methods(
+            (provider & providers).ids, buyer.id, currency_id=order.currency_id.id,
+            website_id=website_id, sale_order_id=order.id,
         )
         if (
             not order.website_id
@@ -133,7 +144,7 @@ class PaymentTransaction(models.Model):
             or provider not in providers
             or self.operation != "online_direct"
             or self.payment_method_id != self.env.ref("payment.payment_method_card")
-            or self.payment_method_id not in provider.payment_method_ids
+            or self.payment_method_id not in methods
             or self.tokenize
             or self.token_id
         ):

@@ -869,6 +869,25 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             self.assertEqual(self._get_stock_quantity(product, self.warehouse_w1), quantity)
             self.assertEqual(self._get_stock_quantity(product, self.warehouse_w2), 50)
 
+    def test_exchange_before_source_order_retries_and_settles_once(self):
+        order = {
+            "id": "EXCHANGE_L1_001", "location_id": "L1", "state": "COMPLETED",
+            "returns": [{"source_order_id": "ORDER_L1_001"}],
+        }
+        payment = {"id": "payment_exchange_001", "order_id": order["id"], "status": "COMPLETED"}
+        with patch.object(SquareApiClient, "get_order", return_value=order):
+            result = self._send_square_exchange_event(
+                "payment.updated", "evt_exchange_completed", "payment", payment, expected_status_code=503,
+            )
+        self.assertEqual(result["status"], "retry", result)
+        self.assertFalse(self.env["square.event.receipt"].search([
+            ("event_key", "=", "evt_exchange_completed"),
+        ]))
+        payment = self._run_square_exchange(120, 0)
+        result = self._send_square_exchange_event("payment.updated", "evt_exchange_completed", "payment", payment)
+        self.assertEqual(result["status"], "already_processed", result)
+        self._assert_settled_exchange(1.20, 0)
+
     def test_exchange_respects_an_unreserved_pending_return(self):
         self._import_paid_square_sale()
         order = self.created_sale_order
@@ -1184,6 +1203,41 @@ class TestSquareIntegrationScenario(SquareHttpCase):
             result = self._send_square_exchange_event("payment.updated", "evt_late_payment", "payment", payment)
             self.assertEqual(result["status"], "already_processed", result)
             self.assertEqual(imported.invoice_ids.reconciled_payment_ids, reconciled)
+
+    def test_unavailable_tender_lookup_retries_signed_payment_and_settles_once(self):
+        order = self._mock_get_order("ORDER_L1_001")
+        tender = order["tenders"][0]
+        tender["card_details"]["status"] = "AUTHORIZED"
+        payment = {
+            "id": tender["id"], "order_id": order["id"], "location_id": order["location_id"],
+            "amount_money": tender["amount_money"], "status": "COMPLETED",
+        }
+        with (
+            patch.object(SquareApiClient, "get_order", return_value=order) as get_order,
+            patch.object(SquareApiClient, "get_payment", return_value={**payment, "status": "APPROVED"}) as get_payment,
+        ):
+            result = self._send_square_order_event("order.updated", "evt-approved-order", "COMPLETED")
+            invoice = self.env["sale.order"].browse(result["sale_order_id"]).invoice_ids
+            self.assertEqual(invoice.state, "posted")
+            self.assertGreater(invoice.amount_residual, 0)
+            for unavailable in (get_order, get_payment):
+                with self.subTest(lookup=unavailable):
+                    unavailable.return_value = None
+                    result = self._send_square_exchange_event(
+                        "payment.updated", "evt-capture-recovery", "payment", payment, expected_status_code=503,
+                    )
+                    self.assertEqual(result["status"], "retry", result)
+                    self.assertFalse(invoice.reconciled_payment_ids)
+                    self.assertEqual(invoice.amount_residual, invoice.amount_total)
+                    get_order.return_value = order
+
+            get_payment.return_value = payment
+            for status in ("success", "already_processed"):
+                result = self._send_square_exchange_event("payment.updated", "evt-capture-recovery", "payment", payment)
+                self.assertEqual(result["status"], status, result)
+                self.assertEqual(len(invoice.reconciled_payment_ids), 1)
+                self.assertEqual(invoice.reconciled_payment_ids.amount, invoice.amount_total)
+                self.assertEqual(invoice.amount_residual, 0)
 
     def test_paid_sale_import_and_replay(self):
         mapping = self.square_config.location_mapping_ids.filtered(lambda item: item.square_location_id == "L1")

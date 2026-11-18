@@ -239,10 +239,21 @@ class TestStockSync(TransactionCase):
         pending = jobs.search([])
         self.assertEqual(len(pending), 1)
         self.assertGreater(pending.next_attempt, fields.Datetime.now())
+        # Square was unreachable for more than a day. Stock received in a new
+        # bin since this observation must be included in the recovered count.
+        pending.counted_at = fields.Datetime.subtract(fields.Datetime.now(), hours=25)
+        self.env["stock.quant"].create({
+            "product_id": quant.product_id.id,
+            "location_id": self.env["stock.location"].create({
+                "name": "Additional bin", "location_id": self.warehouse.lot_stock_id.id,
+                "usage": "internal",
+            }).id,
+            "quantity": 3,
+        })
         pending.next_attempt = fields.Datetime.now()
         with patch.object(SquareApiClient, "_make_api_request", side_effect=self._square_response) as requests:
             self._send_pending_counts()
-            self._assert_physical_counts(requests, [("SQ-STOCK-LOCATION", "2.5")])
+            self._assert_physical_counts(requests, [("SQ-STOCK-LOCATION", "5.5")])
         self.assertFalse(jobs.search([]))
 
 

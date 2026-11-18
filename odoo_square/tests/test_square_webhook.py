@@ -78,7 +78,6 @@ class TestSquareWebhook(SquareHttpCase):
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_order_created_completed(self):
         """Test webhook processing for order.created with COMPLETED status"""
-        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=None))
 
         # Sample Square webhook data for order.created
         webhook_data = {
@@ -116,6 +115,8 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Make webhook request using Odoo's HTTP testing
+        order = webhook_data["data"]["object"]["order_created"]
+        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=order))
         response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
@@ -142,7 +143,6 @@ class TestSquareWebhook(SquareHttpCase):
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_webhook_order_updated_completed(self):
         """Test webhook processing for order.updated with COMPLETED status"""
-        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=None))
 
         webhook_data = {
             "type": "order.updated",
@@ -177,6 +177,8 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
+        order = webhook_data["data"]["object"]["order_updated"]
+        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=order))
         response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
@@ -282,7 +284,6 @@ class TestSquareWebhook(SquareHttpCase):
 
     @mute_logger("odoo.addons.odoo_square.models.sale_order")
     def test_webhook_unknown_product_uses_placeholder(self):
-        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=None))
         self.enterContext(
             patch.object(
                 SquareApiClient,
@@ -315,6 +316,8 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
+        order = webhook_data["data"]["object"]["order_created"]
+        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=order))
         response = self._post_signed_square_webhook(
             "/square/webhook",
             data=json.dumps(webhook_data),
@@ -586,6 +589,7 @@ class TestSquareWebhook(SquareHttpCase):
             ],
         }
 
+        self.enterContext(patch.object(SquareApiClient, "get_order", return_value=square_data))
         processor = self.env["square.order.processor"]
         result = processor._process_square_order(square_data)
 

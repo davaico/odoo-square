@@ -524,6 +524,7 @@ class TestSquareOnlinePosCoexistence(SquareOnlineCheckoutCase):
             wizard_model, "create", [{"config_id": self.pos.id}],
         ))
         self._pos_action(wizard_model, "action_scan_missing_orders", [wizard.ids], button=True)
+        self.assertEqual(wizard.square_total, 0)
         self.assertFalse(wizard.line_ids, "A scan must not offer a website order for POS import")
 
         # A previously selected line or queue entry must be checked again at execution.

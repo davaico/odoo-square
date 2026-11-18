@@ -121,15 +121,6 @@ class TestSquareManualResync(TransactionCase):
             },
         ]
 
-        # Mock get_order for missing order
-        mock_get_order.side_effect = lambda order_id, **kwargs: {
-            "id": order_id,
-            "state": "COMPLETED",
-            "created_at": "2024-01-02T10:00:00Z",
-            "location_id": "LOC_123",
-            "total_money": {"amount": 20000},
-        }
-
         wizard = self.env["square.manual.resync.wizard"].create(
             {
                 "config_id": self.square_config.id,
@@ -139,6 +130,7 @@ class TestSquareManualResync(TransactionCase):
         wizard._onchange_days_back()
         wizard.action_scan_missing_orders()
 
+        mock_get_order.assert_not_called()
         self.assertEqual(wizard.state, "results")
         self.assertEqual(wizard.square_total, 2)
         self.assertEqual(wizard.odoo_total, 1)
@@ -150,6 +142,27 @@ class TestSquareManualResync(TransactionCase):
         )
         self.assertEqual(len(missing_lines), 1)
         self.assertTrue(missing_lines[0].selected)
+
+    def test_scan_reports_incomplete_search_without_partial_results(self):
+        wizard = self.env["square.manual.resync.wizard"].create({"config_id": self.square_config.id})
+        first_page = {"orders": [{"id": "missing-before-outage"}], "cursor": "next-page"}
+        with patch(
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient._make_api_request",
+            side_effect=[first_page, UserError("Square is unavailable.")],
+        ), self.assertRaisesRegex(UserError, "Could not complete the Square order scan for location LOC_123"):
+            wizard.action_scan_missing_orders()
+        self.assertEqual(wizard.state, "preview")
+        self.assertFalse(wizard.line_ids)
+
+    def test_scan_requires_shorter_range_when_page_limit_reached(self):
+        wizard = self.env["square.manual.resync.wizard"].create({"config_id": self.square_config.id})
+        with patch(
+            "odoo.addons.odoo_square.models.square_api_client.SquareApiClient._make_api_request",
+            return_value={"orders": [{"id": "missing-order"}], "cursor": "another-page"},
+        ), self.assertRaisesRegex(UserError, "Select a shorter date range"):
+            wizard.action_scan_missing_orders()
+        self.assertEqual(wizard.state, "preview")
+        self.assertFalse(wizard.line_ids)
 
     def test_resync_requires_selection(self):
         """Test that resync requires at least one selected order"""

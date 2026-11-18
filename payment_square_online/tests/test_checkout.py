@@ -7,6 +7,7 @@ import requests
 from lxml import html
 
 from odoo import Command
+from odoo.exceptions import AccessError
 from odoo.tests import HttpCase, tagged
 from odoo.tests.common import JsonRpcException, new_test_user
 
@@ -341,6 +342,63 @@ class TestSquareOnlineCheckout(SquareOnlineCheckoutCase):
         self.assertFalse(tx.payment_id)
         self.assertFalse(order.invoice_ids)
         external.assert_called_once()
+
+    @patch(square_boundary)
+    def test_pending_charge_reserves_order_even_if_legacy_transaction_link_is_missing(self, external):
+        order = self._make_order()
+        form = self._open_payment_page(order)
+        draft = self._prepare(order, form)
+        external.side_effect = requests.Timeout
+        self.assertEqual(self._submit(draft)["state"], "pending")
+        self.env.invalidate_all()
+        tx = order.transaction_ids
+
+        self.assertEqual(tx.id, draft["square_online_transaction_id"])
+        self.assertEqual(tx.square_online_order_id, order)
+        self.assertEqual(tx.state, "pending")
+        self.assertTrue(tx.square_online_dispatch_at)
+        manager = new_test_user(
+            self.env, login="square-sales-billing",
+            groups="sales_team.group_sale_manager,account.group_account_invoice",
+        )
+        for value in ([Command.clear()], False):
+            with self.subTest(value=value), self.assertRaisesRegex(AccessError, "must stay linked"):
+                order.with_user(manager).write({"transaction_ids": value})
+        self.assertEqual(order.transaction_ids, tx)
+
+        # Represent an order saved before sale-side link protection was installed.
+        order.sudo().write({"transaction_ids": [Command.clear()]})
+        self.assertFalse(order.transaction_ids)
+        self.assertEqual(tx.square_online_order_id, order)
+        with self.assertRaisesRegex(JsonRpcException, "ValidationError"):
+            self._prepare(order, form)
+        self.assertEqual(tx.state, "pending")
+        self.assertFalse(tx.payment_id)
+        external.assert_called_once()
+
+    @patch(square_boundary)
+    def test_native_card_country_restriction_rechecks_prepared_checkout(self, external):
+        order = self._make_order()
+        canada = self.env.ref("base.ca")
+        order.partner_invoice_id = self.env["res.partner"].create({
+            "name": "Canadian billing contact", "parent_id": self.partner.id, "type": "invoice",
+            "email": self.partner.email, "phone": self.partner.phone,
+            "country_id": canada.id, "street": "18 Main Street", "city": "Toronto", "zip": "M5H 2N2",
+            "state_id": self.env["res.country.state"].search([
+                ("country_id", "=", canada.id), ("code", "=", "ON"),
+            ], limit=1).id,
+        })
+        form = self._open_payment_page(order)
+        draft = self._prepare(order, form)
+        self.method.supported_country_ids = [Command.set(canada.ids)]
+        with self.assertRaisesRegex(JsonRpcException, "ValidationError"):
+            self._submit(draft)
+        with self.assertRaisesRegex(JsonRpcException, "ValidationError"):
+            self._prepare(order, form)
+        self.env.invalidate_all()
+        self.assertEqual(order.transaction_ids.state, "draft")
+        self.assertFalse(order.transaction_ids.square_online_dispatch_at)
+        external.assert_not_called()
 
     @patch(square_boundary)
     def test_portal_saved_card_cannot_collect_an_unresolved_or_paid_square_order(self, external):

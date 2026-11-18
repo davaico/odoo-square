@@ -195,142 +195,57 @@ class SquareManualResyncWizard(models.TransientModel):
             if not states:
                 states = ["OPEN", "COMPLETED"]
 
-            # Fetch orders from Square
-            square_order_ids = set()
-            try:
-                # Get config to determine which locations to search
-                config = self.config_id
+            config = self.config_id
+            mappings = self.location_ids or config.location_mapping_ids
+            if not mappings:
+                raise UserError("No locations configured. Please configure location mappings in Square Settings.")
 
-                # Get location mappings to search
-                if self.location_ids:
-                    # User specified specific locations
-                    location_ids_to_search = self.location_ids.mapped("square_location_id")
-                else:
-                    # No specific locations - get from config mappings
-                    location_ids_to_search = config.location_mapping_ids.mapped("square_location_id")
-
-                _logger.info(f"Searching {len(location_ids_to_search)} locations for orders")
-                _logger.info(f"Date range: {self.start_at} to {self.end_at}")
-                _logger.info(f"States: {states}")
-
-                # Fetch orders from each location (simpler than /orders/search)
-                if not location_ids_to_search:
-                    raise UserError("No locations configured. Please configure location mappings in Square Settings.")
-
-                for location_id in location_ids_to_search:
-                    try:
-                        _logger.info(f"Fetching orders for location: {location_id}")
-                        # Square SearchOrders: server-side date + state filter + pagination
-                        # (avoids empty results when >limit orders exist outside the window)
-                        loc_orders = api_client.get_location_orders(
-                            location_id=location_id,
-                            limit=500,
-                            start_at=range_start,
-                            end_at=range_end,
-                            states=states,
-                            square_config=config,
-                        )
-
-                        _logger.info(
-                            f"Location {location_id} returned {len(loc_orders)} orders"
-                        )
-
-                        for order in loc_orders:
-                            order_id = order.get("id")
-                            if order_id:
-                                square_order_ids.add(order_id)
-                    except Exception as e:
-                        _logger.warning(
-                            f"Error fetching orders for location {location_id}: {str(e)}"
-                        )
-                        continue
-
-                _logger.info(f"Found {len(square_order_ids)} orders in Square")
-
-            except Exception as e:
-                _logger.error(f"Error fetching orders from Square: {str(e)}", exc_info=True)
-                raise UserError(f"Failed to fetch orders from Square: {str(e)}")
-
-            # Get existing orders in Odoo
-            existing_orders = self.env["sale.order"].search(
-                [("square_order_id", "in", list(square_order_ids))]
-            )
-            existing_order_ids = set(existing_orders.mapped("square_order_id"))
-
-            _logger.info(
-                f"Found {len(existing_order_ids)} orders already in Odoo"
-            )
-
-            # Compute missing orders
-            missing_order_ids = square_order_ids - existing_order_ids
-            _logger.info(f"Found {len(missing_order_ids)} missing orders")
-
-            # Fetch full details for missing orders and create wizard lines
-            line_vals = []
-            for order_id in sorted(missing_order_ids):
+            orders_by_id = {}
+            for location_id in mappings.mapped("square_location_id"):
                 try:
-                    order_data = api_client.get_order(
-                        order_id, square_config=self.config_id
+                    orders = api_client.get_location_orders(
+                        location_id=location_id, limit=500, start_at=range_start,
+                        end_at=range_end, states=states, square_config=config,
                     )
-                    if order_data:
-                        routing = self.env["square.order.processor"]._square_online_event_result(
-                            order_id=order_id, location_id=order_data.get("location_id"),
-                            square_config=self.config_id, full_order=order_data,
-                        )
-                        if routing and routing["status"] == "ignored":
-                            continue
-                        created_at_str = order_data.get("created_at")
-                        created_at = None
-                        if created_at_str:
-                            try:
-                                created_at = _square_ts_to_odoo_naive(created_at_str)
-                            except Exception:
-                                pass
+                except UserError as error:
+                    raise UserError(_("Could not complete the Square order scan for location %(location)s. %(reason)s",
+                                      location=location_id, reason=str(error))) from error
+                orders_by_id.update((order["id"], order) for order in orders if order.get("id"))
 
-                        line_vals.append(
-                            (
-                                0,
-                                0,
-                                {
-                                    "square_order_id": order_id,
-                                    "created_at": created_at,
-                                    "state": order_data.get("state", "UNKNOWN"),
-                                    "location_id": order_data.get("location_id", ""),
-                                    "total_amount": (
-                                        float(order_data.get("total_money", {}).get("amount", 0))
-                                        / 100.0
-                                    ),
-                                    "selected": True,
-                                },
-                            )
-                        )
-                except Exception as e:
-                    _logger.warning(f"Error fetching order {order_id}: {str(e)}")
-                    # Still add it to lines but without full details
-                    line_vals.append(
-                        (
-                            0,
-                            0,
-                            {
-                                "square_order_id": order_id,
-                                "selected": True,
-                            },
-                        )
-                    )
+            existing_orders = self.env["sale.order"].search([
+                ("square_order_id", "in", list(orders_by_id)),
+                ("company_id", "=", config.company_id.id),
+            ])
+            existing_order_ids = set(existing_orders.mapped("square_order_id"))
+            line_vals = []
+            for order_id in sorted(orders_by_id.keys() - existing_order_ids):
+                order = orders_by_id[order_id]
+                routing = self.env["square.order.processor"]._square_online_event_result(
+                    order_id=order_id, location_id=order.get("location_id"),
+                    square_config=config, full_order=order,
+                )
+                if routing:
+                    if routing["status"] == "ignored":
+                        continue
+                    raise UserError(routing["message"])
+                try:
+                    created_at = _square_ts_to_odoo_naive(order.get("created_at"))
+                except (ValueError, TypeError, OverflowError):
+                    created_at = None
+                line_vals.append((0, 0, {
+                    "square_order_id": order_id,
+                    "created_at": created_at,
+                    "state": order.get("state", "UNKNOWN"),
+                    "location_id": order.get("location_id", ""),
+                    "total_amount": float(order.get("total_money", {}).get("amount", 0)) / 100.0,
+                    "selected": True,
+                }))
 
-            # Clear existing lines and add new ones
             self.line_ids.unlink()
             self.line_ids = line_vals
-
-            # Update counters and move to results state
-            self.square_total = len(square_order_ids)
             self.odoo_total = len(existing_order_ids)
+            self.square_total = self.odoo_total + len(line_vals)
             self.state = "results"
-
-            _logger.info(
-                f"Scan complete: {len(square_order_ids)} in Square, "
-                f"{len(existing_order_ids)} in Odoo, {len(missing_order_ids)} missing"
-            )
 
             return self._reopen_wizard_action()
 

@@ -2,8 +2,8 @@
 import hashlib
 import json
 
-from odoo import _, models
-from odoo.exceptions import ValidationError
+from odoo import _, api, Command, models
+from odoo.exceptions import AccessError, ValidationError
 from odoo.tools import SQL, consteq
 
 from odoo.addons.payment import utils as payment_utils
@@ -13,6 +13,41 @@ from ..square_api import square_amount_in_minor_units
 
 class SaleOrder(models.Model):
     _inherit = "sale.order"
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        if not self.env.su:
+            for vals in vals_list:
+                self._square_online_check_link_edits(
+                    vals.get("transaction_ids", self.env.context.get("default_transaction_ids")) or [],
+                )
+        return super().create(vals_list)
+
+    def write(self, vals):
+        if not self.env.su and "transaction_ids" in vals:
+            self.check_access("write")
+            self._square_online_check_link_edits(vals["transaction_ids"])
+        return super().write(vals)
+
+    def _square_online_check_link_edits(self, value):
+        commands = self._fields["transaction_ids"].convert_to_write(value, self)
+        if commands and isinstance(commands[0], int):
+            commands = [Command.set(commands)]
+        changed = set()
+        for command in commands:
+            if command[0] in (Command.LINK, Command.UNLINK, Command.DELETE):
+                changed.add(command[1])
+            elif command[0] in (Command.SET, Command.CLEAR):
+                wanted = set(command[2]) if command[0] == Command.SET else set()
+                if self:
+                    for order in self.sudo():
+                        changed.update(wanted.symmetric_difference(order.transaction_ids.ids))
+                else:
+                    changed.update(wanted)
+        if changed and self.env["payment.transaction"].sudo().search_count([
+            ("id", "in", list(changed)), ("provider_code", "=", "square_online"),
+        ], limit=1):
+            raise AccessError(_("Square payment transactions must stay linked to their original order."))
 
     def _square_online_billing_contact(self):
         self.ensure_one()
@@ -109,4 +144,11 @@ class SaleOrder(models.Model):
                 lambda other: other.provider_code == "square_online"
                 and other.state in ("pending", "done")
             )
-        return bool(competing)
+        # Earlier data or an integration may have lost the native many-to-many link.
+        # A dispatched Square charge still belongs to its original order.
+        return bool(competing or self.env["payment.transaction"].sudo().search_count([
+            ("square_online_order_id", "=", self.id),
+            ("operation", "=", "online_direct"),
+            ("square_online_dispatch_at", "!=", False),
+            ("state", "in", ("pending", "authorized", "done")),
+        ], limit=1))
