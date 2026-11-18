@@ -537,10 +537,7 @@ class SquareApiClient(models.Model):
                 if not cursor:
                     break
             else:
-                _logger.warning(
-                    "Square SearchOrders: stopped after %s pages (max_pages)",
-                    max_pages,
-                )
+                raise UserError("The Square order search exceeded the page limit. Select a shorter date range.")
 
             _logger.info("Square SearchOrders: %s order(s) total", len(all_orders))
             return all_orders

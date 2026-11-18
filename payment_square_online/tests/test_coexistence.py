@@ -347,7 +347,10 @@ class TestSquareCoexistence(SquareCheckoutCase):
                                  else 'odoo-web-lookalike-pos-reference'),
                 'line_items': [line(original, 2)], 'total_money': money(2400),
                 'fulfillments': [{'pickup_details': {'recipient': {'email_address': buyer.email}}}],
-                'tenders': [{'id': f'{order_id}-PAYMENT', 'amount_money': money(2400)}],
+                'tenders': [{
+                    'id': f'{order_id}-PAYMENT', 'type': 'CARD',
+                    'card_details': {'status': 'CAPTURED'}, 'amount_money': money(2400),
+                }],
             }
             resources[f'/v2/orders/{order_id}'] = {'order': order}
             resources[f'/v2/payments/{order_id}-PAYMENT'] = {

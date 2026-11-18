@@ -572,8 +572,10 @@ class SquareOrderProcessor(models.Model):
         square_location_id = square_order_data.get("location_id")
         self._create_stock_movements(sale_order, square_location_id)
 
-        if not sale_order.invoice_ids.filtered(lambda inv: inv.state == "posted"):
-            self._create_and_validate_invoice(sale_order)
+        if sale_order.invoice_ids.filtered(lambda inv: inv.state == "posted"):
+            self._settle_existing_order_invoice(sale_order, square_order_data)
+        else:
+            self._create_and_validate_invoice(sale_order, square_order_data)
 
         # Log to integration dashboard
         self.env["square.integration.log"]._log_square_event(
@@ -816,6 +818,157 @@ class SquareOrderProcessor(models.Model):
                 square_order_id=sale_order.square_order_id,
                 sale_order_id=sale_order.id,
             )
+
+    def _process_payment(self, payment_data, event_type, webhook_event_id=None):
+        """
+        Process payment.updated webhook to detect and handle exchanges
+        """
+        try:
+            payment_id = payment_data.get("id")
+            order_id = payment_data.get("order_id")
+            payment_status = payment_data.get("status")
+
+            _logger.info(
+                f"Processing payment.updated webhook: payment_id={payment_id}, order_id={order_id}, status={payment_status}"
+            )
+
+            if not order_id:
+                return {"status": "ignored", "message": "Payment has no Square order."}
+
+            # Only process COMPLETED payments
+            if payment_status != "COMPLETED":
+                _logger.info(
+                    f"Payment {payment_id} status is {payment_status}, not COMPLETED - skipping"
+                )
+                return {
+                    "status": "ignored",
+                    "message": f"Payment status {payment_status} not processed",
+                }
+
+            # Fetch full order details from Square API to check for exchanges
+            api_client = self.env["square.api.client"].sudo()
+            routing, order_data = api_client._read_pos_order(order_id)
+            if routing:
+                return routing
+
+            if not order_data:
+                _logger.error(
+                    f"Failed to fetch order {order_id} from Square API for payment {payment_id}"
+                )
+                return {
+                    "status": "retry",
+                    "message": f"Failed to fetch order {order_id} from Square API",
+                }
+
+            # Check if this is an exchange (has returns in line items)
+            has_returns = self._detect_exchange(order_data)
+
+            if has_returns:
+                _logger.info(
+                    f"Exchange detected for order {order_id}, processing exchange flow"
+                )
+
+                # Get the source_order_id from returns - this is the original order to update
+                returns = order_data.get("returns", [])
+                if not returns:
+                    _logger.error(
+                        f"Exchange detected but no returns array found in order {order_id}"
+                    )
+                    return {
+                        "status": "error",
+                        "message": f"Exchange detected but no returns array in order {order_id}",
+                    }
+
+                source_order_id = returns[0].get("source_order_id")
+                if not source_order_id:
+                    _logger.error(
+                        f"No source_order_id found in returns for order {order_id}"
+                    )
+                    return {
+                        "status": "error",
+                        "message": f"No source_order_id in returns for order {order_id}",
+                    }
+
+                _logger.info(
+                    f"Exchange: source_order_id={source_order_id}, current_order_id={order_id}"
+                )
+
+                # Process the exchange
+                bot_user = self._get_square_bot_user()
+                square_processor = self.with_user(bot_user)
+
+                # Find existing sale order using source_order_id (the original order)
+                # Important: Load with bot_user context so it has a user throughout processing
+                sale_order = (
+                    self.env["sale.order"]
+                    .with_user(bot_user)
+                    .search([("square_order_id", "=", source_order_id), ("company_id", "=", self.env.company.id)], limit=1)
+                )
+
+                if not sale_order:
+                    _logger.error(
+                        f"Sale order not found for Square source order {source_order_id} during exchange processing"
+                    )
+                    return {
+                        "status": "retry",
+                        "message": f"Sale order not found for source order {source_order_id}",
+                    }
+
+                # Process the exchange
+                config = api_client._website_routing_config()
+                result = self.env["square.webhook.event"]._apply_once(
+                    config, "exchange:" + order_id,
+                    lambda: square_processor._process_product_exchange(sale_order, order_data, payment_data),
+                    duplicate_status="skipped",
+                )
+
+                return result
+            else:
+                processor = self.with_user(self._get_square_bot_user())
+                sale_order = processor._check_existing_order(order_id)
+                if sale_order:
+                    with self.env.cr.savepoint():
+                        processor._settle_existing_order_invoice(sale_order, payment_data, square_order=order_data)
+                return {
+                    "status": "success",
+                    "message": "Payment processed, no exchange detected",
+                    "payment_id": payment_id,
+                }
+
+        except SquareOrderProcessingDeferred as error:
+            return {"status": "retry", "message": str(error)}
+        except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
+            raise
+        except Exception as e:
+            _logger.error(
+                f"Error processing payment.updated event: {str(e)}", exc_info=True
+            )
+            return {"status": "error", "message": str(e)}
+
+    def _detect_exchange(self, order_data):
+        """
+        Detect if an order contains returns (indicating an exchange)
+
+        Args:
+            order_data: Full order data from Square API
+
+        Returns:
+            bool: True if order contains returns, False otherwise
+        """
+        line_items = order_data.get("line_items", [])
+
+        # Check if any line item has a returns field
+        for line_item in line_items:
+            if "return_line_items" in order_data or line_item.get("quantity_unit", {}).get(
+                "measurement_unit", {}
+            ).get("type") == "TYPE_RETURN":
+                return True
+
+        # Also check for explicit returns field at order level
+        if order_data.get("returns") or order_data.get("return_line_items"):
+            return True
+
+        return False
 
     def _process_product_exchange(self, sale_order, order_data, payment_data):
         """Complete the return, replacement, and accounting for a Square exchange."""
@@ -1401,7 +1554,73 @@ class SquareOrderProcessor(models.Model):
         elif not credit_note.currency_id.is_zero(credit_note.amount_residual):
             self._create_payment_for_credit_note(credit_note, original_sale_order, bot_user)
 
-    def _create_and_validate_invoice(self, sale_order):
+    def _settle_existing_order_invoice(self, sale_order, notification, *, square_order=None):
+        invoices = sale_order.invoice_ids.filtered(
+            lambda invoice: invoice.state == "posted" and invoice.move_type == "out_invoice"
+        )
+        if len(invoices) != 1:
+            return False
+        invoice = invoices
+        if (
+            invoice.amount_total <= 0
+            or invoice.reconciled_payment_ids
+            or invoice.currency_id.compare_amounts(invoice.amount_residual, invoice.amount_total)
+        ):
+            return False
+        if self._has_verified_order_payment(invoice, sale_order, notification, square_order=square_order):
+            if not self._create_payment_for_invoice(invoice, sale_order, self._get_square_bot_user()):
+                raise SquareOrderProcessingDeferred("Could not register the Square payment.")
+            return True
+        return False
+
+    def _has_verified_order_payment(self, invoice, sale_order, notification, *, square_order=None):
+        client = self.env["square.api.client"]
+        order = square_order if square_order is not None else client.sudo()._get_order(sale_order.square_order_id)
+        if not order:
+            raise SquareOrderProcessingDeferred("Could not verify the Square order payment.")
+        if (order.get("id") or order.get("order_id")) != sale_order.square_order_id:
+            return False
+        if order.get("state") != "COMPLETED":
+            return False
+        if notification.get("location_id") and order.get("location_id") != notification["location_id"]:
+            return False
+
+        currency = invoice.currency_id
+        paid_minor = 0
+        payment_ids = set()
+        for tender in order.get("tenders") or []:
+            payment_id = tender.get("payment_id") or tender.get("id")
+            if not payment_id or payment_id in payment_ids:
+                continue
+            payment_ids.add(payment_id)
+            money = tender.get("amount_money") or {}
+            tip = (tender.get("tip_money") or {}).get("amount", 0)
+            tender_type = tender.get("type")
+            card_status = (tender.get("card_details") or {}).get("status")
+            if not (tender_type in ("CASH", "OTHER") or (tender_type == "CARD" and card_status == "CAPTURED")):
+                payment = client.sudo()._get_payment(payment_id)
+                if not payment:
+                    raise SquareOrderProcessingDeferred("Could not verify the Square tender payment.")
+                if (
+                    payment.get("id") != payment_id
+                    or payment.get("order_id") != sale_order.square_order_id
+                    or payment.get("location_id") != order.get("location_id")
+                    or payment.get("status") != "COMPLETED"
+                ):
+                    continue
+                money = payment.get("amount_money") or {}
+                tip = 0
+            amount = money.get("amount")
+            if (
+                money.get("currency") == currency.name
+                and type(amount) is int and type(tip) is int and 0 <= tip < amount
+            ):
+                paid_minor += amount - tip
+        return paid_minor > 0 and currency.compare_amounts(
+            paid_minor / 10 ** currency.decimal_places, invoice.amount_total,
+        ) == 0
+
+    def _create_and_validate_invoice(self, sale_order, notification):
         """Create and validate invoice for the sale order"""
         try:
             # Check if sale order has lines before creating invoice
@@ -1439,13 +1658,11 @@ class SquareOrderProcessor(models.Model):
                     f"Current currency: {invoice.currency_id.name}"
                 )
 
-            # Create payment for the invoice (Square orders are already paid)
-            payment_created = self._create_payment_for_invoice(
-                invoice, sale_order, bot_user
-            )
-
-            if invoice.amount_total > 0 and not payment_created:
-                raise SquareOrderProcessingDeferred("Could not register the Square payment.")
+            payment_created = False
+            if invoice.amount_total > 0 and self._has_verified_order_payment(invoice, sale_order, notification):
+                payment_created = self._create_payment_for_invoice(invoice, sale_order, bot_user)
+                if not payment_created:
+                    raise SquareOrderProcessingDeferred("Could not register the Square payment.")
 
             # Determine payment status for messaging
             payment_status = (

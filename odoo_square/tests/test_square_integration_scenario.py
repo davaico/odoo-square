@@ -181,8 +181,9 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                 "tenders": [
                     {
                         "id": "payment_001",
+                        "type": "CARD",
                         "amount_money": {"amount": total, "currency": "EUR"},
-                        "card_details": {"card": {"cardholder_name": "JOHN DOE"}},
+                        "card_details": {"status": "CAPTURED", "card": {"cardholder_name": "JOHN DOE"}},
                     }
                 ],
             }
@@ -361,6 +362,40 @@ class TestSquareIntegrationScenario(SquareHttpCase):
                 ("sale_order_id", "=", order.id),
                 ("square_refund_id", "=", refund.square_refund_id),
             ]), 1)
+
+    @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
+    def test_completed_order_only_records_matching_captured_funds(self):
+        order = self._mock_get_order("ORDER_L1_001")
+        tender = order["tenders"][0]
+        expected = tender["amount_money"].copy()
+        tender["amount_money"] = {**expected, "amount": expected["amount"] - 1}
+        notice = {"id": order["id"], "location_id": order["location_id"], "state": "COMPLETED"}
+        payment = {"id": tender["id"], "order_id": order["id"], "location_id": order["location_id"],
+                   "status": "COMPLETED"}
+
+        def deliver(event_type, event_id, resource, data):
+            response = self.post_square_webhook(data=json.dumps({
+                "type": event_type, "event_id": event_id, "data": {"object": {resource: data}},
+            }))
+            self.assertEqual(response.status_code, 200, response.text)
+            return response.json()
+
+        with patch.object(SquareApiClient, "_get_order", return_value=order):
+            result = deliver("order.created", "evt-short-capture", "order_created", notice)
+            invoice = self.env["sale.order"].browse(result["sale_order_id"]).invoice_ids
+            self.assertEqual(invoice.state, "posted")
+            self.assertGreater(invoice.amount_total, 0)
+            self.assertEqual(invoice.amount_residual, invoice.amount_total)
+            self.assertFalse(invoice.reconciled_payment_ids)
+
+            tender["amount_money"] = {**expected, "currency": "USD"}
+            deliver("payment.updated", "evt-foreign-capture", "payment", payment)
+            self.assertFalse(invoice.reconciled_payment_ids)
+
+            tender["amount_money"] = expected
+            for event_id in ("evt-matching-capture", "evt-matching-capture", "evt-capture-replay"):
+                deliver("payment.updated", event_id, "payment", payment)
+                self.assert_reconciled_payment(invoice, "inbound", invoice.amount_total)
 
     @mute_logger("odoo.addons.odoo_square.controllers.square_webhook")
     def test_late_inline_open_update_leaves_paid_sale_intact(self):

@@ -99,6 +99,8 @@ class TestPaidSquareSale(SquareHttpCase):
             "tenders": [
                 {
                     "id": "checkout-payment",
+                    "type": "CARD",
+                    "card_details": {"status": "CAPTURED"},
                     "amount_money": {"amount": 3000, "currency": "EUR"},
                 }
             ],

@@ -121,6 +121,8 @@ class TestSquareWebhook(SquareHttpCase):
         }
 
         # Make webhook request using Odoo's HTTP testing
+        order = webhook_data["data"]["object"]["order_created"]
+        self.enterContext(patch.object(SquareApiClient, "_get_order", return_value=order))
         response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -180,6 +182,8 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
+        order = webhook_data["data"]["object"]["order_updated"]
+        self.enterContext(patch.object(SquareApiClient, "_get_order", return_value=order))
         response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -311,6 +315,8 @@ class TestSquareWebhook(SquareHttpCase):
             },
         }
 
+        order = webhook_data["data"]["object"]["order_created"]
+        self.enterContext(patch.object(SquareApiClient, "_get_order", return_value=order))
         response = self.post_square_webhook(
             data=json.dumps(webhook_data),
             headers={"Content-Type": "application/json"},
@@ -666,6 +672,7 @@ class TestSquareWebhook(SquareHttpCase):
             ],
         }
 
+        self.enterContext(patch.object(SquareApiClient, "_get_order", return_value=square_data))
         processor = self.env["square.order.processor"]
         result = processor._import_square_order(square_data)
 

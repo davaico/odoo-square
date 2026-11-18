@@ -91,9 +91,9 @@ class SquareStockCount(models.Model):
             self.unlink()
             return
         if self.counted_at < fields.Datetime.now() - timedelta(hours=24):
-            service._record_count_result(product, self.square_location_id, False)
-            self.next_attempt = False
-            return
+            # A stale request may already have reached Square. Take a new warehouse
+            # measurement with its own timestamp and key before resolving the SKU.
+            self._queue_count(product, mapping, service._get_warehouse_stock(product, self.warehouse_id))
         if config.id not in locations_by_config:
             locations_by_config[config.id] = set(service._merchant_location_ids(active_config))
         if self.square_location_id not in locations_by_config[config.id]:
