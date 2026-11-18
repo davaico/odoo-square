@@ -142,10 +142,10 @@ Pending Square refunds reduce the available balance shown in Odoo. Completed Squ
 
 CI runs separate POS-only, standalone online, combined, and concurrent-refund jobs. It requires nonzero passing test results, rejects skipped addon tests, and checks that the browser and combined coexistence cases ran. Logs are attached to each job.
 
-Run the following commands from the repository root in Bash. The browser test image uses Linux amd64 and adds pinned Chrome and its Python WebSocket dependency to the Odoo 19 Community image. If the pinned package is no longer available, select a compatible Odoo 19 test image with a working Chrome or Chromium binary and `python3-websocket` by setting `ODOO_TEST_IMAGE` to its local tag.
+Run the following commands from the repository root in Bash. The browser test image uses Linux amd64 and installs Google Chrome Stable from Google's signed package repository and `python3-websocket` from Ubuntu. To use another compatible Odoo 19 test image with Chrome or Chromium and `python3-websocket`, set `ODOO_TEST_IMAGE` to its local tag.
 
 ```bash
-docker build -f config/Dockerfile.test -t odoo-square-v19-browser-test config
+docker build --pull -f config/Dockerfile.test -t odoo-square-v19-browser-test config
 export ODOO_TEST_IMAGE=odoo-square-v19-browser-test
 
 run_square_tests() (
