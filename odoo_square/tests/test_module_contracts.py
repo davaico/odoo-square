@@ -4,6 +4,8 @@
 import json
 from unittest.mock import patch
 
+from lxml import etree
+
 from odoo import Command, release
 from odoo.exceptions import AccessError, ValidationError
 from odoo.modules.module import get_manifest
@@ -158,6 +160,26 @@ class TestSquareModuleContracts(TransactionCase):
             get.return_value.json.return_value = {"locations": []}
             self.env["square.api.client"].with_user(bot)._get_locations()
             self.assertEqual(get.call_args.kwargs["headers"]["Authorization"], "Bearer square-token")
+
+    def test_square_configuration_form_shows_operator_buttons_only_to_admins(self):
+        admin = self.env.ref("base.user_admin")
+        salesperson = new_test_user(
+            self.env, login="square-config-salesperson", groups="sales_team.group_sale_salesman",
+        )
+        view = self.env.ref("odoo_square.view_square_config_form")
+        model = self.env["square.config"]
+        for user, expected_visible in ((admin, True), (salesperson, False)):
+            arch = etree.fromstring(model.with_user(user).get_view(view.id, "form")["arch"])
+            for action in ("test_square_connection", "sync_square_locations"):
+                with self.subTest(user=user.login, action=action):
+                    self.assertEqual(bool(arch.xpath("//header/button[@name=$action]", action=action)), expected_visible)
+
+    def test_square_webhook_events_are_private(self):
+        admin = self.env.ref("base.user_admin")
+        model = self.env["square.webhook.event"].with_user(admin)
+        for operation in ("read", "write", "create", "unlink"):
+            with self.subTest(operation=operation), self.assertRaises(AccessError):
+                model.check_access(operation)
 
     def test_service_records_respect_operator_and_company(self):
         config = self.env["square.config"].create({

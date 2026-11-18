@@ -44,6 +44,13 @@ class TestSquareConnection(HttpCase):
                 form.state = 'test'
         self.assertFalse(Form(self.env['payment.provider']).square_connection_status)
 
+    def test_square_online_webhook_events_are_private(self):
+        admin = self.env.ref('base.user_admin')
+        model = self.env['payment.square.webhook.event'].with_user(admin)
+        for operation in ('read', 'write', 'create', 'unlink'):
+            with self.subTest(operation=operation), self.assertRaises(AccessError):
+                model.check_access(operation)
+
     def test_authorizes_sandbox_and_selects_owned_location_and_journal(self):
         provider = self.env.ref('payment_square_online.payment_provider_square_online')
         with patch.dict(os.environ, {'ODOO_SQUARE_ONLINE_ENCRYPTION_KEY': Fernet.generate_key().decode()}):

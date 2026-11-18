@@ -436,6 +436,5 @@ class SquareConfig(models.Model):
             "res_model": "square.manual.resync.wizard",
             "res_id": wizard.id,
             "view_mode": "form",
-            "view_type": "form",
             "target": "new",
         }

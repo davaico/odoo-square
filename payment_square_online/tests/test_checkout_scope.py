@@ -369,12 +369,14 @@ class TestSquareCheckoutScope(HttpCase):
         replacement_location = location.copy({'square_id': 'US-REPLACEMENT'})
 
         with patch('odoo.addons.payment_square_online.square_api.request') as square:
-            for change in ({'is_published': False}, {
-                'is_published': True, 'square_location_id': incompatible_location.id,
-            }):
+            for change, prepare_error in (
+                # Newer Odoo 18 releases reject unpublished providers before Square's validation.
+                ({'is_published': False}, r'Square is unavailable|This payment provider is not available'),
+                ({'is_published': True, 'square_location_id': incompatible_location.id}, r'Square is unavailable'),
+            ):
                 provider.write(change)
                 self.assertFalse(self._square_forms())
-                self.assertIn('Square is unavailable', self._rpc(route, **params)['error']['data']['message'])
+                self.assertRegex(self._rpc(route, **params)['error']['data']['message'], prepare_error)
                 self.assertIn('Square is unavailable', self._rpc(
                     '/payment/square/online/submit', **prepared['square_submission'], source_id='cnon:stale-config',
                 )['error']['data']['message'])
@@ -385,6 +387,7 @@ class TestSquareCheckoutScope(HttpCase):
             )['error']['data']['message'])
             square.assert_not_called()
         self.assertEqual(order.state, 'draft')
+        self.assertEqual(len(order.transaction_ids), 1)
         self.assertEqual(order.transaction_ids.square_location_ref, 'US-FIRST')
         self.assertFalse(order.transaction_ids.payment_id)
 

@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   odoo-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -39,10 +39,10 @@ jobs:
       DB_NAME: odoo_square_v18_test
       ODOO_TEST_DOCKERFILE: config/Dockerfile.test
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - name: Build Odoo 18 with Chrome
-        run: docker compose -f docker-compose.test.yml build odoo
+      - name: Build PostgreSQL and Odoo 18 with Chrome
+        run: docker compose -f docker-compose.test.yml build --pull
       - name: Install and exercise the selected workflow
         shell: bash
         run: |
@@ -89,7 +89,7 @@ jobs:
 
       - name: Upload test evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: odoo18-${{ matrix.suite }}-${{ github.run_attempt }}
           path: test-results/

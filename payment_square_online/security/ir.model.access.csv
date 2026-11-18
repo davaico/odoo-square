@@ -1,3 +1,4 @@
 id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
 access_square_connection_private,Square connection credentials are private,model_payment_square_connection,base.group_system,0,0,0,0
 access_square_location_admin,Square location administration,model_payment_square_location,base.group_system,1,0,0,0
+access_square_webhook_event_private,Square webhook events are private,model_payment_square_webhook_event,base.group_system,0,0,0,0
