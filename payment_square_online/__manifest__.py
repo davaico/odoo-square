@@ -13,6 +13,8 @@
     "category": "Accounting/Payment Providers",
     "author": "Davai",
     "website": "https://github.com/davaico/odoo-square",
+    "support": "support@davai.co",
+    "images": ["static/description/online-card-payment.jpg"],
     "depends": ["website_sale"],
     "external_dependencies": {"python": ["cryptography", "requests"]},
     "data": [
