@@ -57,7 +57,7 @@ Genuine Square POS sales, refunds, and exchanges continue through POS import. We
 
 For Odoo 18 regression testing with the test Compose configuration, use `ODOO_INIT_MODULES=payment_square_online,sale_stock,odoo_square` and `ODOO_TEST_TAGS=standard/payment_square_online,standard/odoo_square,square_coexistence`. To test the provider alone, use `ODOO_INIT_MODULES=payment_square_online,sale_stock` and `ODOO_TEST_TAGS=standard/payment_square_online`.
 
-CI runs separate POS-only, standalone online, combined, and concurrent-refund jobs. For local online tests, set `ODOO_TEST_DOCKERFILE=config/Dockerfile.test` before the build in the [root test commands](../README.md#testing). This test image includes pinned Chrome and its Python WebSocket dependency so the embedded card browser test runs. Check for a nonzero passing test summary and no skipped addon tests. `ODOO_TEST_IMAGE` can select an already-built compatible image.
+CI runs separate POS-only, standalone online, combined, and concurrent-refund jobs. For local online tests, set `ODOO_TEST_DOCKERFILE=config/Dockerfile.test` before the build in the [root test commands](../README.md#testing). The test image uses Chrome Stable from Google's signed package repository and the Python WebSocket dependency to run the embedded card browser test. Check for a nonzero passing test summary and no skipped addon tests. `ODOO_TEST_IMAGE` can select an already-built compatible image.
 
 The refund concurrency fixture uses independent database connections and commits test records. Run it in its own disposable project from Bash:
 
@@ -68,7 +68,7 @@ The refund concurrency fixture uses independent database connections and commits
   export ODOO_TEST_DOCKERFILE=config/Dockerfile.test
   compose=(docker compose -p "odoo-square-v18-test-race-$(date +%s)-$$" -f docker-compose.test.yml)
   trap '"${compose[@]}" down --volumes' EXIT
-  "${compose[@]}" build odoo
+  "${compose[@]}" build --pull
   "${compose[@]}" run --rm -T odoo odoo --database="$DB_NAME" \
     --init=payment_square_online,sale_stock --stop-after-init --no-http
   printf '%s\n' \

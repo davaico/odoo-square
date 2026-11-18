@@ -23,7 +23,7 @@ For Odoo website checkout, install **Square Online Payments**. You can use eithe
 
 ## Requirements
 
-- Odoo 18.0 Community and PostgreSQL. The included Compose setup uses Odoo 18.0-20261015 and PostgreSQL 17.4.
+- Odoo 18.0 Community and PostgreSQL. The included Compose setup tracks Odoo 18.0 and PostgreSQL 17 on Debian Bookworm.
 - Python package: `requests`, included in the official Odoo container
 - Square Developer account with an application, access token, location IDs, and webhook signature key
 - Docker and Docker Compose for the included local development environment
@@ -63,7 +63,7 @@ Edit `.env` and set a non-default `DB_PASSWORD`.
 Install **Square POS Integration** into the fresh local database, then start Odoo:
 
 ```bash
-docker compose -p odoo-square-v18 build odoo
+docker compose -p odoo-square-v18 build --pull
 docker compose -p odoo-square-v18 run --rm odoo odoo -d odoo_square_v18 -i odoo_square --stop-after-init
 docker compose -p odoo-square-v18 up -d
 ```
@@ -110,6 +110,13 @@ Start the local stack:
 docker compose -p odoo-square-v18 up -d
 ```
 
+To refresh the images and apply current operating system package updates, rebuild and recreate the services with their existing volumes.
+
+```bash
+docker compose -p odoo-square-v18 build --pull --no-cache
+docker compose -p odoo-square-v18 up -d
+```
+
 Follow Odoo logs:
 
 ```bash
@@ -130,6 +137,8 @@ docker compose -p odoo-square-v18 run --rm odoo odoo -d odoo_square_v18 -u odoo_
 docker compose -p odoo-square-v18 up -d
 ```
 
+For existing PostgreSQL 17 databases, review the [17.12 upgrade notes](https://www.postgresql.org/docs/17/release-17-12.html#RELEASE-17-12-MIGRATION) for index and backup steps that apply to your database.
+
 ## Testing
 
 Run the CI test service with its own Compose project, database, and volumes:
@@ -137,7 +146,7 @@ Run the CI test service with its own Compose project, database, and volumes:
 ```bash
 test_project=odoo-square-v18-test-$$
 export DB_PASSWORD=ci_odoo_test DB_NAME=odoo_square_v18_test
-docker compose -p "$test_project" -f docker-compose.test.yml build odoo
+docker compose -p "$test_project" -f docker-compose.test.yml build --pull
 docker compose -p "$test_project" -f docker-compose.test.yml run --rm odoo
 docker compose -p "$test_project" -f docker-compose.test.yml down -v
 ```
