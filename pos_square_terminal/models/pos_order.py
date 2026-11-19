@@ -267,12 +267,12 @@ class PosOrder(models.Model):
 
     @api.model
     def square_retry_payment(self, order_uuid, payment_uuid, attempt_reference):
-        order, payment = self._square_checkout_records(order_uuid, payment_uuid)
-        order._square_lock_checkout(touch=True)
         previous = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
         if previous.reference != attempt_reference or previous._cashier_state() != 'failed':
             return previous._cashier_status()
 
+        order = previous.order_id.with_env(self.env)
+        payment = previous.payment_id.with_env(self.env)
         order._square_check_session()
         attempts = order._square_current_attempts()
         order._square_check_reserved_amounts(attempts)
