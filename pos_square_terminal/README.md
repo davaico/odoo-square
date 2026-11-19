@@ -30,6 +30,8 @@ To replace a device, close the register session, create a new terminal record an
 
 If the register uses Odoo Global Discounts, Square receives the receipt summary with the verified discounts and taxes. With **Restrict Price Modifications to Managers** enabled, use an Odoo Point of Sale manager login to send a manually priced basket. A manager selected through the employee switcher also needs an authenticated manager login for Square Terminal checkout.
 
+Predefined product options with a verifiable price can use a receipt summary. Square Terminal checkout blocks lot- or serial-tracked items, custom-text options, priced dynamic variants in combo components, options on the combo itself, and combos whose groups include anything other than one choice per group.
+
 For a split, enter exact shares using Odoo cash and one or more Square cards. For example, record €20 cash on a €60 sale, then select **Square Counter**, check the €40 balance and choose **Send**. A card share can show **Authorized by Square** while the original sale awaits the remaining shares. If the last share is cash, enter it and select **Validate**. Odoo settles all covered shares on the same Square order. For a cash-only sale, choose the Odoo cash method from the start. If Odoo flags an unsupported tender combination, correct it before dispatch.
 
 ### Tips
