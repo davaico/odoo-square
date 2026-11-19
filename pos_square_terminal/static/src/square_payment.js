@@ -78,7 +78,7 @@ class SquarePayment extends PaymentInterface {
         if (status.state === "authorized") {
             status = await this.call(line, "square_prepare_settlement", status.reference);
         }
-        if (status.state === "settling") {
+        if (["settling", "settlement_blocked"].includes(status.state)) {
             status = await this.call(line, "square_settle_payment", status.reference);
         }
         return status.state === "verified";
@@ -374,7 +374,9 @@ patch(PaymentScreenPaymentLines.prototype, {
         if (line.square_attempt_state === "canceling") {
             return _t("Continue cancellation");
         }
-        return line.pos_order_id.squareAuthorizedAmount ? _t("Abandon split") : _t("Cancel payment");
+        return line.square_attempt_state === "settlement_blocked" || line.pos_order_id.squareAuthorizedAmount
+            ? _t("Abandon split")
+            : _t("Cancel payment");
     },
     squareActionLabel(line) {
         if (line.square_attempt_state === "failed") {
@@ -394,6 +396,9 @@ patch(PaymentScreenPaymentLines.prototype, {
         }
         if (line.square_attempt_state === "settling") {
             return _t("Check the original Square settlement before taking another payment.");
+        }
+        if (line.square_attempt_state === "settlement_blocked") {
+            return _t("Square released a card authorization. Abandon the split to take another payment.");
         }
         if (line.square_attempt_state === "unsupported_split") {
             return _t("This Square Terminal cannot authorize a split. Cancel the payment to choose another tender.");

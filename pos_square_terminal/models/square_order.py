@@ -47,6 +47,7 @@ class SquareOrder(models.Model):
     square_order_id = fields.Char(index='btree_not_null', copy=False)
     split = fields.Boolean(copy=False)
     settlement_request = fields.Json(copy=False)
+    settlement_blocked = fields.Boolean(copy=False)
     cancel_requested = fields.Boolean(copy=False)
     cancelled = fields.Boolean(copy=False)
     active_order_key = fields.Char(compute='_compute_active_order_key', store=True)
@@ -204,7 +205,8 @@ class SquareOrder(models.Model):
             self.order_id._square_check_reserved_amounts(attempts)
             order, payments = self._read_settlement(path, attempts)
             if (
-                not read_only and order['state'] == 'OPEN' and order.get('version') == request['order_version']
+                not read_only and not self.cancel_requested
+                and order['state'] == 'OPEN' and order.get('version') == request['order_version']
                 and self._matches_settlement_tenders(order, attempts, complete=False)
                 and all(payment['status'] == 'APPROVED' for payment in payments)
             ):
@@ -216,14 +218,22 @@ class SquareOrder(models.Model):
                 order, payments = self._read_settlement(path, attempts)
         except (SquareAPIError, UserError, ValueError):
             return
+        statuses = {payment['status'] for payment in payments}
         if (
-            order['state'] == 'COMPLETED'
+            order['state'] == 'COMPLETED' and statuses == {'COMPLETED'}
             and self._matches_settlement_tenders(order, attempts, complete=True)
-            and all(payment['status'] == 'COMPLETED' for payment in payments)
         ):
-            for attempt, payment in zip(attempts, payments):
-                if attempt.state != 'verified':
-                    attempt._mark_verified(payment)
+            with self.env.cr.savepoint():
+                for attempt, payment in zip(attempts, payments):
+                    if attempt.state != 'verified':
+                        attempt._mark_verified(payment)
+        released = {'CANCELED', 'FAILED'}
+        self.settlement_blocked = (
+            order['state'] in ('OPEN', 'CANCELED')
+            and bool(statuses & released) and statuses <= released | {'APPROVED'}
+            and self._matches_settlement_tenders(order, attempts, complete=False)
+        )
+        return self.settlement_blocked
 
     def _read_settlement(self, path, attempts):
         for attempt in attempts:
@@ -236,7 +246,7 @@ class SquareOrder(models.Model):
         order = self.connection_id._request('GET', path).get('order')
         if (
             not isinstance(order, dict) or order.get('id') != self.square_order_id
-            or order.get('state') not in ('OPEN', 'COMPLETED')
+            or order.get('state') not in ('OPEN', 'COMPLETED', 'CANCELED')
             or not self._matches_order_totals(order, state=order['state'])
         ):
             raise ValueError('Square order does not match the original split sale')

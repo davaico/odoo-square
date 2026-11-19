@@ -288,21 +288,27 @@ class PosOrder(models.Model):
     def square_settle_payment(self, order_uuid, payment_uuid, attempt_reference):
         attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=False)
         link = attempt.square_order_link_id
-        if attempt.reference == attempt_reference and attempt._cashier_state() == 'settling':
+        state = attempt._cashier_state()
+        if attempt.reference == attempt_reference and state in ('settling', 'settlement_blocked'):
             order = attempt.order_id.with_user(self.env.user)
             order._square_check_session()
             attempts = order._square_current_attempts()
             order._square_check_reserved_amounts(attempts)
-            link._settle(attempts)
+            link._settle(attempts, read_only=state == 'settlement_blocked')
         return attempt._cashier_status()
 
     @api.model
     def square_cancel_payment(self, order_uuid, payment_uuid, attempt_reference):
         attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
-        if attempt.reference == attempt_reference and attempt._cashier_state() not in ('verified', 'cancelled', 'settling'):
-            attempt.order_id.with_user(self.env.user)._square_check_session()
-            attempt.square_order_link_id.cancel_requested = True
-            attempt.order_id._square_finish_cancellation(attempt, request=True)
+        if attempt.reference == attempt_reference and attempt._cashier_state() not in ('verified', 'cancelled'):
+            order = attempt.order_id.with_user(self.env.user)
+            order._square_check_session()
+            link = attempt.square_order_link_id
+            if link.settlement_request and not link.cancel_requested:
+                if not link._settle(order._square_current_attempts(), read_only=True):
+                    return attempt._cashier_status()
+            link.cancel_requested = True
+            order._square_finish_cancellation(attempt, request=True)
         return attempt._cashier_status()
 
     def _square_finish_cancellation(self, attempt, *, request=False):

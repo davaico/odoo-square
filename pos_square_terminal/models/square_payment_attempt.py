@@ -351,7 +351,7 @@ class SquarePaymentAttempt(models.Model):
             if self.square_order_link_id.cancel_requested:
                 return 'canceling'
             if self.square_order_link_id.settlement_request:
-                return 'settling'
+                return 'settlement_blocked' if self.square_order_link_id.settlement_blocked else 'settling'
             if self.provider_status == 'PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED':
                 return 'unsupported_split'
         return self.state
