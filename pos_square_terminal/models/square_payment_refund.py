@@ -22,10 +22,9 @@ class SquarePaymentRefund(models.Model):
     amount_minor = fields.Integer(required=True)
     amount = fields.Monetary(compute='_compute_amount', compute_sudo=True)
 
-    _sql_constraints = [
-        ('square_refund_unique', 'unique(environment, merchant_id, square_refund_id)',
-         'This Square refund has already been recorded.'),
-    ]
+    _square_refund_unique = models.Constraint(
+        'UNIQUE(environment, merchant_id, square_refund_id)', 'This Square refund has already been recorded.',
+    )
 
     @api.depends('amount_minor', 'attempt_id.square_order_link_id.currency_digits')
     def _compute_amount(self):

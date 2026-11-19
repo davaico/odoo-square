@@ -31,9 +31,9 @@ class SquareCredential(models.Model):
     oauth_expires_at = fields.Datetime()
     oauth_redirect_uri = fields.Char()
 
-    _sql_constraints = [
-        ('unique_connection', 'unique(connection_id)', 'A connection can have one Square OAuth credential.'),
-    ]
+    _unique_connection = models.Constraint(
+        'UNIQUE(connection_id)', 'A connection can have one Square OAuth credential.',
+    )
 
     @staticmethod
     def _cipher():
