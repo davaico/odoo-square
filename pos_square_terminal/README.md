@@ -30,9 +30,11 @@ This checkout supports a single card tender for ordinary untaxed items at their 
 
 ## Recover and review payments
 
-In the [Square Developer Console](https://developer.squareup.com/apps), add a webhook subscription in the connection's environment. Copy **Webhook Endpoint** from the saved Odoo connection. Register this HTTPS URL for `terminal.checkout.created`, `terminal.checkout.updated`, `payment.created`, and `payment.updated`. Copy the exact registered URL and the subscription's signature key into **Square Notifications** on that Odoo connection. Keep the original subscription and authorization available when you replace or archive a connection. [Square webhook setup](https://developer.squareup.com/docs/webhooks/step2subscribe)
+In the [Square Developer Console](https://developer.squareup.com/apps), add a webhook subscription in the connection's environment. Copy **Webhook Endpoint** from the saved Odoo connection. Register this HTTPS URL for `terminal.checkout.created`, `terminal.checkout.updated`, `payment.created`, `payment.updated`, `refund.created`, and `refund.updated`. Copy the exact registered URL and the subscription's signature key into **Square Notifications** on that Odoo connection. Keep the original subscription and authorization available when you replace or archive a connection. [Square webhook setup](https://developer.squareup.com/docs/webhooks/step2subscribe)
 
-Odoo continues checking unresolved payments after the register browser closes. In **Point of Sale → Orders → Square Terminal Payments**, open an attempt and choose **Check Square Payment** to read its current status from Square. You can also find the attempts under **Square Payments** on the original POS order. Use the last successful check, verified amounts, and Square references when investigating discrepancies. If authorization has expired or been revoked, open and reauthorize the original connection listed on the attempt.
+Odoo continues checking unresolved payments and looking for Square refunds after the register browser closes. In **Point of Sale → Orders → Square Terminal Payments**, open an attempt and choose **Check Square Payment** to read its current status from Square. You can also find the attempts under **Square Payments** on the original POS order. Use the last successful check, verified amounts, and Square references when investigating discrepancies. If authorization has expired or been revoked, open and reauthorize the original connection listed on the attempt.
+
+The original payment shows each confirmed Square refund amount and reference. Review those entries to determine the accounting correction or goods return to handle in Odoo.
 
 ## Finish and close the register
 
