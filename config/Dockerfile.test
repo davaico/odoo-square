@@ -1,7 +1,12 @@
 FROM odoo:18.0
 
 USER root
+# Use the Azure mirror for the signed Ubuntu archive, including the security pocket.
 RUN export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive \
+    && sed -Ei 's@^URIs: http://(archive|security)\.ubuntu\.com/ubuntu/?$@URIs: https://azure.archive.ubuntu.com/ubuntu/@' \
+        /etc/apt/sources.list.d/ubuntu.sources \
+    && printf '%s\n' 'Acquire::Retries "3";' 'Acquire::https::Timeout "30";' \
+        > /etc/apt/apt.conf.d/80-ci-fetch \
     && install -d -m 0755 /etc/apt/keyrings \
     && curl --fail --location --silent --show-error \
         --output /etc/apt/keyrings/google-chrome.asc \
