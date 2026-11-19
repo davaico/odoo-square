@@ -25,7 +25,7 @@ class TestSquareModuleContracts(TransactionCase):
 
         self.assertEqual(manifest["license"], "AGPL-3")
         self.assertEqual(release.series, "18.0")
-        self.assertEqual(manifest["version"], "18.0.1.4.2")
+        self.assertEqual(manifest["version"], "18.0.1.4.3")
         self.assertTrue(manifest["installable"])
         self.assertTrue(manifest["application"])
         self.assertIn("sale_stock", manifest["depends"])

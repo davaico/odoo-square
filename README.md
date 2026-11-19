@@ -32,7 +32,7 @@ For in-person payments started in Odoo Point of Sale, install **Square Terminal 
 
 ## Compatibility
 
-This repository follows Odoo addon versioning. The current manifest version is `18.0.1.4.2`, where `18.0` is the Odoo series and `1.4.2` is the addon release version.
+This repository follows Odoo addon versioning. The Square POS Integration manifest version is `18.0.1.4.3`, where `18.0` is the Odoo series and `1.4.3` is the addon release version.
 
 The addon manifest declares the following Odoo dependencies:
 
@@ -205,6 +205,8 @@ flowchart TB
 ```
 
 ## Operational Notes
+
+When deploying Square POS Integration `18.0.1.4.3`, [upgrade the installed module](#development) before resuming stock synchronization. The upgrade adds stock-count metadata used by Square Terminal and preserves pending counts.
 
 When upgrading Square POS Integration to `18.0.1.4.2`, update the installed module to apply the refund schema change. Unverified legacy refunds retain their claimed Square ID and document links for review. Confirmed Square deliveries can use the same ID to record the verified refund. If your installation processed a signed replay on 18.0.1.4.1 and a historical refund was removed, consult a backup taken before that operation for its original links.
 
