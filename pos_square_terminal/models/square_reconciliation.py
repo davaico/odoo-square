@@ -1,5 +1,6 @@
 import logging
 from datetime import timedelta
+from time import monotonic
 
 from psycopg2.errors import DeadlockDetected, SerializationFailure
 
@@ -8,6 +9,10 @@ from odoo.exceptions import AccessError
 
 
 _logger = logging.getLogger(__name__)
+
+RECONCILIATION_BATCH_SIZE = 20
+RECONCILIATION_MAX_CANDIDATES = 200
+RECONCILIATION_TIME_BUDGET_SECONDS = 60
 
 
 class SquarePaymentAttempt(models.Model):
@@ -98,23 +103,58 @@ class SquarePaymentAttempt(models.Model):
     @api.model
     def _cron_reconcile_payments(self):
         due = self._reconciliation_domain(fields.Datetime.now())
-        for attempt_id in self.search(due, order='next_reconciliation_at, id', limit=20).ids:
-            try:
-                with self.env.registry.cursor() as cr:
-                    attempt = api.Environment(cr, SUPERUSER_ID, {})[self._name].browse(attempt_id)
-                    if not attempt._lock_reconciliation(skip_locked=True) or not attempt.filtered_domain(due):
-                        continue
-                    attempt.next_reconciliation_at = fields.Datetime.now() + timedelta(minutes=5)
-                    try:
-                        with cr.savepoint():
-                            if attempt._refresh() and attempt.state == 'verified':
-                                attempt.next_reconciliation_at = fields.Datetime.now() + timedelta(days=1)
-                    except (SerializationFailure, DeadlockDetected):
-                        raise
-                    except Exception:
-                        _logger.exception('Could not check Square Terminal payment attempt %s', attempt_id)
-            except (SerializationFailure, DeadlockDetected):
-                continue
+        deadline = monotonic() + RECONCILIATION_TIME_BUDGET_SECONDS
+        seen_ids = []
+        made_progress = False
+        # Prioritize sales awaiting payment confirmation ahead of routine refund checks.
+        for priority in [('state', '!=', 'verified'), ('state', '=', 'verified')]:
+            priority_due = [*due, priority]
+            while len(seen_ids) < RECONCILIATION_MAX_CANDIDATES and monotonic() < deadline:
+                batch_limit = min(RECONCILIATION_BATCH_SIZE, RECONCILIATION_MAX_CANDIDATES - len(seen_ids))
+                attempt_ids = self.search(
+                    [*priority_due, ('id', 'not in', seen_ids)], order='next_reconciliation_at, id', limit=batch_limit,
+                ).ids
+                for attempt_id in attempt_ids:
+                    if monotonic() >= deadline:
+                        break
+                    # The selector's transaction can still see old due dates and locked rows.
+                    seen_ids.append(attempt_id)
+                    if self._reconcile_scheduled_attempt(attempt_id, priority_due):
+                        made_progress = True
+                if len(attempt_ids) < batch_limit:
+                    break
+        if made_progress and self.search_count([*due, ('id', 'not in', seen_ids)], limit=1):
+            self._schedule_reconciliation_continuation()
+
+    @api.model
+    def _schedule_reconciliation_continuation(self):
+        cron = self.env.ref('pos_square_terminal.ir_cron_square_terminal_reconcile_payments')
+        now = fields.Datetime.now()
+        continuation_at = now + timedelta(minutes=1)
+        if not self.env['ir.cron.trigger'].sudo().search_count([
+            ('cron_id', '=', cron.id), ('call_at', '>', now), ('call_at', '<=', continuation_at),
+        ], limit=1):
+            cron._trigger(at=continuation_at)
+
+    @api.model
+    def _reconcile_scheduled_attempt(self, attempt_id, due):
+        try:
+            with self.env.registry.cursor() as cr:
+                attempt = api.Environment(cr, SUPERUSER_ID, {})[self._name].browse(attempt_id)
+                if not attempt._lock_reconciliation(skip_locked=True) or not attempt.filtered_domain(due):
+                    return False
+                attempt.next_reconciliation_at = fields.Datetime.now() + timedelta(minutes=5)
+                try:
+                    with cr.savepoint():
+                        if attempt._refresh() and attempt.state == 'verified':
+                            attempt.next_reconciliation_at = fields.Datetime.now() + timedelta(days=1)
+                except (SerializationFailure, DeadlockDetected):
+                    raise
+                except Exception:
+                    _logger.exception('Could not check Square Terminal payment attempt %s', attempt_id)
+                return True
+        except (SerializationFailure, DeadlockDetected):
+            return False
 
     def action_check_square_payment(self):
         self.ensure_one()

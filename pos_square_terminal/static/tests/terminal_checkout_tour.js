@@ -4,9 +4,48 @@ import * as Dialog from "@point_of_sale/../tests/tours/utils/dialog_util";
 import * as NumberPopup from "@point_of_sale/../tests/tours/utils/number_popup_util";
 import * as PaymentScreen from "@point_of_sale/../tests/tours/utils/payment_screen_util";
 import * as PartnerList from "@point_of_sale/../tests/tours/utils/partner_list_util";
+import * as ProductConfigurator from "@point_of_sale/../tests/tours/utils/product_configurator_util";
 import * as ProductScreen from "@point_of_sale/../tests/tours/utils/product_screen_util";
 import * as ReceiptScreen from "@point_of_sale/../tests/tours/utils/receipt_screen_util";
 import { inLeftSide, refresh } from "@point_of_sale/../tests/tours/utils/common";
+import { setOfflineMode, setOnlineMode } from "@point_of_sale/../tests/tours/utils/offline_util";
+
+function openDeskPadPaymentScreen() {
+    return [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+    ];
+}
+
+function sendDeskPadToSquare() {
+    return [
+        ...openDeskPadPaymentScreen(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+    ];
+}
+
+function reopenOrderAfterReload(storageKey) {
+    return [
+        refresh(),
+        { trigger: "body:not(:has(.pos-loader))" },
+        Chrome.clickMenuOption("Orders"),
+        {
+            trigger: ".ticket-screen .order-row",
+            async run(helpers) {
+                const uuid = sessionStorage.getItem(storageKey);
+                const order = window.posmodel.models["pos.order"].getBy("uuid", uuid);
+                const rows = [...document.querySelectorAll(".ticket-screen .order-row")].filter((row) =>
+                    [...row.querySelectorAll(".col")].some((column) => column.textContent.trim() === order?.pos_reference));
+                if (rows.length !== 1) {
+                    throw new Error("Original Square order is missing from the native Orders screen");
+                }
+                await helpers.dblclick(rows[0]);
+            },
+        },
+    ];
+}
 
 registry.category("web_tour.tours").add("SquareTerminalCardCheckout", {
     steps: () => [
@@ -28,15 +67,55 @@ registry.category("web_tour.tours").add("SquareTerminalCardCheckout", {
 
 registry.category("web_tour.tours").add("SquareTerminalCashOnly", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         { trigger: '.paymentmethod:not([aria-disabled="true"]):contains("Square Counter")' },
         ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
         ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "12.34"),
         ...PaymentScreen.clickValidate(),
         ...ReceiptScreen.receiptIsThere(),
         { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalRetryOfflineDraft", {
+    steps: () => [
+        ...openDeskPadPaymentScreen(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        setOfflineMode(),
+        {
+            trigger: ".payment-screen .send_payment_request",
+            run() {
+                const order = window.posmodel.get_order();
+                sessionStorage.setItem("squareOfflineDraft", order.uuid);
+                sessionStorage.setItem("squareOfflineTender", order.payment_ids[0].uuid);
+                this.anchor.click();
+            },
+        },
+        {
+            trigger: ".modal:contains('Save the sale before sending it to Square Terminal.') .btn-primary, " +
+                ".payment-screen .electronic_status:contains('Square payment outcome needs verification')",
+            run() {
+                if (!this.anchor.matches(".btn-primary")) {
+                    throw new Error("A failed draft sync must leave the original tender ready to send");
+                }
+                this.anchor.click();
+            },
+        },
+        setOnlineMode(),
+        {
+            trigger: ".payment-screen .send_payment_request",
+            run() {
+                const order = window.posmodel.get_order();
+                if (order.uuid !== sessionStorage.getItem("squareOfflineDraft") ||
+                    order.payment_ids[0]?.uuid !== sessionStorage.getItem("squareOfflineTender")) {
+                    throw new Error("Retry must use the original Square order and tender");
+                }
+                this.anchor.click();
+            },
+        },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("12.34"),
+        { trigger: ".pos-receipt .paymentlines:contains('Square Counter')" },
     ],
 });
 
@@ -55,6 +134,55 @@ registry.category("web_tour.tours").add("SquareTerminalDiscountedFraction", {
         ...ReceiptScreen.receiptIsThere(),
         ...ReceiptScreen.receiptAmountTotalIs("16.20"),
         { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalCatalogSellingUnit", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad", 1.5),
+        ...ProductScreen.addOrderline("Monitor Stand", 2),
+        ...ProductScreen.addOrderline("Letter Tray", 1.5),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "32.09"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("32.09"),
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalTrackedItems", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.clickDisplayedProduct("Desk Pad"),
+        ...ProductScreen.enterLotNumber("DESK-101"),
+        ...ProductScreen.clickDisplayedProduct("Monitor Stand"),
+        ...ProductScreen.enterLotNumber("MONITOR-101"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "15.53"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("15.53"),
+        { trigger: ".pos-receipt .orderline:contains('Desk Pad'):contains('SN DESK-101')" },
+        { trigger: ".pos-receipt .orderline:contains('Monitor Stand'):contains('Lot Number MONITOR-101')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalConfiguredOption", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.clickDisplayedProduct("Desk Pad"),
+        ...ProductConfigurator.pickRadio("Lacquered"),
+        Dialog.confirm(),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "12.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("12.00"),
+        { trigger: ".pos-receipt .orderline:contains('Desk Pad'):contains('Lacquered')" },
     ],
 });
 
@@ -114,21 +242,7 @@ registry.category("web_tour.tours").add("SquareTerminalMixedComboRecovery", {
                 sessionStorage.setItem("squareMixedTenders", order.payment_ids.map((line) => line.uuid).sort().join());
             },
         },
-        refresh(),
-        { trigger: "body:not(:has(.pos-loader))" },
-        Chrome.clickMenuOption("Orders"),
-        {
-            trigger: ".ticket-screen .order-row",
-            async run(helpers) {
-                const order = window.posmodel.models["pos.order"].getBy("uuid", sessionStorage.getItem("squareMixedOrder"));
-                const rows = [...document.querySelectorAll(".ticket-screen .order-row")].filter((row) =>
-                    [...row.querySelectorAll(".col")].some((column) => column.textContent.trim() === order?.pos_reference));
-                if (rows.length !== 1) {
-                    throw new Error("Original mixed sale is missing from the native Orders screen");
-                }
-                await helpers.dblclick(rows[0]);
-            },
-        },
+        ...reopenOrderAfterReload("squareMixedOrder"),
         {
             trigger: ".payment-screen .square-check-status:contains('Check status')",
             run() {
@@ -153,9 +267,7 @@ registry.category("web_tour.tours").add("SquareTerminalMixedComboRecovery", {
 
 registry.category("web_tour.tours").add("SquareTerminalCardsThenCash", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         ...PaymentScreen.clickNumpad("5"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "5.00"),
@@ -216,9 +328,7 @@ function enterOdooTip(keys) {
 
 registry.category("web_tour.tours").add("SquareTerminalOdooTipRecovery", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...enterOdooTip("6"),
         ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
         PaymentScreen.enterPaymentLineAmount("Checkout Cash", "22"),
@@ -271,9 +381,7 @@ registry.category("web_tour.tours").add("SquareTerminalOdooTipRecovery", {
 
 registry.category("web_tour.tours").add("SquareTerminalOdooTipFinalCard", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...enterOdooTip("0.01"),
         ...Array.from({ length: 3 }, () => [
             ...PaymentScreen.clickPaymentMethod("Square Counter"),
@@ -296,9 +404,7 @@ registry.category("web_tour.tours").add("SquareTerminalOdooTipFinalCard", {
 
 registry.category("web_tour.tours").add("SquareTerminalOdooTipRemainder", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...enterOdooTip("0.02"),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         ...PaymentScreen.clickNumpad("4"),
@@ -326,9 +432,7 @@ registry.category("web_tour.tours").add("SquareTerminalOdooTipRemainder", {
 
 registry.category("web_tour.tours").add("SquareTerminalSingleOdooTip", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...enterOdooTip("2"),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "14.34"),
@@ -342,9 +446,7 @@ registry.category("web_tour.tours").add("SquareTerminalSingleOdooTip", {
 
 registry.category("web_tour.tours").add("SquareTerminalRejectsVoucher", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...PaymentScreen.clickPaymentMethod("Store Voucher"),
         ...PaymentScreen.clickNumpad("2"),
         ...PaymentScreen.selectedPaymentlineHas("Store Voucher", "2.00"),
@@ -361,9 +463,7 @@ registry.category("web_tour.tours").add("SquareTerminalRejectsVoucher", {
 
 registry.category("web_tour.tours").add("SquareTerminalPreviewDiscrepancy", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "12.34"),
         { trigger: ".payment-screen .send_payment_request", run: "click" },
@@ -373,11 +473,7 @@ registry.category("web_tour.tours").add("SquareTerminalPreviewDiscrepancy", {
 
 registry.category("web_tour.tours").add("SquareTerminalCancelRacesPayment", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
-        ...PaymentScreen.clickPaymentMethod("Square Counter"),
-        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...sendDeskPadToSquare(),
         { trigger: ".payment-screen .electronic_status:contains('Waiting for Square Terminal')" },
         {
             trigger: ".payment-screen .square-cancel-payment",
@@ -401,11 +497,7 @@ registry.category("web_tour.tours").add("SquareTerminalCancelRacesPayment", {
 
 registry.category("web_tour.tours").add("SquareTerminalLostCancellation", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
-        ...PaymentScreen.clickPaymentMethod("Square Counter"),
-        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...sendDeskPadToSquare(),
         { trigger: ".payment-screen .electronic_status:contains('Waiting for Square Terminal')" },
         { trigger: ".payment-screen .square-cancel-payment", run: "click" },
         { trigger: ".payment-screen .electronic_status:contains('Waiting for Square to confirm cancellation')" },
@@ -428,9 +520,7 @@ registry.category("web_tour.tours").add("SquareTerminalLostCancellation", {
 
 registry.category("web_tour.tours").add("SquareTerminalLostCheckoutResponse", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         {
             trigger: ".payment-screen .send_payment_request",
@@ -443,22 +533,7 @@ registry.category("web_tour.tours").add("SquareTerminalLostCheckoutResponse", {
             },
         },
         { trigger: ".payment-screen .electronic_status:contains('Square payment outcome needs verification')" },
-        refresh(),
-        { trigger: "body:not(:has(.pos-loader))" },
-        Chrome.clickMenuOption("Orders"),
-        {
-            trigger: ".ticket-screen .order-row",
-            async run(helpers) {
-                const uuid = sessionStorage.getItem("squareRecoveryOrder");
-                const order = window.posmodel.models["pos.order"].getBy("uuid", uuid);
-                const rows = [...document.querySelectorAll(".ticket-screen .order-row")].filter((row) =>
-                    [...row.querySelectorAll(".col")].some((column) => column.textContent.trim() === order?.pos_reference));
-                if (rows.length !== 1) {
-                    throw new Error("Original Square order is missing from the native Orders screen");
-                }
-                await helpers.dblclick(rows[0]);
-            },
-        },
+        ...reopenOrderAfterReload("squareRecoveryOrder"),
         {
             trigger: ".product-screen, .payment-screen",
             async run(helpers) {
@@ -495,9 +570,7 @@ registry.category("web_tour.tours").add("SquareTerminalLostCheckoutResponse", {
 
 registry.category("web_tour.tours").add("SquareTerminalSplitRecovery", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         PaymentScreen.enterPaymentLineAmount("Square Counter", "5"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "5.00"),
@@ -520,22 +593,7 @@ registry.category("web_tour.tours").add("SquareTerminalSplitRecovery", {
                 sessionStorage.setItem("squareSplitTenders", order.payment_ids.map((line) => line.uuid).sort().join());
             },
         },
-        refresh(),
-        { trigger: "body:not(:has(.pos-loader))" },
-        Chrome.clickMenuOption("Orders"),
-        {
-            trigger: ".ticket-screen .order-row",
-            async run(helpers) {
-                const uuid = sessionStorage.getItem("squareSplitOrder");
-                const order = window.posmodel.models["pos.order"].getBy("uuid", uuid);
-                const rows = [...document.querySelectorAll(".ticket-screen .order-row")].filter((row) =>
-                    [...row.querySelectorAll(".col")].some((column) => column.textContent.trim() === order?.pos_reference));
-                if (rows.length !== 1) {
-                    throw new Error("Original Square split is missing from the native Orders screen");
-                }
-                await helpers.dblclick(rows[0]);
-            },
-        },
+        ...reopenOrderAfterReload("squareSplitOrder"),
         {
             trigger: ".payment-screen .square-check-status:contains('Check status')",
             run() {
@@ -556,9 +614,7 @@ registry.category("web_tour.tours").add("SquareTerminalSplitRecovery", {
 
 registry.category("web_tour.tours").add("SquareTerminalSplitDeviceTips", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         PaymentScreen.enterPaymentLineAmount("Square Counter", "40"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "40.00"),
@@ -619,19 +675,9 @@ registry.category("web_tour.tours").add("SquareTerminalSplitDeviceTips", {
     ].flat(),
 });
 
-function startDeviceTipCheckout() {
-    return [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
-        ...PaymentScreen.clickPaymentMethod("Square Counter"),
-        { trigger: ".payment-screen .send_payment_request", run: "click" },
-    ];
-}
-
 registry.category("web_tour.tours").add("SquareTerminalDeviceTipMissingProduct", {
     steps: () => [
-        ...startDeviceTipCheckout(),
+        ...sendDeskPadToSquare(),
         { trigger: ".modal:contains('Configure an active, tax-free Odoo tip service product') .btn-primary", run: "click" },
         { trigger: ".payment-screen .send_payment_request" },
     ],
@@ -639,7 +685,7 @@ registry.category("web_tour.tours").add("SquareTerminalDeviceTipMissingProduct",
 
 registry.category("web_tour.tours").add("SquareTerminalDeviceTipZero", {
     steps: () => [
-        ...startDeviceTipCheckout(),
+        ...sendDeskPadToSquare(),
         ...ReceiptScreen.receiptIsThere(),
         ...ReceiptScreen.receiptAmountTotalIs("12.34"),
         { trigger: ".pos-receipt:not(:has(.orderline:contains('Terminal Gratuity'))) .orderline:contains('Desk Pad')" },
@@ -648,7 +694,7 @@ registry.category("web_tour.tours").add("SquareTerminalDeviceTipZero", {
 
 registry.category("web_tour.tours").add("SquareTerminalSingleDeviceTip", {
     steps: () => [
-        ...startDeviceTipCheckout(),
+        ...sendDeskPadToSquare(),
         ...ReceiptScreen.receiptIsThere(),
         ...ReceiptScreen.receiptAmountTotalIs("15.64"),
         { trigger: ".pos-receipt .orderline:contains('Terminal Gratuity'):contains('3.30')" },
@@ -658,9 +704,7 @@ registry.category("web_tour.tours").add("SquareTerminalSingleDeviceTip", {
 
 registry.category("web_tour.tours").add("SquareTerminalAbandonSplit", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         ...PaymentScreen.clickNumpad("3"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "3.00"),
@@ -689,11 +733,7 @@ registry.category("web_tour.tours").add("SquareTerminalAbandonSplit", {
 
 registry.category("web_tour.tours").add("SquareTerminalCloseWithUncertainPayment", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
-        ...PaymentScreen.clickPaymentMethod("Square Counter"),
-        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...sendDeskPadToSquare(),
         { trigger: ".payment-screen .electronic_status:contains('Square payment outcome needs verification')" },
         ...Chrome.clickMenuOption("Close Register"),
         { trigger: ".close-pos-popup .btn-primary:contains('Close Register')", run: "click" },
@@ -718,9 +758,7 @@ registry.category("web_tour.tours").add("SquareTerminalCloseWithUncertainPayment
 
 registry.category("web_tour.tours").add("SquareTerminalInvoiceCustomer", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
+        ...openDeskPadPaymentScreen(),
         ...PaymentScreen.clickInvoiceButton(),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         {
@@ -764,11 +802,7 @@ registry.category("web_tour.tours").add("SquareTerminalInvoiceCustomer", {
 
 registry.category("web_tour.tours").add("SquareTerminalCounterHandover", {
     steps: () => [
-        ...Chrome.startPoS(),
-        ...ProductScreen.addOrderline("Desk Pad"),
-        ...ProductScreen.clickPayButton(),
-        ...PaymentScreen.clickPaymentMethod("Square Counter"),
-        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...sendDeskPadToSquare(),
         ...ReceiptScreen.receiptIsThere(),
         ...ReceiptScreen.receiptAmountTotalIs("12.34"),
         { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },

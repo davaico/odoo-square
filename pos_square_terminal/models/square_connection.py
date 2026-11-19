@@ -103,11 +103,13 @@ class SquareConnection(models.Model):
         self.ensure_one()
         return self._credential()._authorization_error()
 
-    def _request(self, method, path, **kwargs):
+    def _request(self, method, path, *, before_request=None, **kwargs):
         """Use the original connection even if it has been archived for new sales."""
         self.ensure_one()
         credential = self._credential()
         token = credential._access_token_for_use()
+        if before_request:
+            before_request()
         try:
             return square_request(self.environment, method, path, access_token=token, **kwargs)
         except SquareAPIError as error:

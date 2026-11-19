@@ -5,6 +5,28 @@ from odoo import _, api, fields, models
 from ..const import SQUARE_LOCATION_CURRENCIES
 
 
+SQUARE_STANDARD_UOMS = {
+    ('generic_unit', 'UNIT'): 'uom.product_uom_unit',
+    ('weight_unit', 'METRIC_GRAM'): 'uom.product_uom_gram',
+    ('weight_unit', 'METRIC_KILOGRAM'): 'uom.product_uom_kgm',
+    ('weight_unit', 'IMPERIAL_WEIGHT_OUNCE'): 'uom.product_uom_oz',
+    ('weight_unit', 'IMPERIAL_POUND'): 'uom.product_uom_lb',
+    ('length_unit', 'METRIC_MILLIMETER'): 'uom.product_uom_millimeter',
+    ('length_unit', 'METRIC_CENTIMETER'): 'uom.product_uom_cm',
+    ('length_unit', 'METRIC_METER'): 'uom.product_uom_meter',
+    ('length_unit', 'METRIC_KILOMETER'): 'uom.product_uom_km',
+    ('length_unit', 'IMPERIAL_INCH'): 'uom.product_uom_inch',
+    ('length_unit', 'IMPERIAL_FOOT'): 'uom.product_uom_foot',
+    ('length_unit', 'IMPERIAL_YARD'): 'uom.product_uom_yard',
+    ('length_unit', 'IMPERIAL_MILE'): 'uom.product_uom_mile',
+    ('area_unit', 'METRIC_SQUARE_METER'): 'uom.uom_square_meter',
+    ('area_unit', 'IMPERIAL_SQUARE_FOOT'): 'uom.uom_square_foot',
+    ('volume_unit', 'METRIC_LITER'): 'uom.product_uom_litre',
+    ('volume_unit', 'IMPERIAL_CUBIC_INCH'): 'uom.product_uom_cubic_inch',
+    ('volume_unit', 'IMPERIAL_CUBIC_FOOT'): 'uom.product_uom_cubic_foot',
+}
+
+
 class SquareLocation(models.Model):
     _name = 'pos.square.location'
     _description = 'Square Terminal Location'
@@ -63,20 +85,32 @@ class SquareLocation(models.Model):
             return self.square_id not in (obj.get('absent_at_location_ids') or [])
         return self.square_id in (obj.get('present_at_location_ids') or [])
 
-    def _square_catalog_quantity_unit(self, variation):
+    def _square_catalog_quantity_unit(self, unit_id):
         self.ensure_one()
-        unit_id = variation['item_variation_data'].get('measurement_unit_id')
-        if not isinstance(unit_id, str) or not unit_id:
-            return None
         path = '/v2/catalog/object/' + quote(unit_id, safe='')
         unit = self.connection_id._request('GET', path).get('object')
-        if not isinstance(unit, dict) or unit.get('id') != unit_id or unit.get('type') != 'MEASUREMENT_UNIT':
+        if (
+            not isinstance(unit, dict) or unit.get('id') != unit_id or unit.get('type') != 'MEASUREMENT_UNIT'
+            or not self._square_catalog_object_available(unit)
+        ):
             return None
-        data = unit.get('measurement_unit_data') or {}
+        data = unit.get('measurement_unit_data')
+        if not isinstance(data, dict) or not isinstance(data.get('measurement_unit'), dict):
+            return None
         digits = data.get('precision', 3)
-        if isinstance(data.get('measurement_unit'), dict) and type(digits) is int and 0 <= digits <= 5:
-            return {'catalog_object_id': unit_id, 'precision': digits}
-        return None
+        measurements = [(field, value) for field, value in data['measurement_unit'].items() if field.endswith('_unit')]
+        if len(measurements) != 1 or type(digits) is not int or not 0 <= digits <= 5:
+            return None
+        field, value = measurements[0]
+        unit_type = data['measurement_unit'].get('type')
+        if unit_type is not None and unit_type != f"TYPE_{field.removesuffix('_unit').upper()}":
+            return None
+        xml_id = SQUARE_STANDARD_UOMS.get((field, value)) if isinstance(value, str) else None
+        if not xml_id:
+            return None
+        return self.env.ref(xml_id), {
+            'catalog_object_id': unit_id, 'precision': digits, 'measurement_unit': {field: value},
+        }
 
     @api.model
     def _square_location_values(self, response, merchant_id):

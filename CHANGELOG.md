@@ -1,8 +1,11 @@
 # Changelog
 
-This project follows Odoo addon versioning: `17.0.x.y.z`.
+## Odoo 18 (unreleased)
 
-## Unreleased
+- Added Square Terminal for Odoo 18 POS, including split tenders, tips and recovery on the original sale.
+- Updated the Square POS importer to recognize terminal payments and refunds during webhook processing and manual resync, and to account for linked terminal orders when publishing stock.
+
+## Earlier unreleased notes
 
 - Expanded open-source project documentation.
 - Added contributor and security guidance.
@@ -11,4 +14,4 @@ This project follows Odoo addon versioning: `17.0.x.y.z`.
 
 ## 17.0.1.3.0
 
-- Current public addon release declared by `addons/odoo_square/__manifest__.py`.
+- Square POS Integration release for Odoo 17.

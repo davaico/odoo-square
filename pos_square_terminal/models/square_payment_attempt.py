@@ -52,6 +52,8 @@ class SquarePaymentAttempt(models.Model):
     ], required=True, default='prepared', index=True)
     active_device_key = fields.Char(compute='_compute_active_device_key', store=True)
     square_checkout_id = fields.Char(index='btree_not_null', copy=False)
+    observed_square_payment_ids = fields.Json(copy=False)
+    checkout_payment_list_complete = fields.Boolean(copy=False)
     square_payment_id = fields.Char(index='btree_not_null', copy=False)
     provider_status = fields.Char(copy=False)
     last_checked_at = fields.Datetime(copy=False)
@@ -104,25 +106,44 @@ class SquarePaymentAttempt(models.Model):
         ):
             raise UserError(_("Reconnect the original Square merchant account."))
 
-    def _dispatch(self):
+    def _dispatch(self, on_submission):
         self.ensure_one()
         if self.state != 'dispatching':
             return
+        submitted = False
+
+        def mark_submitted():
+            nonlocal submitted
+            submitted = True
+            on_submission()
+
         try:
             self._check_provider_scope()
             checkout = self.connection_id._request(
                 'POST', '/v2/terminals/checkouts', payload=deepcopy(self.checkout_request),
+                before_request=mark_submitted,
             ).get('checkout')
-            self._observe_checkout(checkout)
-        except SquareAPIError as error:
-            if (
-                error.status == 400 and error.codes == ('PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED',)
-                and self.square_order_link_id.split
+        except (SquareAPIError, UserError, ValueError) as error:
+            if not submitted:
+                self.write({'state': 'failed', 'provider_status': 'NOT_SUBMITTED'})
+                self._record_failed_check(
+                    str(error) if isinstance(error, UserError) else _("Odoo could not send the checkout."),
+                )
+            elif isinstance(error, SquareAPIError) and error.status == 400 and error.error_only and (
+                set(error.codes) <= {'INVALID_FEES', 'INVALID_LOCATION'}
+                or (error.codes == ('PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED',) and self.square_order_link_id.split)
             ):
-                self.write({'state': 'failed', 'provider_status': error.codes[0]})
+                self.write({'state': 'failed', 'provider_status': ', '.join(error.codes)})
             else:
                 self.state = 'uncertain'
-        except (UserError, ValueError):
+            return
+
+        try:
+            self._observe_checkout(checkout)
+        except SquarePaymentDiscrepancy as error:
+            self.state = 'uncertain'
+            self._record_failed_check(str(error), discrepancy=True)
+        except (SquareAPIError, UserError, ValueError):
             self.state = 'uncertain'
 
     def _refresh(self, *, recheck_failed=False):
@@ -182,14 +203,23 @@ class SquarePaymentAttempt(models.Model):
     def _recover_original_payment(self):
         self.ensure_one()
         link = self.square_order_link_id
-        payment = self._read_payment(self.square_payment_id) if self.square_payment_id else None
-        if payment and payment['status'] not in ('FAILED', 'CANCELED'):
-            status = self._observe_payment(payment, final=False)
-            self._record_successful_check()
-            return status
-
         path = '/v2/orders/' + quote(link.square_order_id, safe='')
-        order = self.connection_id._request('GET', path).get('order')
+        complete_list = self.checkout_payment_list_complete
+        known_payment_ids = self._known_payment_ids()
+        try:
+            order = self.connection_id._request('GET', path).get('order')
+        except SquareAPIError as error:
+            if complete_list and not error.is_authorization_error:
+                # A completed checkout supplies the full candidate list, even after it expires.
+                payment = self._select_payment([self._read_payment(payment_id) for payment_id in known_payment_ids])
+                if payment and payment['status'] == 'COMPLETED':
+                    status = self._observe_payment(payment, final=True)
+                    self._record_successful_check()
+                    return status
+            raise
+        if complete_list:
+            # If the order supplies new or contradictory evidence we must validate it before using the list again.
+            self.checkout_payment_list_complete = False
         if not (
             isinstance(order, dict) and order.get('id') == link.square_order_id
             and order.get('reference_id') == link.reference and order.get('location_id') == self.square_location_id
@@ -200,21 +230,22 @@ class SquarePaymentAttempt(models.Model):
         if not isinstance(tenders, list):
             raise ValueError('Invalid Square order tenders')
         tender_ids = set()
-        matching_payments = []
+        matching_payments = [self._read_payment(payment_id) for payment_id in known_payment_ids]
         for tender in tenders:
             payment_id = (tender.get('payment_id') or tender.get('id')) if isinstance(tender, dict) else None
             if not isinstance(payment_id, str) or not payment_id or payment_id in tender_ids:
                 raise ValueError('Invalid Square order tender payment ID')
             tender_ids.add(payment_id)
-            if payment or tender.get('type') == 'CASH':
+            if payment_id in known_payment_ids or tender.get('type') == 'CASH':
                 continue
             candidate = self._read_payment(payment_id, from_order=True)
             if candidate:
                 matching_payments.append(candidate)
-        if len(matching_payments) > 1:
-            raise ValueError('Multiple Square payments match the reserved checkout')
-        if matching_payments:
-            payment = matching_payments[0]
+        self.write({
+            'observed_square_payment_ids': [payment['id'] for payment in matching_payments],
+            'checkout_payment_list_complete': complete_list,
+        })
+        payment = self._select_payment(matching_payments)
         # A missing checkout or empty tender list can still precede a late capture.
         # A canceled order is a terminal, unpaid provider state.
         cancellation_confirmed = order['state'] == 'CANCELED' and (
@@ -283,6 +314,8 @@ class SquarePaymentAttempt(models.Model):
 
     def _observe_checkout(self, checkout, *, authoritative=False):
         self.ensure_one()
+        if self.checkout_payment_list_complete:
+            self.checkout_payment_list_complete = False
         if not isinstance(checkout, dict):
             raise ValueError('Missing Square Terminal checkout')
         checkout_id = checkout.get('id')
@@ -318,23 +351,47 @@ class SquarePaymentAttempt(models.Model):
             'state': state,
         })
         ids = checkout.get('payment_ids', [])
-        if not isinstance(ids, list) or len(ids) > 1 or any(not isinstance(item, str) or not item for item in ids):
+        if (
+            not isinstance(ids, list) or any(not isinstance(item, str) or not item for item in ids)
+            or len(ids) != len(set(ids))
+        ):
             raise ValueError('Invalid Square payment IDs')
         if status == 'COMPLETED' and not ids:
-            raise ValueError('Square Terminal checkout did not identify one payment')
+            raise ValueError('Square Terminal checkout did not identify any payment')
 
         safe_cancellation = authoritative and status == 'CANCELED' and cancel_reason in (
             'BUYER_CANCELED', 'SELLER_CANCELED',
         )
         final = status == 'COMPLETED' or safe_cancellation
-        payment_id = ids[0] if ids else self.square_payment_id
+        # Keep the references even if a payment read fails, so later recovery still checks them.
+        known_payment_ids = list(dict.fromkeys(ids + self._known_payment_ids()))
+        self.write({
+            'observed_square_payment_ids': known_payment_ids,
+            'checkout_payment_list_complete': status == 'COMPLETED',
+        })
+        payment = self._select_payment([self._read_payment(payment_id) for payment_id in known_payment_ids])
         payment_status = None
-        if payment_id:
-            payment_status = self._verify_payment(payment_id, final=final)
+        if payment:
+            payment_status = self._observe_payment(payment, final=final)
         elif safe_cancellation:
             self.state = 'failed'
         self._record_successful_check()
         return payment_status or True
+
+    def _known_payment_ids(self):
+        ids = self.observed_square_payment_ids or []
+        if self.square_payment_id and self.square_payment_id not in ids:
+            return [*ids, self.square_payment_id]
+        return ids
+
+    def _select_payment(self, payments):
+        active_payments = [payment for payment in payments if payment['status'] not in ('FAILED', 'CANCELED')]
+        if active_payments and self.state == 'failed':
+            # New collection evidence invalidates an earlier release before cancellation can use it.
+            self.state = 'uncertain'
+        if len(active_payments) > 1:
+            raise SquarePaymentDiscrepancy(_("Multiple Square payments match the original checkout."))
+        return next(iter(active_payments or payments), None)
 
     def _requested_base_minor(self):
         return self.checkout_request['checkout']['amount_money']['amount']
@@ -355,8 +412,7 @@ class SquarePaymentAttempt(models.Model):
         if from_order and payment.get('reference_id') != self.reference:
             return
         if not (
-            (not self.square_payment_id or self.square_payment_id == payment_id)
-            and payment.get('reference_id') == self.reference
+            payment.get('reference_id') == self.reference
             and (not self.square_checkout_id
                  or payment.get('terminal_checkout_id', self.square_checkout_id) == self.square_checkout_id)
             and payment.get('source_type') == 'CARD'

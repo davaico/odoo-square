@@ -41,6 +41,12 @@ function showSquareMessage(dialog, body) {
     dialog.add(AlertDialog, { title: _t("Square Terminal"), body });
 }
 
+function markUncertain(line) {
+    if (!["verified", "cancelled", "authorized", "recording_cash", "settling"].includes(line.square_attempt_state)) {
+        line.update({ square_attempt_state: "uncertain" });
+    }
+}
+
 class SquarePayment extends PaymentInterface {
     get fast_payments() {
         return false;
@@ -113,9 +119,7 @@ class SquarePayment extends PaymentInterface {
             const status = await this.call(line, "square_check_payment");
             return await this.settleIfCovered(line, status);
         } catch {
-            if (!["verified", "cancelled", "authorized", "recording_cash", "settling"].includes(line.square_attempt_state)) {
-                line.update({ square_attempt_state: "uncertain" });
-            }
+            markUncertain(line);
             return false;
         }
     }
@@ -124,9 +128,7 @@ class SquarePayment extends PaymentInterface {
         try {
             return await this.call(line, "square_cancel_payment", line.square_attempt_reference);
         } catch {
-            if (!["verified", "cancelled", "authorized", "recording_cash", "settling"].includes(line.square_attempt_state)) {
-                line.update({ square_attempt_state: "uncertain" });
-            }
+            markUncertain(line);
         }
     }
 
@@ -134,7 +136,7 @@ class SquarePayment extends PaymentInterface {
         const order = this.pos.get_order();
         let line = order.payment_ids.find((line) => line.uuid === uuid);
         const originalState = line.square_attempt_state;
-        let preparing = !originalState;
+        let prepareStarted = Boolean(originalState);
         try {
             let status;
             if (originalState === "failed") {
@@ -151,8 +153,8 @@ class SquarePayment extends PaymentInterface {
                     return false;
                 }
                 line = savedLine;
+                prepareStarted = true;
                 status = await this.call(line, "square_prepare_payment");
-                preparing = false;
             }
             if (status.state === "prepared") {
                 status = await this.call(line, "square_prepare_linked_order");
@@ -181,13 +183,17 @@ class SquarePayment extends PaymentInterface {
             }
             return await this.settleIfCovered(line, status);
         } catch (error) {
-            if (error instanceof RPCError) {
-                if (preparing && !line.square_attempt_state) {
+            const serverError = error instanceof RPCError;
+            if (serverError || !prepareStarted) {
+                if (!line.square_attempt_state) {
                     line.set_payment_status("pending");
                 }
-                showSquareMessage(this.env.services.dialog, error.data?.message || error.message);
-            } else if (!["verified", "cancelled", "authorized", "recording_cash", "settling"].includes(line.square_attempt_state)) {
-                line.update({ square_attempt_state: "uncertain" });
+                const message = serverError
+                    ? error.data?.message || error.message
+                    : _t("Save the sale before sending it to Square Terminal.");
+                showSquareMessage(this.env.services.dialog, message);
+            } else {
+                markUncertain(line);
             }
         }
         return false;
@@ -500,7 +506,7 @@ patch(PaymentScreenPaymentLines.prototype, {
             return _t("Card declined. The original checkout is still active on Square Terminal.");
         }
         if (line.square_attempt_state === "failed") {
-            return _t("Square confirmed that no payment was collected.");
+            return _t("No Square payment was collected.");
         }
         if (line.square_attempt_state === "timed_out") {
             return _t("Square reported a timeout. Check the original payment before collecting again.");

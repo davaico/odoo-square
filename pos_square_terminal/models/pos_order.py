@@ -245,8 +245,11 @@ class PosOrder(models.Model):
 
             submission_started = False
 
-            def dispatch_reserved_checkout():
+            def mark_submission_started():
                 nonlocal submission_started
+                submission_started = True
+
+            def dispatch_reserved_checkout():
                 attempt = orders._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
                 if attempt.reference != attempt_reference or attempt.state != 'dispatching':
                     return attempt._cashier_status()
@@ -257,8 +260,7 @@ class PosOrder(models.Model):
                     attempt.state = 'failed'
                     attempt.order_id._square_finish_cancellation(attempt, request=True)
                 else:
-                    submission_started = True
-                    attempt._dispatch()
+                    attempt._dispatch(mark_submission_started)
                 return attempt._cashier_status()
 
             return retrying(dispatch_reserved_checkout, orders.env)
@@ -422,8 +424,11 @@ class PosOrder(models.Model):
             return
         if not link._release_cash_tenders(request=request):
             return
-        released_payment_ids = related_attempts.filtered('square_payment_id').mapped('square_payment_id')
-        released_payment_ids.extend(filter(None, link._cash_square_payment_ids()))
+        released_payment_ids = {
+            payment_id for share in related_attempts if share.state == 'failed'
+            for payment_id in share._known_payment_ids()
+        }
+        released_payment_ids.update(filter(None, link._cash_square_payment_ids()))
         link._cancel_unpaid_order(released_payment_ids, request=request)
         if link.cancelled:
             self._square_lock_checkout(touch=True)
@@ -510,12 +515,15 @@ class PosOrder(models.Model):
                 raise UserError(_("The Odoo tip differs from the recorded tip line."))
         combo_prices = self._square_combo_prices(pricelist, digits)
         unit_prices = {}
+        lot_quantities = {}
+        for line in self.lines.filtered(lambda line: line.product_id.tracking == 'lot'):
+            lot_quantities[line.product_id] = lot_quantities.get(line.product_id, 0) + line.qty
         for line in self.lines:
             product = line.product_id
             taxes = product.taxes_id._filter_taxes_by_company(self.company_id)
             global_discount = line in discount_lines
             if (
-                not all(isfinite(value) for value in (line.qty, line.price_unit, line.discount))
+                not all(isfinite(value) for value in (line.qty, line.price_unit, line.discount, line.price_extra))
                 or line.qty <= 0 or (line.price_unit < 0 and not global_discount) or not 0 <= line.discount <= 100
                 or (line.discount and not config.manual_discount)
                 or (line.price_type == 'manual' and line not in tip_lines and not global_discount and not can_edit_price)
@@ -523,16 +531,19 @@ class PosOrder(models.Model):
                     line.price_type != 'manual' or line.qty != 1 or line.price_unit >= 0 or line.discount
                     or line.combo_parent_id or line.combo_line_ids or line in tip_lines
                 ))
-                or line.price_extra
                 or line.refunded_orderline_id or (line.combo_item_id and line not in combo_prices)
                 or (line.combo_parent_id and line not in combo_prices)
-                or product.tracking != 'none'
                 or not product.active or not product.sale_ok
                 or (not product.available_in_pos and not line.combo_parent_id and line not in tip_lines and not global_discount)
                 or (product.company_id and product.company_id != self.company_id)
                 or (not global_discount and set(taxes.ids) != set(line.tax_ids.ids))
             ):
                 raise UserError(_("An Odoo basket item cannot be priced for Square Terminal."))
+            options = line._square_configured_attribute_values()
+            chosen_extras = options.filtered(lambda value: value.attribute_id.create_variant == 'no_variant')
+            client_extra = 0 if global_discount or line in tip_lines or line in combo_prices else sum(chosen_extras.mapped('price_extra'))
+            if float_compare(client_extra, line.price_extra, precision_digits=price_digits):
+                raise UserError(_("The Odoo basket option price changed. Reload the register and check the sale."))
             if line in tip_lines:
                 price = self.tip_amount
             elif line in combo_prices:
@@ -540,7 +551,13 @@ class PosOrder(models.Model):
             elif line.price_type == 'manual':
                 price = line.price_unit
             else:
-                price = pricelist._get_product_price(product, line.qty) if pricelist else product.lst_price
+                quantity = lot_quantities.get(product, line.qty)
+                extra = product._get_no_variant_attributes_price_extra(chosen_extras)
+                if pricelist:
+                    priced_product = product.with_context(no_variant_attributes_price_extra=extra)
+                    price = pricelist._get_product_price(priced_product, quantity)
+                else:
+                    price = product.with_context(uom=False).lst_price + extra
             if float_compare(price, line.price_unit, precision_digits=price_digits):
                 raise UserError(_("The Odoo basket price changed. Reload the register and check the sale."))
             unit_prices[line] = price if global_discount else float_round(price, precision_digits=price_digits)
@@ -609,6 +626,10 @@ class PosOrder(models.Model):
                 'product': line.product_id,
                 'name': line.product_id.with_context(display_default_code=False).display_name[:255],
                 'combo': line in combo_prices,
+                'options': bool(
+                    line.attribute_value_ids - line.product_id.product_template_attribute_value_ids
+                    or line.custom_attribute_value_ids
+                ),
                 'quantity': decimal_string(line.qty),
                 'unit_minor': int(unit_minor) if unit_minor == unit_minor.to_integral_value() else None,
                 'total_minor': net_minor + tax_minor,
@@ -684,13 +705,13 @@ class PosOrder(models.Model):
                 or set(children.combo_item_id.combo_id.ids) != set(groups.ids)
                 or any(
                     child not in self.lines or child.product_id != child.combo_item_id.product_id
-                    or child.qty != parent.qty or child.attribute_value_ids
+                    or child.qty != parent.qty
                     for child in children
                 )
             ):
                 raise UserError(_("The Odoo combo no longer matches its configured choices."))
             prices[parent] = 0
-            product = parent.product_id
+            product = parent.product_id.with_context(no_variant_attributes_price_extra=0, uom=False)
             price = pricelist._get_product_price(product, 1) if pricelist else product.lst_price
             weight = sum(groups.mapped('base_price'))
             remaining = price
@@ -701,7 +722,8 @@ class PosOrder(models.Model):
                 else:
                     share = float_round(item.combo_id.base_price * price / weight, precision_digits=digits) if weight else 0
                 remaining -= share
-                prices[child] = share + item.extra_price
+                option_extra = sum(child._square_configured_attribute_values().mapped('price_extra'))
+                prices[child] = share + item.extra_price + option_extra
         return prices
 
     def _square_order_payload(self, location, reference, line_items):
@@ -722,8 +744,10 @@ class PosOrder(models.Model):
         expected = {}
         variations = {}
         units = {}
+        count_unit = self.env.ref('uom.product_uom_unit')
         for index, line in enumerate(line_items, 1):
             product = line['product']
+            uom = product.uom_id if product else count_unit
             sku = product.default_code if product else None
             quantity = line['quantity']
             precision = len(quantity.partition('.')[2])
@@ -737,25 +761,28 @@ class PosOrder(models.Model):
                 'base_price_money': {'amount': line['unit_minor'], 'currency': currency},
             }
             catalog_unit = None
-            if precision:
-                if variation:
-                    if variation['id'] not in units:
-                        units[variation['id']] = location._square_catalog_quantity_unit(variation)
-                    catalog_unit = units[variation['id']]
-                    if not catalog_unit or precision > catalog_unit['precision']:
+            if variation:
+                unit_id = variation['item_variation_data'].get('measurement_unit_id')
+                if isinstance(unit_id, str) and unit_id:
+                    if unit_id not in units:
+                        units[unit_id] = location._square_catalog_quantity_unit(unit_id)
+                    catalog_uom, catalog_unit = units[unit_id] or (None, None)
+                    if catalog_uom != uom or precision > catalog_unit['precision']:
                         variation = catalog_unit = None
-                if not variation:
-                    name = product.uom_id.name
-                    payload['quantity_unit'] = {
-                        'measurement_unit': {'custom_unit': {'name': name[:50], 'abbreviation': name[:10]}},
-                        'precision': precision,
-                    }
+                elif unit_id is not None or precision or uom != count_unit:
+                    variation = None
             if variation:
                 payload['catalog_object_id'] = variation['id']
                 if variation.get('version'):
                     payload['catalog_version'] = variation['version']
             else:
                 payload['name'] = line['name']
+                if precision or uom != count_unit:
+                    name = uom.name
+                    payload['quantity_unit'] = {
+                        'measurement_unit': {'custom_unit': {'name': name[:50], 'abbreviation': name[:10]}},
+                        'precision': precision,
+                    }
             for tax in line['taxes']:
                 tax_uid = tax['uid']
                 if tax not in order['taxes']:
@@ -774,9 +801,8 @@ class PosOrder(models.Model):
                 'total_money': line['total_minor'],
                 'total_tax_money': line['tax_minor'],
                 'total_discount_money': line['discount_minor'],
+                'quantity_unit': catalog_unit or False,
             }
-            if catalog_unit:
-                expected[uid]['quantity_unit'] = catalog_unit
         return {'idempotency_key': str(uuid4()), 'order': order}, {
             'lines': expected,
             'summary_reason': summary_reason,
@@ -787,6 +813,8 @@ class PosOrder(models.Model):
             return 'global_discount'
         if any(line['combo'] for line in line_items):
             return 'combo'
+        if any(line['options'] for line in line_items):
+            return 'options'
         if any(
             line['unit_minor'] is None or len(line['quantity']) > 12
             or len(line['quantity'].partition('.')[2]) > 5

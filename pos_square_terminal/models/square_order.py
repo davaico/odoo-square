@@ -164,17 +164,32 @@ class SquareOrder(models.Model):
         )
 
     def _matches_quantity_unit(self, line, requested):
-        if not requested:
+        if requested is None:
             return True
         unit = line.get('quantity_unit')
-        if not isinstance(unit, dict) or type(unit.get('precision')) is not int:
+        if requested is False:
+            return not unit or (
+                isinstance(unit, dict) and not unit.get('catalog_object_id')
+                and type(unit.get('precision')) is int and unit['precision'] == 0
+                and unit.get('measurement_unit') in (
+                    {'generic_unit': 'UNIT'}, {'generic_unit': 'UNIT', 'type': 'TYPE_GENERIC'},
+                )
+            )
+        if (
+            not isinstance(unit, dict) or type(unit.get('precision')) is not int
+            or unit['precision'] != requested['precision']
+        ):
             return False
-        if 'catalog_object_id' in requested:
-            return unit.get('catalog_object_id') == requested['catalog_object_id'] and unit['precision'] == requested['precision']
+        if unit.get('catalog_object_id') != requested.get('catalog_object_id'):
+            return False
+        expected_measurement = requested.get('measurement_unit')
+        if not expected_measurement:
+            return True  # Earlier attempts only saved the catalog ID and precision.
         measurement = unit.get('measurement_unit')
         return (
-            unit['precision'] == requested['precision'] and isinstance(measurement, dict)
-            and measurement.get('custom_unit') == requested['measurement_unit']['custom_unit']
+            isinstance(measurement, dict)
+            and {field: value for field, value in measurement.items() if field.endswith('_unit')}
+            == expected_measurement
         )
 
     def _cash_payment_lines(self):
