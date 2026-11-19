@@ -199,30 +199,42 @@ class SquareOrder(models.Model):
     def _settlement_payment_ids(self, attempts):
         return attempts.mapped('square_payment_id') + self._cash_square_payment_ids()
 
-    def _tender_amounts(self, gross_minor, covered_minor):
+    def _covered_tender_amounts(self, attempts):
+        gross = sum(attempts.mapped('amount_minor')) + self._cash_total_minor()
+        tip = sum(attempt._requested_tip_minor() for attempt in attempts) + sum(
+            tender['request'].get('tip_money', {}).get('amount', 0) for tender in self.cash_tenders or []
+        )
+        return gross, tip
+
+    def _tender_amounts(self, gross_minor, covered_minor, covered_tip_minor):
         self.ensure_one()
         tip_minor = 0
         if self.tip_minor:
             total = self.total_minor + self.tip_minor
-            # Round at each cumulative boundary in minor units. The final boundary equals the original tip.
-            prior_tip = (covered_minor * self.tip_minor + total // 2) // total
-            new_tip = ((covered_minor + gross_minor) * self.tip_minor + total // 2) // total
-            tip_minor = new_tip - prior_tip
+            remaining_gross = total - covered_minor - gross_minor
+            remaining_tip = self.tip_minor - covered_tip_minor
+            if remaining_gross == 0:
+                tip_minor = remaining_tip
+            else:
+                # Leave fractional cents for the final tender and reserve at least one cent of goods for it.
+                proportional_tip = gross_minor * self.tip_minor // total
+                tip_minor = min(remaining_tip, max(proportional_tip, remaining_tip - remaining_gross + 1))
         amounts = {'amount_money': {'amount': gross_minor - tip_minor, 'currency': self.currency_code}}
         if tip_minor:
             amounts['tip_money'] = {'amount': tip_minor, 'currency': self.currency_code}
         return amounts
 
-    def _reserve_cash_tenders(self, payments, *, card_total):
+    def _reserve_cash_tenders(self, payments, attempts):
         self.ensure_one()
         if not payments:
             return
         tenders = list(self.cash_tenders or [])
-        covered = card_total + self._cash_total_minor()
+        covered, covered_tip = self._covered_tender_amounts(attempts)
         for payment in payments.sorted('id'):
             gross = minor_units(payment.amount, self.currency_digits)
-            amounts = self._tender_amounts(gross, covered)
+            amounts = self._tender_amounts(gross, covered, covered_tip)
             covered += gross
+            covered_tip += amounts.get('tip_money', {}).get('amount', 0)
             tenders.append({
                 'native_id': payment.id,
                 'native_uuid': payment.uuid,

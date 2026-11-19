@@ -115,9 +115,8 @@ class PosOrder(models.Model):
                         terminal.location_id, digits, total_minor, line_items, tip_minor,
                         split=amount_minor < gross_minor,
                     )
-                card_total = sum(attempts.mapped('amount_minor'))
-                link._reserve_cash_tenders(cash, card_total=card_total)
-                money = link._tender_amounts(amount_minor, card_total + link._cash_total_minor())
+                link._reserve_cash_tenders(cash, attempts)
+                money = link._tender_amounts(amount_minor, *link._covered_tender_amounts(attempts))
                 if money['amount_money']['amount'] <= 0:
                     raise UserError(_("Enter a larger Square card share to include some of the goods total."))
                 attempt_reference = 'odoo-' + uuid4().hex
@@ -355,7 +354,7 @@ class PosOrder(models.Model):
                 added_cash = sum(minor_units(line.amount, link.currency_digits) for line in cash)
                 if covered + added_cash == link.total_minor + link.tip_minor:
                     order._square_check_session()
-                    link._reserve_cash_tenders(cash, card_total=card_total)
+                    link._reserve_cash_tenders(cash, attempts)
                     order._square_check_reserved_amounts(attempts)
                     if link.cash_tenders:
                         # Commit the recording intent before issuing any Cash CreatePayment.

@@ -1834,12 +1834,23 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         attempt = self.env['pos.square.payment.attempt'].sudo().search([('order_id', '=', order.id)])
         self.assertEqual((attempt.verified_base, attempt.verified_tip), (40, 4))
 
+    def test_odoo_tip_remainder_goes_only_on_the_final_card(self):
+        self.desk_pad.lst_price = 99.99
+        self._configure_device_tip(odoo_tipping=True)
+        self._run_mixed_checkout(
+            'SquareTerminalOdooTipFinalCard', ((9999, 0, 0),), 0, (2500, 2500, 2500, 2499),
+            odoo_tips=(0, 0, 0, 0, 1), lose_settlement=True,
+        )
+        order = self.pos_session.order_ids
+        self.assertEqual((order.amount_total, order.amount_paid, order.tip_amount), (100, 100, 0.01))
+        self.assertEqual(order.payment_ids.mapped('amount'), [25, 25, 25, 25])
+
     def test_odoo_tip_rounding_remainder_follows_two_card_shares_onto_cash(self):
         self.desk_pad.lst_price = 12
         tip_product = self._configure_device_tip(odoo_tipping=True)
         self._run_mixed_checkout(
-            'SquareTerminalOdooTipRemainder', ((1200, 0, 0),), 402, (399, 400),
-            odoo_tips=(1, 1, 0), lose_cash=True,
+            'SquareTerminalOdooTipRemainder', ((1200, 0, 0),), 402, (400, 400),
+            odoo_tips=(2, 0, 0), lose_cash=True,
         )
         order = self.pos_session.order_ids
         self.assertEqual((order.amount_total, order.amount_paid, order.tip_amount), (12.02, 12.02, 0.02))
@@ -1964,7 +1975,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             if (method, path) == ('POST', '/v2/orders/MIXEDORDER/pay'):
                 request = kwargs['json']
                 self.assertCountEqual(request['payment_ids'], payments)
-                self.assertEqual(len(request['payment_ids']), len(cards) + 1)
+                self.assertEqual(len(request['payment_ids']), len(cards) + bool(cash))
                 self.assertEqual(request['order_version'], 1)
                 self.assertTrue(request['idempotency_key'])
                 self.assertEqual({payment['status'] for payment in payments.values()}, {'APPROVED'})
@@ -1995,7 +2006,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             self.start_pos_tour(tour)
         self.assertEqual(mutations, [
             '/v2/orders/calculate', '/v2/orders', *['/v2/terminals/checkouts'] * len(cards),
-            *['/v2/payments'] * (2 if lose_cash else 1), '/v2/orders/MIXEDORDER/pay',
+            *['/v2/payments'] * ((2 if lose_cash else 1) if cash else 0), '/v2/orders/MIXEDORDER/pay',
         ])
         self.env.invalidate_all()
         order = self.pos_session.order_ids
@@ -2003,9 +2014,12 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertCountEqual(order.payment_ids.ids, original_order['tender_ids'])
         self.assertEqual(order.state, 'paid')
         cash_line = order.payment_ids.filtered(lambda payment: payment.payment_method_id == self.cash_method)
-        self.assertEqual(cash_line.amount, cash / 100)
-        self.assertEqual(cash_line.transaction_id, 'CASH-1')
-        self.assertFalse(cash_line.is_change)
+        if cash:
+            self.assertEqual(cash_line.amount, cash / 100)
+            self.assertEqual(cash_line.transaction_id, 'CASH-1')
+            self.assertFalse(cash_line.is_change)
+        else:
+            self.assertFalse(cash_line)
         card_lines = order.payment_ids - cash_line
         self.assertCountEqual(
             [(payment.amount, payment.payment_status, payment.transaction_id) for payment in card_lines],

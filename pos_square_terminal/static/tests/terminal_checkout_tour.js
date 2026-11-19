@@ -235,6 +235,31 @@ registry.category("web_tour.tours").add("SquareTerminalOdooTipRecovery", {
     ].flat(),
 });
 
+registry.category("web_tour.tours").add("SquareTerminalOdooTipFinalCard", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...enterOdooTip("0.01"),
+        ...Array.from({ length: 3 }, () => [
+            ...PaymentScreen.clickPaymentMethod("Square Counter"),
+            ...PaymentScreen.clickNumpad("2"),
+            ...PaymentScreen.clickNumpad("5"),
+            ...PaymentScreen.selectedPaymentlineHas("Square Counter", "25.00"),
+            { trigger: ".payment-screen .send_payment_request", run: "click" },
+            { trigger: ".payment-screen .electronic_payment .electronic_status:contains('Authorized by Square')" },
+        ]).flat(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "25.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Check the original Square settlement')" },
+        { trigger: ".payment-screen .square-check-status:contains('Check status')", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("100.00"),
+        { trigger: ".pos-receipt .orderline:contains('Terminal Gratuity'):contains('0.01')" },
+    ].flat(),
+});
+
 registry.category("web_tour.tours").add("SquareTerminalOdooTipRemainder", {
     steps: () => [
         ...Chrome.startPoS(),
