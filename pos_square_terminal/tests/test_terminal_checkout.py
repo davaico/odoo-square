@@ -2303,10 +2303,11 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             self.assertNotIn('fulfillments', order)
 
         self._run_priced_checkout(
-            'SquareTerminalInvoiceCustomer', ((1234, 0, 0),), check_order, expected_state='invoiced',
+            'SquareTerminalInvoiceCustomer', ((1234, 0, 0),), check_order, expected_state='done',
         )
         order = self.pos_session.order_ids
         self.assertEqual(order.partner_id, customer)
+        self.assertEqual(order.invoice_status, 'invoiced')
         self.assertEqual(order.account_move.partner_id, customer)
         self.assertEqual(order.account_move.state, 'posted')
         self.assertEqual(len(order.payment_ids), 1)
