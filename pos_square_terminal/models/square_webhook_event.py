@@ -5,7 +5,7 @@ from urllib.parse import quote
 from psycopg2.errors import DeadlockDetected, SerializationFailure, UniqueViolation
 
 from odoo import SUPERUSER_ID, api, fields, models
-from odoo.osv import expression
+from odoo.fields import Domain
 
 
 _logger = logging.getLogger(__name__)
@@ -84,10 +84,10 @@ class SquareWebhookEvent(models.Model):
         return 204
 
     def _attempt_scope(self):
-        return [
+        return Domain([
             ('connection_id', '=', self.connection_id.id), ('environment', '=', self.environment),
             ('merchant_id', '=', self.merchant_id), ('application_id', '=', self.application_id),
-        ]
+        ])
 
     def _process_event(self):
         self.ensure_one()
@@ -100,11 +100,11 @@ class SquareWebhookEvent(models.Model):
         if self.event_type.startswith('refund.'):
             return self._process_refund_event()
         field = 'square_checkout_id' if self.event_type.startswith('terminal.checkout.') else 'square_payment_id'
-        identity = [(field, '=', self.resource_id)]
+        identity = Domain(field, '=', self.resource_id)
         if self.resource_reference:
-            identity = expression.OR([identity, [('reference', '=', self.resource_reference)]])
+            identity |= Domain('reference', '=', self.resource_reference)
         attempt = self.env['pos.square.payment.attempt'].search(
-            expression.AND([self._attempt_scope(), identity]), limit=2,
+            self._attempt_scope() & identity, limit=2,
         )
         if len(attempt) != 1 or attempt.state not in attempt._square_reconcilable_states():
             # Genuine Square sales and unrelated application events need no Terminal work.
@@ -120,7 +120,7 @@ class SquareWebhookEvent(models.Model):
 
         attempts = self.env['pos.square.payment.attempt']
         scope = self._attempt_scope()
-        attempt = attempts.search(scope + [('square_payment_id', '=', payment_id)], limit=1)
+        attempt = attempts.search(scope & Domain('square_payment_id', '=', payment_id), limit=1)
         if not attempt:
             # The original payment ID may not have been observed yet. Use the
             # authenticated payment to locate the attempt, then verify its checkout.
@@ -132,10 +132,10 @@ class SquareWebhookEvent(models.Model):
             location_id = self._identifier(payment.get('location_id'))
             if not (reference and order_id and location_id):
                 return True
-            attempt = attempts.search(scope + [
+            attempt = attempts.search(scope & Domain([
                 ('reference', '=', reference), ('square_order_id', '=', order_id),
                 ('square_location_id', '=', location_id),
-            ], limit=1)
+            ]), limit=1)
         if not attempt or attempt.state not in attempt._square_reconcilable_states():
             return True
         attempt._lock_reconciliation()

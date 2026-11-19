@@ -26,7 +26,7 @@ jobs:
             tags: /payment_square_online,-/payment_square_online:TestSquareOnlinePosCoexistence
           - suite: combined
             modules: payment_square_online,website_sale_stock,payment_demo,odoo_square
-            tags: /payment_square_online,/odoo_square
+            tags: /payment_square_online,/odoo_square,-/payment_square_online:TestSquareOnlinePosCoexistence.test_website_terminal_and_square_register_keep_their_own_sales
           - suite: terminal
             modules: pos_square_terminal
             tags: standard/pos_square_terminal
@@ -123,6 +123,9 @@ jobs:
             esac
             if [[ "$TEST_SUITE" == terminal-importer || "$TEST_SUITE" == terminal-combined ]]; then
               grep -Fq 'Starting TestSquareTerminalImport.' "$log"
+            fi
+            if [[ "$TEST_SUITE" == terminal-combined ]]; then
+              grep -Fq 'Starting TestSquareOnlinePosCoexistence.test_website_terminal_and_square_register_keep_their_own_sales ' "$log"
             fi
           fi
 

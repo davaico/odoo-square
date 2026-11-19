@@ -32,7 +32,7 @@ For a sale started in the Odoo register, install **Square Terminal for Point of 
 
 ## Compatibility
 
-Use release branch `19.0` for Odoo 19 Community. The manifest version is `19.0.1.4.2`, where `19.0` is the Odoo series and `1.4.2` is the addon release version.
+Use release branch `19.0` for Odoo 19 Community. The Square sales importer version is `19.0.1.4.3`. Upgrade the installed importer when adding Square Terminal so its inventory queue can account for stock deductions already made by Square.
 
 The addon manifest declares the following Odoo dependencies:
 
