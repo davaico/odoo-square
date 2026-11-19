@@ -1391,7 +1391,13 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertEqual(order.lines.qty, 1.5)
         self.assertEqual(order.lines.discount, 10)
 
-    def test_combo_falls_back_to_square_summary_and_keeps_native_receipt(self):
+    def test_mixed_combo_recovers_original_cash_and_card_after_lost_settlement(self):
+        euro = self.env.ref('base.EUR')
+        euro.active = True
+        self.main_pos_config.journal_id.currency_id = euro
+        self.method.square_terminal_id.location_id.sudo().currency_code = 'EUR'
+        self.currency = 'EUR'
+        self.assertEqual(self.main_pos_config.currency_id, euro)
         tax = self._included_vat()
         self.desk_pad.write({'lst_price': 3, 'taxes_id': [Command.set(tax.ids)]})
         self.monitor_stand.lst_price = 3
@@ -1426,13 +1432,195 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             self.assertEqual(discount['amount_money'], self._money(200))
             self.assertEqual(untaxed['applied_discounts'], [{'discount_uid': discount['uid']}])
 
-        self._run_priced_checkout('SquareTerminalComboSummary', ((2100, 350, 0), (3900, 0, 200)), check_order)
+        self._run_mixed_checkout(
+            'SquareTerminalMixedComboRecovery', ((2100, 350, 0), (3900, 0, 200)),
+            2000, (4000,), check_order=check_order, lose_settlement=True,
+        )
         order = self.pos_session.order_ids
         self.assertEqual(order.lines.product_id, combo | self.desk_pad | self.monitor_stand | self.whiteboard_pen)
         parent = order.lines.filtered(lambda line: line.product_id == combo)
         self.assertEqual(parent.combo_line_ids.product_id, self.desk_pad | self.monitor_stand)
         self.assertEqual(order.amount_total, 60.0)
         self.assertEqual(order.amount_tax, 3.50)
+
+    def test_cash_after_two_card_authorizations_recovers_recording_and_closes_accounting(self):
+        self.desk_pad.lst_price = 12
+        other_cash = (self.main_pos_config.payment_method_ids - self.cash_method).filtered('is_cash_count')
+        self.main_pos_config.with_context(bypass_payment_method_ids_forbidden_change=True).write({
+            'payment_method_ids': [Command.unlink(method.id) for method in other_cash],
+        })
+        cash_journal = self.cash_method.journal_id
+        cash_account = cash_journal.default_account_id
+        self._run_mixed_checkout(
+            'SquareTerminalCardsThenCash', ((1200, 0, 0),), 300, (500, 400), lose_cash=True,
+        )
+        session = self.pos_session.with_user(self.pos_user)
+        closing = session.get_closing_control_data()
+        self.assertEqual(closing['default_cash_details']['payment_amount'], 3)
+        self.assertEqual(
+            [(method['amount'], method['number']) for method in closing['non_cash_payment_methods']
+             if method['id'] == self.method.id], [(9, 2)],
+        )
+        self.assertEqual(session.post_closing_cash_details(3), {'successful': True})
+        self.assertEqual(session.close_session_from_ui(), {'successful': True})
+        self.assertEqual(session.state, 'closed')
+        statement_lines = session.sudo().statement_line_ids.filtered(lambda line: line.journal_id == cash_journal)
+        self.assertEqual(statement_lines.amount, 3)
+        self.assertEqual(statement_lines.move_id.state, 'posted')
+        self.assertEqual(statement_lines.move_id.line_ids.filtered(lambda line: line.account_id == cash_account).debit, 3)
+        bank_payment = session.sudo().bank_payment_ids.filtered(lambda payment: payment.pos_payment_method_id == self.method)
+        self.assertEqual(bank_payment.amount, 9)
+        self.assertEqual(bank_payment.journal_id, self.method.journal_id)
+
+    def test_unsupported_voucher_is_explained_before_any_square_request(self):
+        voucher = self.bank_payment_method.copy({'name': 'Store Voucher'})
+        self.main_pos_config.with_context(bypass_payment_method_ids_forbidden_change=True).write({
+            'payment_method_ids': [Command.link(voucher.id)],
+        })
+        with patch('odoo.addons.pos_square_terminal.square_api.request') as provider:
+            self.start_pos_tour('SquareTerminalRejectsVoucher')
+            provider.assert_not_called()
+        self.env.invalidate_all()
+        order = self.pos_session.order_ids
+        self.assertEqual(order.state, 'draft')
+        self.assertFalse(order.payment_ids.filtered('transaction_id'))
+        self.assertFalse(self.env['pos.square.order'].sudo().search_count([('order_id', '=', order.id)]))
+
+    def _run_mixed_checkout(self, tour, line_amounts, cash, cards, *, check_order=lambda order: None,
+                            lose_settlement=False, lose_cash=False):
+        fields = ('total_money', 'total_tax_money', 'total_discount_money')
+        totals = {field: self._money(sum(amounts)) for field, amounts in zip(fields, zip(*line_amounts))}
+        provider_order = {}
+        checkouts = {}
+        payments = {}
+        mutations = []
+        cash_request = {}
+        original_order = {}
+        lose_readback = False
+
+        def square_response(method, url, **kwargs):
+            nonlocal lose_readback
+            path = urlsplit(url).path
+            if method == 'POST':
+                mutations.append(path)
+            if method == 'POST' and path in ('/v2/orders/calculate', '/v2/orders'):
+                order = kwargs['json']['order']
+                check_order(order)
+                self.assertEqual(len(order['line_items']), len(line_amounts))
+                response = {**order, **totals, 'line_items': [
+                    {**line, **{field: self._money(amount) for field, amount in zip(fields, amounts)}}
+                    for line, amounts in zip(order['line_items'], line_amounts)
+                ]}
+                if path == '/v2/orders':
+                    self.assertFalse(provider_order)
+                    provider_order.update(response, id='MIXEDORDER', version=1)
+                    response = provider_order
+                return self._square_response({'order': response})
+            if (method, path) == ('POST', '/v2/terminals/checkouts'):
+                number = len(checkouts) + 1
+                checkout = kwargs['json']['checkout']
+                self.assertEqual(checkout['order_id'], 'MIXEDORDER')
+                self.assertEqual(checkout['payment_options'], {'autocomplete': False})
+                self.assertEqual(checkout['amount_money'], self._money(cards[number - 1]))
+                self.assertTrue(all(payment['status'] == 'APPROVED' for payment in payments.values()))
+                checkout_id = f'CHECKOUT-{number}'
+                payment_id = f'CARD-{number}'
+                checkouts[checkout_id] = {
+                    **checkout, 'id': checkout_id, 'location_id': 'SQUARELOC',
+                    'status': 'COMPLETED', 'payment_ids': [payment_id],
+                }
+                payments[payment_id] = {
+                    'id': payment_id, 'order_id': 'MIXEDORDER', 'location_id': 'SQUARELOC',
+                    'reference_id': checkout['reference_id'], 'source_type': 'CARD', 'status': 'APPROVED',
+                    'amount_money': self._money(cards[number - 1]), 'total_money': self._money(cards[number - 1]),
+                }
+                return self._square_response({'checkout': {**checkouts[checkout_id], 'status': 'PENDING', 'payment_ids': []}})
+            if method == 'GET' and path.startswith('/v2/terminals/checkouts/'):
+                return self._square_response({'checkout': checkouts[path.rsplit('/', 1)[1]]})
+            if (method, path) == ('POST', '/v2/payments'):
+                request = kwargs['json']
+                self.assertEqual(request['source_id'], 'CASH')
+                self.assertFalse(request['autocomplete'])
+                self.assertEqual(request['order_id'], 'MIXEDORDER')
+                self.assertEqual(request['location_id'], 'SQUARELOC')
+                self.assertEqual(request['amount_money'], self._money(cash))
+                self.assertEqual(request['cash_details'], {'buyer_supplied_money': self._money(cash)})
+                self.assertTrue(request['idempotency_key'])
+                self.assertEqual(len(checkouts), len(cards))
+                with self.registry.cursor() as cr:
+                    env = api.Environment(cr, self.env.uid, {})
+                    draft = env['pos.order'].search([('session_id', '=', self.pos_session.id)])
+                    actual_cash = draft.payment_ids.filtered_domain([('payment_method_id', '=', self.cash_method.id)])
+                    self.assertEqual(actual_cash.amount, cash / 100)
+                    self.assertFalse(actual_cash.transaction_id)
+                if cash_request:
+                    self.assertEqual(request, cash_request)
+                else:
+                    cash_request.update(request)
+                    payments['CASH-1'] = {
+                        'id': 'CASH-1', 'order_id': 'MIXEDORDER', 'location_id': 'SQUARELOC',
+                        'reference_id': request['reference_id'], 'source_type': 'CASH', 'status': 'APPROVED',
+                        'amount_money': self._money(cash), 'total_money': self._money(cash),
+                        'cash_details': {'buyer_supplied_money': self._money(cash), 'change_back_money': self._money(0)},
+                    }
+                    if lose_cash:
+                        raise ConnectionError('Square recorded the cash before the response was lost')
+                return self._square_response({'payment': payments['CASH-1']})
+            if method == 'GET' and path.startswith('/v2/payments/'):
+                return self._square_response({'payment': payments[path.rsplit('/', 1)[1]]})
+            if (method, path) == ('GET', '/v2/orders/MIXEDORDER'):
+                if lose_readback:
+                    lose_readback = False
+                    raise ConnectionError('Square settlement readback was unavailable')
+                return self._square_response({'order': provider_order})
+            if (method, path) == ('POST', '/v2/orders/MIXEDORDER/pay'):
+                request = kwargs['json']
+                self.assertCountEqual(request['payment_ids'], payments)
+                self.assertEqual(len(request['payment_ids']), len(cards) + 1)
+                self.assertEqual(request['order_version'], 1)
+                self.assertTrue(request['idempotency_key'])
+                self.assertEqual({payment['status'] for payment in payments.values()}, {'APPROVED'})
+                with self.registry.cursor() as cr:
+                    env = api.Environment(cr, self.env.uid, {})
+                    native = env['pos.order'].search([('session_id', '=', self.pos_session.id)])
+                    self.assertEqual(native.state, 'draft')
+                    original_order.update(id=native.id, tender_ids=native.payment_ids.ids)
+                tenders = []
+                for payment_id in request['payment_ids']:
+                    payment = payments[payment_id]
+                    payment['status'] = 'COMPLETED'
+                    tenders.append({
+                        'payment_id': payment_id, 'location_id': 'SQUARELOC', 'type': payment['source_type'],
+                        'amount_money': payment['total_money'],
+                    })
+                provider_order.update(state='COMPLETED', version=2, tenders=tenders)
+                if lose_settlement:
+                    lose_readback = True
+                    raise ConnectionError('Square settled the mixed order before the response was lost')
+                return self._square_response({'order': provider_order})
+            self.fail(f'Unexpected Square request: {method} {path}')
+
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
+            self.start_pos_tour(tour)
+        self.assertEqual(mutations, [
+            '/v2/orders/calculate', '/v2/orders', *['/v2/terminals/checkouts'] * len(cards),
+            *['/v2/payments'] * (2 if lose_cash else 1), '/v2/orders/MIXEDORDER/pay',
+        ])
+        self.env.invalidate_all()
+        order = self.pos_session.order_ids
+        self.assertEqual(order.id, original_order['id'])
+        self.assertCountEqual(order.payment_ids.ids, original_order['tender_ids'])
+        self.assertEqual(order.state, 'paid')
+        cash_line = order.payment_ids.filtered(lambda payment: payment.payment_method_id == self.cash_method)
+        self.assertEqual(cash_line.amount, cash / 100)
+        self.assertEqual(cash_line.transaction_id, 'CASH-1')
+        self.assertFalse(cash_line.is_change)
+        card_lines = order.payment_ids - cash_line
+        self.assertCountEqual(
+            [(payment.amount, payment.payment_status, payment.transaction_id) for payment in card_lines],
+            [(amount / 100, 'done', f'CARD-{number}') for number, amount in enumerate(cards, 1)],
+        )
+        self.assertEqual({payment['status'] for payment in payments.values()}, {'COMPLETED'})
 
     def _included_vat(self):
         return self.env['account.tax'].create({

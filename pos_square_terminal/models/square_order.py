@@ -7,6 +7,7 @@ from odoo import api, fields, models
 from odoo.exceptions import UserError
 
 from ..square_api import SquareAPIError
+from .pos_order import minor_units
 
 
 def matches_money(value, amount, currency):
@@ -46,6 +47,8 @@ class SquareOrder(models.Model):
     pricing_issue = fields.Char(copy=False)
     square_order_id = fields.Char(index='btree_not_null', copy=False)
     split = fields.Boolean(copy=False)
+    cash_tenders = fields.Json(copy=False)
+    cash_recording = fields.Boolean(copy=False)
     settlement_request = fields.Json(copy=False)
     settlement_blocked = fields.Boolean(copy=False)
     cancel_requested = fields.Boolean(copy=False)
@@ -172,6 +175,143 @@ class SquareOrder(models.Model):
             and measurement.get('custom_unit') == requested['measurement_unit']['custom_unit']
         )
 
+    def _cash_payment_lines(self):
+        native_ids = {
+            tender['native_id'] for link in self for tender in (link.cash_tenders or [])
+        }
+        return self.order_id.payment_ids.filtered(lambda payment: payment.id in native_ids)
+
+    @staticmethod
+    def _cash_tender_gross(tender):
+        request = tender['request']
+        return request['amount_money']['amount'] + request.get('tip_money', {}).get('amount', 0)
+
+    def _cash_total_minor(self):
+        self.ensure_one()
+        return sum(self._cash_tender_gross(tender) for tender in self.cash_tenders or [])
+
+    def _cash_square_payment_ids(self):
+        self.ensure_one()
+        return [tender.get('payment_id') for tender in self.cash_tenders or []]
+
+    def _settlement_payment_ids(self, attempts):
+        return attempts.mapped('square_payment_id') + self._cash_square_payment_ids()
+
+    def _reserve_cash_tenders(self, payments):
+        self.ensure_one()
+        if not payments:
+            return
+        tenders = list(self.cash_tenders or [])
+        for payment in payments:
+            amount = {'amount': minor_units(payment.amount, self.currency_digits), 'currency': self.currency_code}
+            tenders.append({
+                'native_id': payment.id,
+                'native_uuid': payment.uuid,
+                'method_id': payment.payment_method_id.id,
+                'request': {
+                    'idempotency_key': str(uuid4()),
+                    'source_id': 'CASH',
+                    'autocomplete': False,
+                    'location_id': self.square_location_id,
+                    'reference_id': 'odoo-' + uuid4().hex,
+                    'amount_money': amount,
+                    'cash_details': {'buyer_supplied_money': amount},
+                },
+            })
+        self.cash_tenders = tenders
+
+    def _matches_native_cash(self, payments, *, verified=False):
+        self.ensure_one()
+        payments_by_id = {payment.id: payment for payment in payments}
+        for tender in self.cash_tenders or []:
+            payment = payments_by_id.get(tender['native_id'])
+            if not payment or (
+                payment.uuid != tender['native_uuid'] or payment.payment_method_id.id != tender['method_id']
+                or not payment.payment_method_id.is_cash_count or payment.is_change or payment.payment_status
+                or minor_units(payment.amount, self.currency_digits) != self._cash_tender_gross(tender)
+                or (verified and (not tender.get('payment_id') or payment.transaction_id != tender['payment_id']))
+            ):
+                return False
+        return True
+
+    def _read_cash_tender(self, tender):
+        payment_id = tender['payment_id']
+        path = '/v2/payments/' + quote(payment_id, safe='')
+        payment = self.connection_id._request('GET', path).get('payment')
+        return self._verify_cash_tender(tender, payment, expected_id=payment_id)
+
+    def _verify_cash_tender(self, tender, payment, *, expected_id=None):
+        request = tender['request']
+        amount = request['amount_money']['amount']
+        tip = request.get('tip_money', {}).get('amount', 0)
+        supplied = request['cash_details']['buyer_supplied_money']['amount']
+        if not (
+            isinstance(payment, dict) and isinstance(payment.get('id'), str) and payment['id']
+            and (not expected_id or payment['id'] == expected_id)
+            and payment.get('order_id') == self.square_order_id
+            and payment.get('location_id') == self.square_location_id
+            and payment.get('reference_id') == request['reference_id']
+            and payment.get('source_type') == 'CASH'
+            and payment.get('status') in ('APPROVED', 'PENDING', 'COMPLETED', 'CANCELED', 'FAILED')
+            and matches_money(payment.get('amount_money'), amount, self.currency_code)
+            and self._matches_optional_money(payment, 'tip_money', tip)
+            and matches_money(payment.get('total_money'), amount + tip, self.currency_code)
+            and isinstance(payment.get('cash_details'), dict)
+            and matches_money(payment['cash_details'].get('buyer_supplied_money'), supplied, self.currency_code)
+            and self._matches_optional_money(payment['cash_details'], 'change_back_money', supplied - amount - tip)
+        ):
+            raise ValueError('Square cash payment does not match the original Odoo cash tender')
+        return payment
+
+    def _record_cash_tenders(self, attempt):
+        self.ensure_one()
+        try:
+            attempt._check_provider_scope()
+            for tender in deepcopy(self.cash_tenders):
+                if tender.get('payment_id'):
+                    continue
+                request = {**tender['request'], 'order_id': self.square_order_id}
+                payment = self.connection_id._request('POST', '/v2/payments', payload=request).get('payment')
+                payment = self._verify_cash_tender(tender, payment)
+                self._update_cash_tender(tender, payment_id=payment['id'])
+        except (SquareAPIError, UserError, ValueError):
+            return False
+        return True
+
+    def _update_cash_tender(self, tender, **values):
+        self.cash_tenders = [
+            {**entry, **values} if entry['native_id'] == tender['native_id'] else entry
+            for entry in self.cash_tenders
+        ]
+
+    def _release_cash_tenders(self, *, request):
+        self.ensure_one()
+        if not self.cash_recording:
+            return True
+        try:
+            for tender in self.cash_tenders:
+                if tender.get('released'):
+                    continue
+                payment_id = tender.get('payment_id')
+                if not payment_id:
+                    if not request:
+                        return False
+                    self.connection_id._request('POST', '/v2/payments/cancel', payload={
+                        'idempotency_key': tender['request']['idempotency_key'],
+                    })
+                else:
+                    payment = self._read_cash_tender(tender)
+                    if request and payment['status'] == 'APPROVED':
+                        path = '/v2/payments/' + quote(payment_id, safe='') + '/cancel'
+                        self.connection_id._request('POST', path)
+                        payment = self._read_cash_tender(tender)
+                    if payment['status'] not in ('CANCELED', 'FAILED'):
+                        return False
+                self._update_cash_tender(tender, released=True)
+        except (SquareAPIError, UserError, ValueError):
+            return False
+        return True
+
     def _prepare_settlement(self, attempts):
         self.ensure_one()
         path = '/v2/orders/' + quote(self.square_order_id, safe='')
@@ -180,10 +320,10 @@ class SquareOrder(models.Model):
                 attempt._check_provider_scope()
             order = self._read_settlement_order(path)
             version = order.get('version')
-            payment_ids = attempts.mapped('square_payment_id')
+            payment_ids = self._settlement_payment_ids(attempts)
             if (
                 order['state'] == 'OPEN' and type(version) is int and version > 0
-                and all(payment_ids) and len(set(payment_ids)) == len(attempts)
+                and all(payment_ids) and len(set(payment_ids)) == len(payment_ids)
                 and self._matches_settlement_tenders(order, attempts, complete=False)
             ):
                 # The cashier calls settlement in a separate RPC after this intent commits.
@@ -198,7 +338,7 @@ class SquareOrder(models.Model):
     def _settle(self, attempts, *, read_only=False):
         self.ensure_one()
         request = self.settlement_request
-        if not request or request['payment_ids'] != attempts.mapped('square_payment_id'):
+        if not request or request['payment_ids'] != self._settlement_payment_ids(attempts):
             return
         path = '/v2/orders/' + quote(self.square_order_id, safe='')
         try:
@@ -227,6 +367,9 @@ class SquareOrder(models.Model):
                 for attempt, payment in zip(attempts, payments):
                     if attempt.state != 'verified':
                         attempt._mark_verified(payment)
+                native_cash = {line.id: line for line in self._cash_payment_lines()}
+                for tender in self.cash_tenders or []:
+                    native_cash[tender['native_id']]._square_set_verified(tender['payment_id'], cash=True)
         released = {'CANCELED', 'FAILED'}
         self.settlement_blocked = (
             order['state'] in ('OPEN', 'CANCELED')
@@ -240,6 +383,7 @@ class SquareOrder(models.Model):
             attempt._check_provider_scope()
         order = self._read_settlement_order(path)
         payments = [attempt._read_payment(attempt.square_payment_id) for attempt in attempts]
+        payments.extend(self._read_cash_tender(tender) for tender in self.cash_tenders or [])
         return order, payments
 
     def _read_settlement_order(self, path):
@@ -256,17 +400,22 @@ class SquareOrder(models.Model):
         tenders = order.get('tenders', [])
         if not isinstance(tenders, list):
             return False
-        expected = {attempt.square_payment_id: attempt.amount_minor for attempt in attempts}
+        expected = {attempt.square_payment_id: ('CARD', attempt.amount_minor) for attempt in attempts}
+        expected.update({
+            tender['payment_id']: ('CASH', self._cash_tender_gross(tender))
+            for tender in (self.cash_tenders or []) if tender.get('payment_id')
+        })
         for tender in tenders:
             if not isinstance(tender, dict):
                 return False
             payment_id = tender.get('payment_id') or tender.get('id')
             if not isinstance(payment_id, str) or payment_id not in expected:
                 return False
+            source_type, amount = expected.pop(payment_id)
             if (
-                tender.get('type') != 'CARD'
+                tender.get('type') != source_type
                 or tender.get('location_id', self.square_location_id) != self.square_location_id
-                or not matches_money(tender.get('amount_money'), expected.pop(payment_id), self.currency_code)
+                or not matches_money(tender.get('amount_money'), amount, self.currency_code)
             ):
                 return False
         return not complete or not expected

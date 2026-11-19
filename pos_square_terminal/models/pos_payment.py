@@ -9,6 +9,7 @@ class PosPayment(models.Model):
 
     square_attempt_state = fields.Char(compute='_compute_square_attempt_state')
     square_attempt_reference = fields.Char(compute='_compute_square_attempt_state')
+    square_cash_reserved = fields.Boolean(compute='_compute_square_attempt_state')
 
     _square_evidence_fields = {
         'payment_status', 'transaction_id', 'card_type', 'card_brand', 'card_no', 'cardholder_name',
@@ -19,10 +20,12 @@ class PosPayment(models.Model):
     def _compute_square_attempt_state(self):
         attempts = self.pos_order_id._square_attempts()
         attempts_by_payment = {attempt.payment_id.id: attempt for attempt in attempts}
+        reserved_cash_ids = set(attempts.square_order_link_id.filtered(lambda link: not link.cancelled)._cash_payment_lines().ids)
         for payment in self:
             attempt = attempts_by_payment.get(payment.id)
             payment.square_attempt_state = attempt._cashier_state() if attempt else False
             payment.square_attempt_reference = attempt.reference if attempt else False
+            payment.square_cash_reserved = payment.id in reserved_cash_ids
 
     @api.model_create_multi
     def create(self, vals_list):
@@ -58,7 +61,7 @@ class PosPayment(models.Model):
         orders._square_lock_checkout(touch=True)
         reserved = orders._square_reserved_attempts()
         reserved_order_ids = set(reserved.order_id.ids)
-        reserved_payment_ids = set(reserved.payment_id.ids)
+        reserved_payment_ids = set((reserved.payment_id | reserved.square_order_link_id._cash_payment_lines()).ids)
         for payment in self:
             payment_vals = dict(vals)
             new_method = self.env['pos.payment.method'].browse(vals.get('payment_method_id') or [])
@@ -92,16 +95,19 @@ class PosPayment(models.Model):
                 order._square_check_new_share(payment, order._square_current_attempts())
         return True
 
-    def _square_set_verified(self, payment_id):
+    def _square_set_verified(self, payment_id, *, cash=False):
         self.ensure_one()
-        super(PosPayment, self.sudo()).write({'payment_status': 'done', 'transaction_id': payment_id})
-        self.invalidate_recordset(['square_attempt_state', 'square_attempt_reference'])
+        values = {'transaction_id': payment_id}
+        if not cash:
+            values['payment_status'] = 'done'
+        super(PosPayment, self.sudo()).write(values)
+        self.invalidate_recordset(['square_attempt_state', 'square_attempt_reference', 'square_cash_reserved'])
 
     def unlink(self):
         self.check_access('unlink')
         orders = self.pos_order_id
         orders._square_lock_checkout(touch=True)
         attempts = orders._square_reserved_attempts()
-        if set(attempts.payment_id.ids).intersection(self.ids):
+        if (attempts.payment_id | attempts.square_order_link_id._cash_payment_lines()) & self:
             raise UserError(_("The original tender is reserved by a Square payment."))
         return super().unlink()

@@ -352,6 +352,8 @@ class SquarePaymentAttempt(models.Model):
                 return 'canceling'
             if self.square_order_link_id.settlement_request:
                 return 'settlement_blocked' if self.square_order_link_id.settlement_blocked else 'settling'
+            if self.square_order_link_id.cash_recording:
+                return 'recording_cash'
             if self.provider_status == 'PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED':
                 return 'unsupported_split'
         return self.state
@@ -360,6 +362,14 @@ class SquarePaymentAttempt(models.Model):
         self.ensure_one()
         status = self._cashier_tender_status()
         if self.square_order_link_id.split:
+            link = self.square_order_link_id
+            status['cash_tenders'] = {
+                tender['native_uuid']: {
+                    'reserved': not link.cancelled,
+                    'payment_id': tender.get('payment_id') if self.state == 'verified' else False,
+                }
+                for tender in link.cash_tenders or []
+            }
             status['tenders'] = {
                 attempt.payment_uuid: attempt._cashier_tender_status()
                 for attempt in self.order_id._square_current_attempts()

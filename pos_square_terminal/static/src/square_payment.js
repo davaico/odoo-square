@@ -29,6 +29,14 @@ function isReservedSquarePayment(line) {
     );
 }
 
+function isNativeCashMethod(method) {
+    return method?.type === "cash" && method.payment_method_type === "none" && !method.use_payment_terminal;
+}
+
+function isReservedSquareTender(line) {
+    return isReservedSquarePayment(line) || Boolean(line?.square_cash_reserved);
+}
+
 function showSquareMessage(dialog, body) {
     dialog.add(AlertDialog, { title: _t("Square Terminal"), body });
 }
@@ -45,6 +53,13 @@ class SquarePayment extends PaymentInterface {
         );
         let cancelled = false;
         for (const tender of [...order.payment_ids]) {
+            const cash = status.cash_tenders?.[tender.uuid];
+            if (cash) {
+                if (!tender.transaction_id || cash.payment_id) {
+                    tender.update({ square_cash_reserved: cash.reserved, transaction_id: cash.payment_id });
+                }
+                continue;
+            }
             const result = tender.uuid === line.uuid ? status : status.tenders?.[tender.uuid];
             if (!result || (tender.square_attempt_state === "verified" && result.state !== "verified")) {
                 continue;
@@ -79,6 +94,9 @@ class SquarePayment extends PaymentInterface {
         if (status.state === "authorized") {
             status = await this.call(line, "square_prepare_settlement", status.reference);
         }
+        if (status.state === "recording_cash") {
+            status = await this.call(line, "square_record_cash", status.reference);
+        }
         if (["settling", "settlement_blocked"].includes(status.state)) {
             status = await this.call(line, "square_settle_payment", status.reference);
         }
@@ -90,7 +108,7 @@ class SquarePayment extends PaymentInterface {
             const status = await this.call(line, "square_check_payment");
             return await this.settleIfCovered(line, status);
         } catch {
-            if (!["verified", "cancelled", "authorized", "settling"].includes(line.square_attempt_state)) {
+            if (!["verified", "cancelled", "authorized", "recording_cash", "settling"].includes(line.square_attempt_state)) {
                 line.update({ square_attempt_state: "uncertain" });
             }
             return false;
@@ -101,7 +119,7 @@ class SquarePayment extends PaymentInterface {
         try {
             return await this.call(line, "square_cancel_payment", line.square_attempt_reference);
         } catch {
-            if (!["verified", "cancelled", "authorized", "settling"].includes(line.square_attempt_state)) {
+            if (!["verified", "cancelled", "authorized", "recording_cash", "settling"].includes(line.square_attempt_state)) {
                 line.update({ square_attempt_state: "uncertain" });
             }
         }
@@ -167,7 +185,7 @@ class SquarePayment extends PaymentInterface {
                     line.set_payment_status("pending");
                 }
                 showSquareMessage(this.env.services.dialog, error.data?.message || error.message);
-            } else if (!["verified", "cancelled", "authorized", "settling"].includes(line.square_attempt_state)) {
+            } else if (!["verified", "cancelled", "authorized", "recording_cash", "settling"].includes(line.square_attempt_state)) {
                 line.update({ square_attempt_state: "uncertain" });
             }
         }
@@ -179,7 +197,7 @@ register_payment_method("square_terminal", SquarePayment);
 
 patch(PosPayment.prototype, {
     set_amount() {
-        if (!isReservedSquarePayment(this)) {
+        if (!isReservedSquareTender(this)) {
             return super.set_amount(...arguments);
         }
     },
@@ -197,9 +215,19 @@ patch(PosPayment.prototype, {
 
 patch(PosOrder.prototype, {
     squareCanAddShare(method) {
-        return method?.use_payment_terminal === "square_terminal" &&
-            this.payment_ids.every((line) => line.square_attempt_state === "authorized") &&
-            this.get_due() > 0;
+        return (method?.use_payment_terminal === "square_terminal" || isNativeCashMethod(method)) &&
+            this.payment_ids.every((line) =>
+                line.square_attempt_state === "authorized" || isNativeCashMethod(line.payment_method_id)
+            ) && this.get_due() > 0;
+    },
+    squareCanSettleWithCash() {
+        return Boolean(this.squareAuthorizedAmount) &&
+            this.payment_ids.every((line) =>
+                line.square_attempt_state === "authorized" || isNativeCashMethod(line.payment_method_id)
+            ) && this.payment_ids.some((line) => isNativeCashMethod(line.payment_method_id)) && this.get_due() === 0;
+    },
+    canBeValidated() {
+        return super.canBeValidated(...arguments) || this.squareCanSettleWithCash();
     },
     get squareAuthorizedAmount() {
         return this.payment_ids.reduce(
@@ -236,7 +264,7 @@ patch(PosOrder.prototype, {
         return super.add_paymentline(...arguments);
     },
     remove_paymentline(line) {
-        if (!isReservedSquarePayment(line)) {
+        if (!isReservedSquareTender(line)) {
             return super.remove_paymentline(...arguments);
         }
     },
@@ -292,8 +320,9 @@ patch(PaymentScreen.prototype, {
     },
     async addNewPaymentLine(method) {
         if (this.squarePaymentReserved && !this.currentOrder.squareCanAddShare(method)) {
-            const message = this.currentOrder.squareAuthorizedAmount && method.use_payment_terminal !== "square_terminal"
-                ? _t("Use another Square card or abandon the split to change tender.")
+            const message = this.currentOrder.squareAuthorizedAmount &&
+                method.use_payment_terminal !== "square_terminal" && !isNativeCashMethod(method)
+                ? _t("Use cash or another Square card, or abandon the split to change tender.")
                 : _t("The balance is reserved by the original Square payment.");
             showSquareMessage(this.dialog, message);
             return false;
@@ -302,7 +331,7 @@ patch(PaymentScreen.prototype, {
     },
     deletePaymentLine(uuid) {
         const line = this.paymentLines.find((line) => line.uuid === uuid);
-        if (!isReservedSquarePayment(line)) {
+        if (!isReservedSquareTender(line)) {
             return super.deletePaymentLine(...arguments);
         }
     },
@@ -312,6 +341,30 @@ patch(PaymentScreen.prototype, {
             this.pos.mainScreen.component !== this.constructor
         )) {
             return;
+        }
+        if (this.currentOrder.squareCanSettleWithCash()) {
+            this.numberBuffer.capture();
+            if (!this.currentOrder.squareCanSettleWithCash()) {
+                return;
+            }
+            const order = this.currentOrder;
+            const card = order.payment_ids.find((line) => line.square_attempt_state === "authorized");
+            try {
+                const synced = await this.pos.syncAllOrders({ orders: [order], throw: true });
+                const saved = synced?.find((record) => record.uuid === order.uuid && record.state === "draft");
+                const savedCard = saved?.payment_ids.find((line) => line.uuid === card.uuid);
+                if (!savedCard) {
+                    showSquareMessage(this.dialog, _t("Save the original sale before settling with cash."));
+                    return;
+                }
+                if (!await savedCard.payment_method_id.payment_terminal.checkPayment(savedCard)) {
+                    this.selectPaymentLine(savedCard.uuid);
+                    return;
+                }
+            } catch (error) {
+                showSquareMessage(this.dialog, error.data?.message || _t("Save the original sale before settling with cash."));
+                return;
+            }
         }
         if (this.paymentLines.some((line) => isSquarePayment(line) && line.square_attempt_state !== "verified")) {
             showSquareMessage(this.dialog, _t("Wait for Square to verify this payment before validating the sale."));
@@ -394,6 +447,7 @@ patch(PaymentScreenStatus.prototype, {
 
 patch(PaymentScreenPaymentLines.prototype, {
     isReservedSquarePayment,
+    isReservedSquareTender,
     squareCancelLabel(line) {
         if (line.square_attempt_state === "canceling") {
             return _t("Continue cancellation");
@@ -417,6 +471,9 @@ patch(PaymentScreenPaymentLines.prototype, {
         }
         if (line.square_attempt_state === "authorized") {
             return _t("Authorized by Square");
+        }
+        if (line.square_attempt_state === "recording_cash") {
+            return _t("Check the original cash recording before taking another payment.");
         }
         if (line.square_attempt_state === "settling") {
             return _t("Check the original Square settlement before taking another payment.");

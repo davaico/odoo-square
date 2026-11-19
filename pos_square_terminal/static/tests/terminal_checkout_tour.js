@@ -56,7 +56,7 @@ registry.category("web_tour.tours").add("SquareTerminalDiscountedFraction", {
     ],
 });
 
-registry.category("web_tour.tours").add("SquareTerminalComboSummary", {
+registry.category("web_tour.tours").add("SquareTerminalMixedComboRecovery", {
     steps: () => [
         ...Chrome.startPoS(),
         ...ProductScreen.addOrderline("Lunch Combo"),
@@ -66,15 +66,114 @@ registry.category("web_tour.tours").add("SquareTerminalComboSummary", {
             ...ProductScreen.selectedOrderlineHasDirect("Whiteboard Pen", 1, "18.00"),
         ]),
         ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        PaymentScreen.enterPaymentLineAmount("Checkout Cash", "20"),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
-        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "60.00"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "40.00"),
         { trigger: ".payment-screen .send_payment_request", run: "click" },
+        {
+            trigger: ".payment-screen .electronic_status:contains('Check the original Square settlement')",
+            run() {
+                const order = window.posmodel.get_order();
+                sessionStorage.setItem("squareMixedOrder", order.uuid);
+                sessionStorage.setItem("squareMixedTenders", order.payment_ids.map((line) => line.uuid).sort().join());
+            },
+        },
+        refresh(),
+        { trigger: "body:not(:has(.pos-loader))" },
+        Chrome.clickMenuOption("Orders"),
+        {
+            trigger: ".ticket-screen .order-row",
+            async run(helpers) {
+                const order = window.posmodel.models["pos.order"].getBy("uuid", sessionStorage.getItem("squareMixedOrder"));
+                const rows = [...document.querySelectorAll(".ticket-screen .order-row")].filter((row) =>
+                    [...row.querySelectorAll(".col")].some((column) => column.textContent.trim() === order?.pos_reference));
+                if (rows.length !== 1) {
+                    throw new Error("Original mixed sale is missing from the native Orders screen");
+                }
+                await helpers.dblclick(rows[0]);
+            },
+        },
+        {
+            trigger: ".payment-screen .square-check-status:contains('Check status')",
+            run() {
+                const order = window.posmodel.get_order();
+                if (order.uuid !== sessionStorage.getItem("squareMixedOrder") ||
+                    order.payment_ids.map((line) => line.uuid).sort().join() !== sessionStorage.getItem("squareMixedTenders")) {
+                    throw new Error("The register must recover the original sale and both native tenders");
+                }
+                this.anchor.click();
+            },
+        },
         ...ReceiptScreen.receiptIsThere(),
         ...ReceiptScreen.receiptAmountTotalIs("60.00"),
         { trigger: ".pos-receipt .orderline:contains('Lunch Combo')" },
         { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
         { trigger: ".pos-receipt .orderline:contains('Monitor Stand')" },
         { trigger: ".pos-receipt .orderline:contains('Whiteboard Pen')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash'):contains('20.00')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Square Counter'):contains('40.00')" },
+    ].flat(),
+});
+
+registry.category("web_tour.tours").add("SquareTerminalCardsThenCash", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.clickNumpad("5"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "5.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
+        ...PaymentScreen.clickNumpad("6"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "5.00"),
+        { trigger: ".payment-screen .payment-status-remaining .amount:contains('7.00')" },
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.clickNumpad("4"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "4.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
+        { trigger: ".payment-screen .payment-status-remaining .amount:contains('3.00')" },
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "3.00"),
+        ...PaymentScreen.clickNumpad("2"),
+        ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "2.00"),
+        ...PaymentScreen.clickPaymentline("Square Counter", "4.00"),
+        ...PaymentScreen.clickPaymentline("Checkout Cash", "2.00"),
+        ...PaymentScreen.clickNumpad("3"),
+        ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "3.00"),
+        ...PaymentScreen.clickValidate(),
+        ...PaymentScreen.clickPaymentline("Square Counter", "4.00"),
+        { trigger: ".payment-screen .electronic_status:contains('Check the original cash recording')" },
+        {
+            trigger: ".payment-screen .paymentline:has(.payment-infos:contains('Checkout Cash')):not(:has(.delete-button))",
+        },
+        { trigger: ".payment-screen .square-check-status:contains('Check status')", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("12.00"),
+        { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash'):contains('3.00')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Square Counter'):contains('5.00')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Square Counter'):contains('4.00')" },
+    ].flat(),
+});
+
+registry.category("web_tour.tours").add("SquareTerminalRejectsVoucher", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Store Voucher"),
+        ...PaymentScreen.clickNumpad("2"),
+        ...PaymentScreen.selectedPaymentlineHas("Store Voucher", "2.00"),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "10.34"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        {
+            trigger: ".modal:contains('Square Terminal only supports combining Odoo cash and Square cards')" +
+                ":contains('Remove Store Voucher') .btn-primary",
+            run: "click",
+        },
     ],
 });
 

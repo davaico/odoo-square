@@ -65,7 +65,7 @@ class PosOrder(models.Model):
         if (
             order.state != 'draft' or payment.payment_status != 'waiting'
             or payment.payment_method_id.use_payment_terminal != 'square_terminal'
-            or order.payment_ids - attempts.payment_id != payment
+            or payment in attempts.payment_id
         ):
             raise UserError(_("Send one unpaid Square card share at a time."))
 
@@ -78,13 +78,16 @@ class PosOrder(models.Model):
         terminal = method.sudo().square_terminal_id
 
         connection = terminal.connection_id
+        link = attempts.square_order_link_id
+        currency = terminal.location_id.currency_code
+        digits = 0 if currency == 'JPY' else 2
+        other_tenders = order.payment_ids - attempts.payment_id - link._cash_payment_lines() - payment
+        cash = order._square_cash_tenders(other_tenders, digits)
+        cash_minor = sum(minor_units(line.amount, digits) for line in cash)
         device_key = attempts._device_key(connection.environment, connection.merchant_id, terminal.device_id)
         if attempts.search_count([('active_device_key', '=', device_key)], limit=1):
             return {'state': 'busy'}
 
-        link = attempts.square_order_link_id
-        currency = terminal.location_id.currency_code
-        digits = 0 if currency == 'JPY' else 2
         amount_minor = minor_units(payment.amount, digits)
         if link:
             order._square_check_new_share(payment, attempts)
@@ -99,7 +102,7 @@ class PosOrder(models.Model):
             total_minor, line_items, tip_minor = order._square_priced_basket(digits)
             if tip_minor:
                 raise UserError(_("Square Terminal cannot send an Odoo-entered tip with this payment."))
-            if total_minor > 2_147_483_647 or not 0 < amount_minor <= total_minor or payment.is_change:
+            if total_minor > 2_147_483_647 or not 0 < amount_minor <= total_minor - cash_minor or payment.is_change:
                 raise UserError(_("Enter a Square card share within the unpaid Odoo order total."))
 
         try:
@@ -109,6 +112,7 @@ class PosOrder(models.Model):
                         terminal.location_id, digits, total_minor, line_items, tip_minor,
                         split=amount_minor < total_minor,
                     )
+                link._reserve_cash_tenders(cash)
                 attempt_reference = 'odoo-' + uuid4().hex
                 checkout = {
                     'reference_id': attempt_reference,
@@ -273,15 +277,38 @@ class PosOrder(models.Model):
         if (
             attempt.reference == attempt_reference and attempt.state == 'authorized'
             and link.split and not link.cancel_requested and not link.settlement_request
+            and not link.cash_recording
         ):
             order = attempt.order_id.with_user(self.env.user)
             attempts = order._square_current_attempts()
-            if (
-                all(share.state == 'authorized' for share in attempts)
-                and sum(attempts.mapped('amount_minor')) == link.total_minor + link.tip_minor
-            ):
-                order._square_check_session()
-                order._square_check_reserved_amounts(attempts)
+            if all(share.state == 'authorized' for share in attempts):
+                pending = order.payment_ids - attempts.payment_id - link._cash_payment_lines()
+                if any(line.payment_method_id.use_payment_terminal == 'square_terminal' for line in pending):
+                    return attempt._cashier_status()
+                cash = order._square_cash_tenders(pending, link.currency_digits)
+                covered = link._cash_total_minor() + sum(attempts.mapped('amount_minor'))
+                added_cash = sum(minor_units(line.amount, link.currency_digits) for line in cash)
+                if covered + added_cash == link.total_minor + link.tip_minor:
+                    order._square_check_session()
+                    link._reserve_cash_tenders(cash)
+                    order._square_check_reserved_amounts(attempts)
+                    if link.cash_tenders:
+                        # Commit the recording intent before issuing any Cash CreatePayment.
+                        link.cash_recording = True
+                    else:
+                        link._prepare_settlement(attempts)
+        return attempt._cashier_status()
+
+    @api.model
+    def square_record_cash(self, order_uuid, payment_uuid, attempt_reference):
+        attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=False)
+        if attempt.reference == attempt_reference and attempt._cashier_state() == 'recording_cash':
+            order = attempt.order_id.with_user(self.env.user)
+            attempts = order._square_current_attempts()
+            order._square_check_session()
+            order._square_check_reserved_amounts(attempts)
+            link = attempt.square_order_link_id
+            if all(share.state == 'authorized' for share in attempts) and link._record_cash_tenders(attempt):
                 link._prepare_settlement(attempts)
         return attempt._cashier_status()
 
@@ -328,7 +355,10 @@ class PosOrder(models.Model):
             attempt._check_provider_scope()
         except UserError:
             return
+        if not link._release_cash_tenders(request=request):
+            return
         released_payment_ids = related_attempts.filtered('square_payment_id').mapped('square_payment_id')
+        released_payment_ids.extend(filter(None, link._cash_square_payment_ids()))
         link._cancel_unpaid_order(released_payment_ids, request=request)
         if link.cancelled:
             self._square_lock_checkout(touch=True)
@@ -690,27 +720,51 @@ class PosOrder(models.Model):
         by_payment = {attempt.payment_id.id: attempt.id for attempt in self._square_reserved_attempts()}
         return self.env['pos.square.payment.attempt'].sudo().browse(list(by_payment.values()))
 
+    def _square_cash_tenders(self, payments, digits):
+        self.ensure_one()
+        for payment in payments:
+            method = payment.payment_method_id
+            if (
+                not method.is_cash_count or method.payment_method_type != 'none' or method.use_payment_terminal
+                or method.company_id != self.company_id or not method.active
+                or method not in self.config_id.payment_method_ids
+            ):
+                raise UserError(_("Square Terminal only supports combining Odoo cash and Square cards. Remove %s before sending.",
+                                  method.display_name))
+            if (
+                not payment.uuid or payment.is_change or payment.payment_status
+                or any(payment[field] for field in payment._square_evidence_fields - {'payment_status'})
+                or minor_units(payment.amount, digits) <= 0
+            ):
+                raise UserError(_("Record a positive cash share without change for this Square sale."))
+        return payments
+
     def _square_check_new_share(self, payment, attempts):
         self.ensure_one()
         link = attempts.square_order_link_id
+        pending = self.payment_ids - attempts.payment_id - link._cash_payment_lines()
+        cards = pending.filtered(lambda line: line.payment_method_id.use_payment_terminal == 'square_terminal')
+        cash = self._square_cash_tenders(pending - cards, link.currency_digits)
         if (
             self.state != 'draft' or not link.split or link.cancel_requested or link.settlement_request
-            or any(attempt.state != 'authorized' for attempt in attempts)
-            or self.payment_ids - attempts.payment_id != payment
-            or payment.payment_method_id.use_payment_terminal != 'square_terminal'
-            or payment.is_change or not payment.uuid
-            or not 0 < minor_units(payment.amount, link.currency_digits)
-            <= link.total_minor + link.tip_minor - sum(attempts.mapped('amount_minor'))
+            or link.cash_recording or any(attempt.state != 'authorized' for attempt in attempts)
+            or payment not in pending or len(cards) > 1
+            or any(card.is_change or not card.uuid for card in cards)
+            or any(minor_units(card.amount, link.currency_digits) <= 0 for card in cards)
+            or sum(minor_units(line.amount, link.currency_digits) for line in cash | cards)
+            > link.total_minor + link.tip_minor - link._cash_total_minor() - sum(attempts.mapped('amount_minor'))
         ):
-            raise UserError(_("Add only one Square card share within the remaining balance."))
+            raise UserError(_("Add cash or one Square card share within the remaining balance."))
 
     def _square_check_reserved_amounts(self, attempts):
         self.ensure_one()
         link = attempts.square_order_link_id
-        total = sum(attempts.mapped('amount_minor'))
+        total = sum(attempts.mapped('amount_minor')) + link._cash_total_minor()
         digits = link.currency_digits
+        cash = link._cash_payment_lines()
         if (
-            set(self.payment_ids.ids) != set(attempts.payment_id.ids)
+            set(self.payment_ids.ids) != set((attempts.payment_id | cash).ids)
+            or len(cash) != len(link.cash_tenders or [])
             or self.uuid != link.order_uuid or self.currency_id.name != link.currency_code
             or self.amount_return or minor_units(self.amount_total, digits) != link.total_minor + link.tip_minor
             or (link.split and not 0 < total <= link.total_minor + link.tip_minor)
@@ -721,6 +775,7 @@ class PosOrder(models.Model):
                 or minor_units(attempt.payment_id.amount, digits) != attempt.amount_minor
                 for attempt in attempts
             )
+            or not link._matches_native_cash(cash)
         ):
             raise UserError(_("The Odoo sale differs from the reserved Square payment."))
 
@@ -733,8 +788,9 @@ class PosOrder(models.Model):
             if (
                 not attempts or any(attempt.state != 'verified' for attempt in attempts)
                 or (link.split and (
-                    sum(attempts.mapped('amount_minor')) != link.total_minor + link.tip_minor
-                    or attempts.mapped('square_payment_id') != (link.settlement_request or {}).get('payment_ids')
+                    sum(attempts.mapped('amount_minor')) + link._cash_total_minor() != link.total_minor + link.tip_minor
+                    or link._settlement_payment_ids(attempts) != (link.settlement_request or {}).get('payment_ids')
+                    or not link._matches_native_cash(link._cash_payment_lines(), verified=True)
                 ))
             ):
                 raise UserError(_("Square has not verified payment for this sale."))

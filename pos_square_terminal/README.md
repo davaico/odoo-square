@@ -20,13 +20,13 @@ For Sandbox, select **Use Sandbox Simulator** instead of generating a code. The 
 
 For a replacement device, add a new terminal record and switch the payment method after closing the register session. Create a new connection if the company, application or environment changes, and keep the original connection available for historical payment checks. Reauthorize that original connection with the same merchant if Square revokes its grant.
 
-## Take a single card payment
+## Take payments at the register
 
-1. Add the items in Odoo and open the POS payment screen. Select the named Square payment method for the full balance, then select **Send**.
+1. Add the items in Odoo and open the POS payment screen. Select the named Square payment method and enter the share to collect, then select **Send**.
 2. Ask the customer to pay on the selected Square Terminal. Keep the original sale open while Odoo verifies the payment. If Square's result is uncertain, keep the original sale available for investigation before taking another payment.
 3. Issue the itemized Odoo receipt when the sale completes. If the register requires manual validation, select **Validate** after the payment shows as successful.
 
-This checkout supports a single card tender for ordinary untaxed items at their configured prices. Odoo uses the configured priced basket and sends the payment amount automatically. Cash-only sales can be completed using the existing cash method.
+For a mixed sale, enter the cash collected and send each Square card share for the balance. After a card authorization, you can also enter the remaining cash and select **Validate**. Use exact shares that add up to the sale total. Odoo keeps the original tenders and records the cash on the same Square order when the full balance is covered. If checkout is interrupted, reopen the original sale and choose **Check status** on a Square line. Cash-only sales use the existing Odoo cash method.
 
 ## Recover and review payments
 

@@ -2,10 +2,10 @@
 <templates xml:space="preserve">
     <t t-name="pos_square_terminal.SquarePaymentLines" t-inherit="point_of_sale.PaymentScreenPaymentLines" t-inherit-mode="extension">
         <xpath expr="//t[@t-if=&quot;!line.payment_status or !['done', 'reversed', 'waitingCard', 'waitingCapture'].includes(line.payment_status)&quot;]" position="attributes">
-            <attribute name="t-if">!this.isReservedSquarePayment(line) and (!line.payment_status or !['done', 'reversed', 'waitingCard', 'waitingCapture'].includes(line.payment_status))</attribute>
+            <attribute name="t-if">!this.isReservedSquareTender(line) and (!line.payment_status or !['done', 'reversed', 'waitingCard', 'waitingCapture'].includes(line.payment_status))</attribute>
         </xpath>
         <xpath expr="//t[@t-if=&quot;!line.payment_status or !['done', 'reversed'].includes(line.payment_status)&quot;]" position="attributes">
-            <attribute name="t-if">!this.isReservedSquarePayment(line) and (!line.payment_status or !['done', 'reversed'].includes(line.payment_status))</attribute>
+            <attribute name="t-if">!this.isReservedSquareTender(line) and (!line.payment_status or !['done', 'reversed'].includes(line.payment_status))</attribute>
         </xpath>
         <xpath expr="//div[@t-att-class='unselectedLineClass(line)']/div[hasclass('payment-infos')]" position="after">
             <span class="electronic_status me-3" t-if="line.square_attempt_state == 'authorized'"
