@@ -1740,6 +1740,52 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 order.square_prepare_payment(order.uuid, order.payment_ids.uuid)
             provider.assert_not_called()
 
+    def test_configured_basket_surcharge_reaches_square_as_a_summary(self):
+        attribute = self.env['product.attribute'].create({
+            'name': 'Topping', 'create_variant': 'no_variant', 'display_type': 'radio',
+            'value_ids': [Command.create({'name': 'Plain'}), Command.create({'name': 'Avocado'})],
+        })
+        sandwich = self.env['product.product'].create({
+            'name': 'Sandwich', 'list_price': 10, 'available_in_pos': True,
+            'taxes_id': [Command.clear()],
+            'attribute_line_ids': [Command.create({
+                'attribute_id': attribute.id, 'value_ids': [Command.set(attribute.value_ids.ids)],
+            })],
+        })
+        avocado = sandwich.attribute_line_ids.product_template_value_ids.filtered(
+            lambda value: value.name == 'Avocado',
+        )
+        avocado.price_extra = 2.25
+        self.env['product.pricelist.item'].create({
+            'pricelist_id': self.main_pos_config.pricelist_id.id,
+            'applied_on': '0_product_variant', 'product_id': sandwich.id,
+            'compute_price': 'percentage', 'percent_price': 20,
+        })
+        choice = self.env['product.combo'].create({
+            'name': 'Sandwich choice', 'combo_item_ids': [Command.create({
+                'product_id': sandwich.id, 'extra_price': 1.75,
+            })],
+        })
+        combo = self.env['product.product'].create({
+            'name': 'Lunch Choice', 'type': 'combo', 'list_price': 20, 'available_in_pos': True,
+            'taxes_id': [Command.clear()], 'combo_ids': [Command.link(choice.id)],
+        })
+
+        def check_order(order):
+            self.assertEqual(len(order['line_items']), 1)
+            item = order['line_items'][0]
+            self.assertIn('Lunch Choice', item['name'])
+            self.assertEqual(item['base_price_money'], self._money(3380))
+            self.assertNotIn('catalog_object_id', item)
+
+        self._run_priced_checkout('SquareTerminalConfiguredBasket', ((3380, 0, 0),), check_order)
+        order = self.pos_session.order_ids
+        self.assertEqual(order.lines.product_id, combo | sandwich)
+        selected = order.lines.filtered(lambda line: line.product_id == sandwich)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(selected.attribute_value_ids, avocado)
+        self.assertEqual(sorted(selected.mapped('price_unit')), [9.80, 24])
+
     def test_mixed_combo_recovers_original_cash_and_card_after_lost_settlement(self):
         euro = self.env.ref('base.EUR')
         euro.active = True

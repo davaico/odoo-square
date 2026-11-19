@@ -512,20 +512,25 @@ class PosOrder(models.Model):
                 or minor_units(tip_lines.price_unit, digits) != tip_minor
             ):
                 raise UserError(_("The Odoo tip differs from the recorded tip line."))
-        combo_prices = self._square_combo_prices(pricelist, digits)
+        configured_options = {line: self._square_selected_options(line) for line in self.lines}
+        combo_prices = self._square_combo_prices(pricelist, digits, configured_options)
         unit_prices = {}
         manual_tax_fields = {'computation_key', 'manual_tax_amounts', 'manual_total_excluded', 'manual_total_excluded_currency'}
         for line in self.lines:
             product = line.product_id
             taxes = product.taxes_id._filter_taxes_by_company(self.company_id)
             global_discount = line in discount_lines
+            options = configured_options[line]
+            price_context = product._get_product_price_context(options)
+            option_price_extra = price_context.get('no_variant_attributes_price_extra', 0)
+            expected_extra = 0 if line.combo_parent_id else option_price_extra
             if line.extra_tax_data and (
                 not isinstance(line.extra_tax_data, dict)
                 or (not global_discount and manual_tax_fields.intersection(line.extra_tax_data))
             ):
                 raise UserError(_("Square Terminal cannot verify a basket with manual tax overrides."))
             if (
-                not all(isfinite(value) for value in (line.qty, line.price_unit, line.discount))
+                not all(isfinite(value) for value in (line.qty, line.price_unit, line.price_extra, line.discount))
                 or line.qty <= 0 or (line.price_unit < 0 and not global_discount) or not 0 <= line.discount <= 100
                 or (line.discount and not config.manual_discount)
                 or (line.price_type == 'manual' and line not in tip_lines and not global_discount and not can_edit_price)
@@ -533,7 +538,7 @@ class PosOrder(models.Model):
                     line.price_type != 'manual' or line.qty != 1 or line.price_unit >= 0 or line.discount
                     or line.combo_parent_id or line.combo_line_ids or line in tip_lines
                 ))
-                or line.price_extra
+                or float_compare(line.price_extra, expected_extra, precision_digits=price_digits)
                 or line.refunded_orderline_id or (line.combo_item_id and line not in combo_prices)
                 or (line.combo_parent_id and line not in combo_prices)
                 or product.tracking != 'none'
@@ -550,7 +555,11 @@ class PosOrder(models.Model):
             elif line.price_type == 'manual':
                 price = line.price_unit
             else:
-                price = pricelist._get_product_price(product, line.qty) if pricelist else product.lst_price
+                priced_product = product.with_context(**price_context)
+                price = (
+                    pricelist._get_product_price(priced_product, line.qty) if pricelist
+                    else product.lst_price + option_price_extra
+                )
             if float_compare(price, line.price_unit, precision_digits=price_digits):
                 raise UserError(_("The Odoo basket price changed. Reload the register and check the sale."))
             unit_prices[line] = price if global_discount else float_round(price, precision_digits=price_digits)
@@ -626,6 +635,7 @@ class PosOrder(models.Model):
                 'product': line.product_id,
                 'name': line.product_id.with_context(display_default_code=False).display_name[:255],
                 'combo': line in combo_prices,
+                'configured_options': bool(configured_options[line]),
                 'quantity': decimal_string(line.qty),
                 'unit_minor': int(unit_minor) if unit_minor == unit_minor.to_integral_value() else None,
                 'total_minor': net_minor + tax_minor,
@@ -718,17 +728,37 @@ class PosOrder(models.Model):
             })
         return receipt_items
 
-    def _square_combo_prices(self, pricelist, digits):
+    def _square_selected_options(self, line):
+        product = line.product_id
+        template = product.product_tmpl_id
+        variant_values = product.product_template_attribute_value_ids
+        combination = variant_values | line.attribute_value_ids
+        if not combination and not template.valid_product_template_attribute_line_ids and not line.custom_attribute_value_ids:
+            return combination
+        if (
+            line.custom_attribute_value_ids or combination.filtered('is_custom')
+            or not template._is_combination_possible(combination)
+            or template._get_variant_for_combination(combination) != product
+        ):
+            raise UserError(_("Square Terminal cannot verify these product options."))
+        return combination - variant_values
+
+    def _square_combo_prices(self, pricelist, digits, configured_options):
         prices = {}
         for parent in self.lines.filtered(lambda line: line.product_id.type == 'combo'):
             groups = parent.product_id.combo_ids
             children = parent.combo_line_ids.sorted('id')
             if (
                 parent.combo_parent_id or not groups or len(children) != len(groups)
+                or configured_options[parent] or any(group.qty_free != 1 for group in groups)
                 or set(children.combo_item_id.combo_id.ids) != set(groups.ids)
                 or any(
                     child not in self.lines or child.product_id != child.combo_item_id.product_id
-                    or child.qty != parent.qty or child.attribute_value_ids
+                    or child.qty != parent.qty
+                    or any(
+                        value.attribute_id.create_variant == 'dynamic' and value.price_extra
+                        for value in child.product_id.product_template_attribute_value_ids
+                    )
                     for child in children
                 )
             ):
@@ -745,7 +775,7 @@ class PosOrder(models.Model):
                 else:
                     share = float_round(item.combo_id.base_price * price / weight, precision_digits=digits) if weight else 0
                 remaining -= share
-                prices[child] = share + item.extra_price
+                prices[child] = share + item.extra_price + sum(configured_options[child].mapped('price_extra'))
         return prices
 
     def _square_order_payload(self, location, reference, line_items):
@@ -831,6 +861,8 @@ class PosOrder(models.Model):
             return 'global_discount'
         if any(line['combo'] for line in line_items):
             return 'combo'
+        if any(line.get('configured_options') for line in line_items):
+            return 'configured_options'
         if any(
             line['unit_minor'] is None or len(line['quantity']) > 12
             or len(line['quantity'].partition('.')[2]) > 5

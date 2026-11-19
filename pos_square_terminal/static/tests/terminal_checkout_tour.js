@@ -1,9 +1,11 @@
 import { registry } from "@web/core/registry";
 import * as Chrome from "@point_of_sale/../tests/pos/tours/utils/chrome_util";
+import * as ComboPopup from "@point_of_sale/../tests/pos/tours/utils/combo_popup_util";
 import * as Dialog from "@point_of_sale/../tests/generic_helpers/dialog_util";
 import * as NumberPopup from "@point_of_sale/../tests/generic_helpers/number_popup_util";
 import * as PaymentScreen from "@point_of_sale/../tests/pos/tours/utils/payment_screen_util";
 import * as PartnerList from "@point_of_sale/../tests/pos/tours/utils/partner_list_util";
+import * as ProductConfigurator from "@point_of_sale/../tests/pos/tours/utils/product_configurator_util";
 import * as ProductScreen from "@point_of_sale/../tests/pos/tours/utils/product_screen_util";
 import * as ReceiptScreen from "@point_of_sale/../tests/pos/tours/utils/receipt_screen_util";
 import { inLeftSide } from "@point_of_sale/../tests/pos/tours/utils/common";
@@ -98,6 +100,28 @@ registry.category("web_tour.tours").add("SquareTerminalManualPrice", {
         ...ReceiptScreen.receiptIsThere(),
         ...ReceiptScreen.receiptAmountTotalIs("11.00"),
         { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalConfiguredBasket", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.clickDisplayedProduct("Lunch Choice"),
+        ComboPopup.select("Sandwich"),
+        ...ProductConfigurator.pickRadio("Avocado"),
+        Dialog.confirm(),
+        Dialog.confirm(),
+        ...ProductScreen.clickDisplayedProduct("Sandwich"),
+        ...ProductConfigurator.pickRadio("Avocado"),
+        Dialog.confirm(),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "33.80"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("33.80"),
+        { trigger: ".pos-receipt .orderline:contains('Lunch Choice')" },
+        { trigger: ".pos-receipt .orderline:contains('Sandwich'):contains('Avocado')" },
     ],
 });
 
