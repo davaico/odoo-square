@@ -63,10 +63,10 @@ class PosPaymentMethod(models.Model):
         return False
 
     @api.model
-    def _load_pos_data_fields(self, config_id):
-        return super()._load_pos_data_fields(config_id) + ['square_terminal_unavailable_reason']
+    def _load_pos_data_fields(self, config):
+        return super()._load_pos_data_fields(config) + ['square_terminal_unavailable_reason']
 
     @api.model
-    def _load_pos_data(self, data):
-        config_id = data['pos.config']['data'][0]['id']
-        return super(PosPaymentMethod, self.with_context(square_pos_config=config_id))._load_pos_data(data)
+    def _load_pos_data_read(self, records, config):
+        records = records.with_context(square_pos_config=config.id)
+        return super()._load_pos_data_read(records, config)

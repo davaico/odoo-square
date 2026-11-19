@@ -15,6 +15,16 @@ from odoo.tests import Form, HttpCase, tagged
 @tagged('post_install', '-at_install')
 class TestSquareTerminalSetup(HttpCase):
 
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        company = cls.env.company
+        if not company.chart_template:
+            cls.env['account.chart.template'].try_loading('generic_coa', company)
+        cls.bank_journal = cls.env['account.journal'].search([
+            ('company_id', '=', company.id), ('type', '=', 'bank'),
+        ], limit=1)
+
     def setUp(self):
         super().setUp()
         self.admin = self.env.ref('base.user_admin')
@@ -38,6 +48,25 @@ class TestSquareTerminalSetup(HttpCase):
             method = self._create_payment_method(terminal)
             self.assertEqual(method.name, 'Square Counter')
             self.assertFalse(method.square_terminal_unavailable_reason)
+
+            eur_journal = self.env['account.journal'].create({
+                'name': 'Setup EUR Sales', 'type': 'sale', 'code': 'SQEUR',
+                'currency_id': self.env.ref('base.EUR').id,
+            })
+            counter, euro_register = self.env['pos.config'].create([
+                {'name': 'Square setup register', 'payment_method_ids': [Command.set(method.ids)]},
+                {
+                    'name': 'Square EUR register', 'payment_method_ids': [Command.set(method.ids)],
+                    'journal_id': eur_journal.id, 'use_pricelist': False,
+                },
+            ])
+            counter.open_ui()
+            euro_register.open_ui()
+            self.assertFalse(self._register_payment_methods(counter)[method.id]['square_terminal_unavailable_reason'])
+            self.assertIn(
+                'Square location currency (USD)',
+                self._register_payment_methods(euro_register)[method.id]['square_terminal_unavailable_reason'],
+            )
 
     def test_incompatible_terminal_leaves_cash_payments_available(self):
         with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=partial(
@@ -71,10 +100,7 @@ class TestSquareTerminalSetup(HttpCase):
             config.open_ui()
             session = config.current_session_id
             session.set_opening_control(0, '')
-            methods = {
-                record['id']: record for record in
-                session.load_data(['pos.config', 'pos.payment.method'])['pos.payment.method']['data']
-            }
+            methods = self._register_payment_methods(config)
             self.assertIn('6.62', methods[method.id]['square_terminal_unavailable_reason'])
             self.assertFalse(methods[cash.id]['square_terminal_unavailable_reason'])
             square.reset_mock()
@@ -99,6 +125,12 @@ class TestSquareTerminalSetup(HttpCase):
         with self.assertRaises(AccessError):
             credential.search_read([], ['access_token'])
 
+    def _register_payment_methods(self, config):
+        return {
+            record['id']: record
+            for record in config.current_session_id.load_data(['pos.payment.method'])['pos.payment.method']
+        }
+
     def _prepare_terminal(self, connection):
         location = self.env['pos.square.location'].search([('connection_id', '=', connection.id)])
         self.assertEqual(location.square_id, 'SQUARELOC')
@@ -110,12 +142,10 @@ class TestSquareTerminalSetup(HttpCase):
         return terminal_form.record
 
     def _create_payment_method(self, terminal):
-        journal = self.env['account.journal'].search([
-            ('company_id', '=', terminal.company_id.id), ('type', '=', 'bank'),
-        ], limit=1)
+        self.assertTrue(self.bank_journal)
         with Form(self.env['pos.payment.method'].with_user(self.admin)) as payment_form:
             payment_form.name = 'Square Counter'
-            payment_form.journal_id = journal
+            payment_form.journal_id = self.bank_journal
             payment_form.payment_method_type = 'terminal'
             payment_form.use_payment_terminal = 'square_terminal'
             payment_form.square_terminal_id = terminal

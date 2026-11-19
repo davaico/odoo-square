@@ -13,11 +13,12 @@ function squareUnavailableReason(method) {
 }
 
 patch(PosOrder.prototype, {
-    add_paymentline(method) {
-        if (squareUnavailableReason(method)) {
-            return false;
+    addPaymentline(method) {
+        const reason = squareUnavailableReason(method);
+        if (reason) {
+            return { status: false, data: reason };
         }
-        return super.add_paymentline(...arguments);
+        return super.addPaymentline(...arguments);
     },
 });
 
