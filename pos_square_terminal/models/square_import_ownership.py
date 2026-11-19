@@ -1,5 +1,5 @@
 from odoo import SUPERUSER_ID, api, models
-from odoo.osv import expression
+from odoo.fields import Domain
 
 
 class SquareImportOwnership(models.Model):
@@ -40,7 +40,7 @@ class SquareImportOwnership(models.Model):
             references.append([
                 ('reference', '=', resource['reference_id']), ('square_order_id', '=', False),
             ])
-        return self._square_terminal_find_import_resource(expression.AND([scope, expression.OR(references)]))
+        return self._square_terminal_find_import_resource(Domain(scope) & Domain.OR(references))
 
     def _square_terminal_find_import_resource(self, domain, *, model='pos.square.order'):
         # The POS commits its reservation before CreateOrder. The importer may

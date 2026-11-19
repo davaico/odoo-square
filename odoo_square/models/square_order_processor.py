@@ -97,7 +97,7 @@ class SquareOrderProcessor(models.Model):
 
         # A manual resync supplies the full order it retrieved with this configuration.
         if order_id:
-            result = self._square_online_event_result(
+            result = self._square_pos_order_result(
                 order_id=order_id, location_id=order_data.get("location_id"),
                 merchant_id=merchant_id, environment=environment, square_config=square_config,
                 full_order=order_data if square_config is not None else None,
@@ -984,8 +984,12 @@ class SquareOrderProcessor(models.Model):
                 order_id=order_id, payment_id=payment_id, location_id=payment_data.get("location_id"),
                 merchant_id=merchant_id, environment=environment,
             )
-            if routing:
+            config = self._square_terminal_import_config()
+            if routing and (not config or routing["status"] == "ignored"):
                 return routing
+            terminal_payment = self._square_terminal_payment_result(payment_data, config)
+            if terminal_payment and terminal_payment["status"] == "ignored":
+                return terminal_payment
 
             receipts = self.env["square.event.receipt"].sudo()
             if receipts._was_applied("payment.updated", payment_id, webhook_event_id):
@@ -994,6 +998,10 @@ class SquareOrderProcessor(models.Model):
             # Fetch full order details from Square API to check for exchanges
             api_client = self.env["square.api.client"].sudo()
             order_data = api_client.get_order(order_id)
+
+            terminal_order = self._square_terminal_order_result(order_id, config, full_order=order_data or {})
+            if terminal_order or terminal_payment or routing:
+                return terminal_order or terminal_payment or routing
 
             if not order_data or (order_data.get("id") or order_data.get("order_id")) != order_id:
                 _logger.error(

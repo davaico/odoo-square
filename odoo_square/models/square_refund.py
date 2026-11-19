@@ -134,11 +134,14 @@ class SquareRefund(models.Model):
 
         if not refund_id:
             return {"status": "error", "message": "No refund ID in Square webhook"}
-        routing = self.env["square.order.processor"]._square_online_event_result(
+        processor = self.env["square.order.processor"]
+        routing = processor._square_online_event_result(
             order_id=order_id, payment_id=refund_data.get("payment_id"), refund_id=refund_id,
             location_id=refund_data.get("location_id"),
             merchant_id=merchant_id, environment=environment,
         )
+        if not routing or routing["status"] == "retry":
+            routing = processor._square_terminal_refund_result(refund_id) or routing
         if routing:
             return routing
         if not order_id:

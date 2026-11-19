@@ -5,6 +5,7 @@ import json
 from unittest import SkipTest
 from unittest.mock import patch
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 import requests
 
@@ -296,6 +297,79 @@ class TestSquareOnlinePosCoexistence(SquareOnlineCheckoutCase):
         self.assertFalse(self.env["square.refund"].search([("square_refund_id", "=", refund["id"])]))
         self.assertEqual(self.env["sale.order"].search([]), sales_before)
         self.assertEqual([call.args[0] for call in online_api.call_args_list].count("POST"), 1)
+
+    @patch(SquareOnlineCheckoutCase.square_boundary)
+    @patch("odoo.addons.odoo_square.models.square_api_client.requests.get")
+    def test_website_terminal_and_square_register_keep_their_own_sales(self, pos_api, online_api):
+        if "pos.square.order" not in self.env:
+            self.skipTest("Square Terminal is not installed")
+        website, transaction, payment = self._start_website_goods_checkout(online_api)
+        config = self.env["pos.config"].create({"name": "Terminal coexistence", "company_id": self.company.id})
+        session = self.env["pos.session"].create({"config_id": config.id})
+        pos_order = self.env["pos.order"].create({
+            "uuid": str(uuid4()), "session_id": session.id, "state": "draft",
+            "amount_tax": 0, "amount_total": 47, "amount_return": 0, "amount_paid": 0,
+        })
+        connection = self.env["pos.square.connection"].sudo().create({
+            "name": "Terminal at shared store", "company_id": self.company.id, "environment": "sandbox",
+            "application_id": "sandbox-sq0idb-terminal-app", "merchant_id": "MERCHANT_TEST",
+        })
+        location = self.env["pos.square.location"].sudo().create({
+            "connection_id": connection.id, "square_id": "SQUARE-NY", "name": "Shared Store",
+            "currency_code": "USD",
+        })
+        terminal = self._square_order("TERMINAL-ORDER")
+        terminal["reference_id"] = "odoo-" + uuid4().hex
+        self.env["pos.square.order"].sudo().create({
+            "order_id": pos_order.id, "order_uuid": pos_order.uuid,
+            "company_id": self.company.id, "connection_id": connection.id, "environment": "sandbox",
+            "merchant_id": "MERCHANT_TEST", "location_id": location.id, "square_location_id": "SQUARE-NY",
+            "reference": terminal["reference_id"], "currency_code": "USD", "currency_digits": 2,
+            "total_minor": 4700, "create_request": {"order": terminal}, "square_order_id": terminal["id"],
+        })
+        register_payment = {
+            "id": "REGISTER-PAYMENT", "order_id": "REGISTER-ORDER", "location_id": "SQUARE-NY",
+            "status": "COMPLETED", "amount_money": {"amount": 4700, "currency": "USD"},
+        }
+        register = self._square_order(register_payment["order_id"], payment_id=register_payment["id"])
+        website_order = self._square_order(payment["order_id"], payment_id=payment["id"])
+        self.pos_objects = {
+            f"/v2/orders/{order['id']}": {"order": order} for order in (terminal, register, website_order)
+        }
+        self.pos_objects.update({
+            f"/v2/payments/{item['id']}": {"payment": item} for item in (payment, register_payment)
+        })
+        self.pos_objects["/v2/locations/SQUARE-NY"] = {
+            "location": {"id": "SQUARE-NY", "merchant_id": "MERCHANT_TEST"},
+        }
+        pos_api.side_effect = self._pos_api
+
+        self.assertEqual(self._notify("payment.updated", payment).json()["status"], "ignored")
+        response = self._notify("order.created", terminal, event_id="terminal-order")
+        self.assertEqual(response.json(), {
+            "status": "ignored", "message": "Odoo POS Square Terminal operation",
+        }, response.text)
+        response = self._notify("order.created", register, event_id="register-order")
+        self.assertEqual(response.json()["status"], "success", response.text)
+        self.assertFalse(transaction.provider_reference)
+
+        def read_payment(method, url, *, headers, **kwargs):
+            self.assertEqual(method, "GET")
+            self.assertTrue(url.endswith("/v2/payments/" + payment["id"]))
+            return self._square_response({"payment": payment})
+
+        online_api.side_effect = read_payment
+        self.assertEqual(self._notify("payment.updated", payment, online=True).status_code, 200)
+        self.assertEqual(self.make_jsonrpc_request("/payment/status/poll")["state"], "done")
+        self.assertEqual(website.state, "sale")
+        self.assertEqual(transaction.payment_id.amount, 47)
+        imported = self.env["sale.order"].search([
+            ("square_order_id", "in", [order["id"] for order in (terminal, register, website_order)]),
+        ])
+        self.assertEqual(imported.square_order_id, register["id"])
+        self.assertEqual(imported.invoice_ids.reconciled_payment_ids.amount, 47)
+        self.assertEqual(imported.picking_ids.state, "done")
+        self.assertEqual(self._physical_stock(self.goods), 10)
 
     def _physical_stock(self, product):
         return sum(self.env["stock.quant"].search([
