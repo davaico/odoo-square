@@ -14,10 +14,15 @@
         "views/pos_payment_method_views.xml",
     ],
     "assets": {
-        "web.assets_tests": ["pos_square_terminal/static/tests/payment_readiness_tour.js"],
+        "web.assets_tests": [
+            "pos_square_terminal/static/tests/payment_readiness_tour.js",
+            "pos_square_terminal/static/tests/terminal_checkout_tour.js",
+        ],
         "point_of_sale._assets_pos": [
             "pos_square_terminal/static/src/payment_readiness.js",
             "pos_square_terminal/static/src/payment_readiness.xml",
+            "pos_square_terminal/static/src/square_payment.js",
+            "pos_square_terminal/static/src/square_payment.xml",
         ],
     },
     "installable": True,

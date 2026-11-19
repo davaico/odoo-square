@@ -19,3 +19,11 @@ Install **Square Terminal for Point of Sale** (`pos_square_terminal`) in Odoo 18
 For Sandbox, select **Use Sandbox Simulator** instead of generating a code. The supplied Square test device simulates a successful card payment within Square's amount limits. It needs a separate Sandbox authorization and location. [Sandbox device behavior](https://developer.squareup.com/docs/devtools/sandbox/testing#terminal-api-checkouts)
 
 For a replacement device, add a new terminal record and switch the payment method after closing the register session. Create a new connection if the company, application or environment changes, and keep the original connection available for historical payment checks. Reauthorize that original connection with the same merchant if Square revokes its grant.
+
+## Take a single card payment
+
+1. Add the items in Odoo and open the POS payment screen. Select the named Square payment method for the full balance, then select **Send**.
+2. Ask the customer to pay on the selected Square Terminal. Keep the original sale open while Odoo verifies the payment. If Square's result is uncertain, keep the original sale available for investigation before taking another payment.
+3. Issue the itemized Odoo receipt when the sale completes. If the register requires manual validation, select **Validate** after the payment shows as successful.
+
+This checkout supports a single card tender for ordinary untaxed items at their configured prices. Odoo uses the configured priced basket and sends the payment amount automatically. Cash-only sales can be completed using the existing cash method.

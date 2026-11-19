@@ -3,3 +3,5 @@ access_pos_square_connection_manager,pos.square.connection manager,model_pos_squ
 access_pos_square_location_manager,pos.square.location manager,model_pos_square_location,point_of_sale.group_pos_manager,1,0,0,0
 access_pos_square_terminal_manager,pos.square.terminal manager,model_pos_square_terminal,point_of_sale.group_pos_manager,1,1,1,0
 access_pos_square_credential_private,Square Terminal credentials are private,model_pos_square_credential,point_of_sale.group_pos_manager,0,0,0,0
+access_pos_square_order_private,Square linked orders are private,model_pos_square_order,point_of_sale.group_pos_user,0,0,0,0
+access_pos_square_payment_attempt_private,Square payment attempts are private,model_pos_square_payment_attempt,point_of_sale.group_pos_user,0,0,0,0

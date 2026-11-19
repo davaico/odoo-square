@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<templates xml:space="preserve">
+    <t t-name="pos_square_terminal.SquarePaymentLines" t-inherit="point_of_sale.PaymentScreenPaymentLines" t-inherit-mode="extension">
+        <xpath expr="//t[@t-if=&quot;!line.payment_status or !['done', 'reversed', 'waitingCard', 'waitingCapture'].includes(line.payment_status)&quot;]" position="attributes">
+            <attribute name="t-if">!this.isReservedSquarePayment(line) and (!line.payment_status or !['done', 'reversed', 'waitingCard', 'waitingCapture'].includes(line.payment_status))</attribute>
+        </xpath>
+        <xpath expr="//t[@t-if=&quot;!line.payment_status or !['done', 'reversed'].includes(line.payment_status)&quot;]" position="attributes">
+            <attribute name="t-if">!this.isReservedSquarePayment(line) and (!line.payment_status or !['done', 'reversed'].includes(line.payment_status))</attribute>
+        </xpath>
+        <xpath expr="//t[@t-if=&quot;line.payment_status == 'pending'&quot;]" position="before">
+            <t t-if="this.isReservedSquarePayment(line) and line.payment_status != 'done'">
+                <div class="electronic_status" t-esc="this.squarePendingMessage(line)"/>
+            </t>
+        </xpath>
+        <xpath expr="//t[@t-if=&quot;line.payment_status == 'pending'&quot;]" position="attributes">
+            <attribute name="t-if"/>
+            <attribute name="t-elif">line.payment_status == 'pending'</attribute>
+        </xpath>
+    </t>
+    <t t-name="pos_square_terminal.SquarePaymentBack" t-inherit="point_of_sale.PaymentScreenBack" t-inherit-mode="extension">
+        <xpath expr="//button[hasclass('back-button')]" position="attributes">
+            <attribute name="t-att-disabled">this.squarePaymentReserved</attribute>
+        </xpath>
+    </t>
+</templates>
