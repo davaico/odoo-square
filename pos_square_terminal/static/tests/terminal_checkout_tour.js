@@ -390,6 +390,7 @@ registry.category("web_tour.tours").add("SquareTerminalOdooTipFinalCard", {
             ...PaymentScreen.selectedPaymentlineHas("Square Counter", "25.00"),
             { trigger: ".payment-screen .send_payment_request", run: "click" },
             { trigger: ".payment-screen .electronic_payment .electronic_status:contains('Authorized by Square')" },
+            { trigger: '.paymentmethod:not(.opacity-50):contains("Square Counter")' },
         ]).flat(),
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "25.00"),
