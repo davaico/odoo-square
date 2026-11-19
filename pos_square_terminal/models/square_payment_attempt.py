@@ -315,7 +315,7 @@ class SquarePaymentAttempt(models.Model):
             if status != 'COMPLETED':
                 raise ValueError('Square no longer reports the verified payment as completed')
             self._observe_verified_payment(payment)
-        elif status == 'COMPLETED' and self._payment_has_no_refunds(payment):
+        elif status == 'COMPLETED':
             if not self.square_order_link_id.split:
                 self._mark_verified(payment)
             else:
@@ -335,9 +335,6 @@ class SquarePaymentAttempt(models.Model):
             elif self.provider_status in ('PENDING', 'IN_PROGRESS'):
                 self.state = 'declined'
         return status
-
-    def _payment_has_no_refunds(self, payment):
-        return 'refunded_money' not in payment or matches_money(payment['refunded_money'], 0, self.currency_code)
 
     def _mark_verified(self, payment):
         self.ensure_one()

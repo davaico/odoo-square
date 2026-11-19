@@ -230,8 +230,6 @@ class SquareOrder(models.Model):
             attempt._check_provider_scope()
         order = self._read_settlement_order(path)
         payments = [attempt._read_payment(attempt.square_payment_id) for attempt in attempts]
-        if not all(attempt._payment_has_no_refunds(payment) for attempt, payment in zip(attempts, payments)):
-            raise ValueError('A Square split payment was refunded before settlement was verified')
         return order, payments
 
     def _read_settlement_order(self, path):

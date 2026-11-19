@@ -36,6 +36,7 @@
                             <field name="requested_amount"/>
                             <field name="verified_base" invisible="not has_verified_amounts"/>
                             <field name="verified_tip" invisible="not has_verified_amounts"/>
+                            <field name="refunded_amount" invisible="not refund_ids"/>
                         </group>
                         <group>
                             <field name="state"/>
@@ -43,6 +44,7 @@
                             <field name="last_checked_at" string="Last Successful Check"/>
                             <field name="order_pricing_discrepancy" invisible="not order_pricing_discrepancy"/>
                             <field name="reconciliation_discrepancy" invisible="not reconciliation_discrepancy"/>
+                            <field name="refund_reconciliation_issue" invisible="not refund_reconciliation_issue"/>
                             <field name="reconciliation_error" string="Latest Check Error"
                                    invisible="not reconciliation_error or reconciliation_error == reconciliation_discrepancy"/>
                         </group>
@@ -62,6 +64,15 @@
                             <field name="square_checkout_id"/>
                             <field name="square_payment_id"/>
                         </group>
+                    </group>
+                    <group string="Confirmed Square Refunds" invisible="not refund_ids">
+                        <field name="refund_ids" nolabel="1" readonly="1">
+                            <list create="0" edit="0" delete="0">
+                                <field name="currency_id" column_invisible="True"/>
+                                <field name="square_refund_id"/>
+                                <field name="amount"/>
+                            </list>
+                        </field>
                     </group>
                 </sheet>
             </form>
