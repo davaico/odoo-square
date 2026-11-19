@@ -5,6 +5,7 @@ from datetime import timedelta
 from functools import partial
 from unittest.mock import patch
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from requests import Response, Timeout
 
@@ -232,6 +233,66 @@ class TestSquareCoexistence(SquareCheckoutCase):
             self._result('/payment/square/online/submit', **submission, source_id='cnon:sdk-token')
         self._result('/payment/status/poll')
         return cart
+
+    def test_website_and_terminal_ownership_coexist_at_the_same_square_location(self):
+        if 'pos.square.order' not in self.env:
+            self.skipTest('Square Terminal is not installed')
+        cart = self._captured_website_order()
+        transaction = cart.transaction_ids
+        pos_config = self.env['pos.config'].create({'name': 'Terminal coexistence'})
+        session = self.env['pos.session'].create({'config_id': pos_config.id})
+        pos_order = self.env['pos.order'].create({
+            'uuid': str(uuid4()), 'session_id': session.id, 'state': 'draft',
+            'amount_tax': 0, 'amount_total': 50, 'amount_return': 0, 'amount_paid': 0,
+        })
+        connection = self.env['pos.square.connection'].sudo().create({
+            'name': 'Terminal merchant', 'company_id': self.company.id, 'environment': 'sandbox',
+            'application_id': 'sandbox-sq0idb-terminal-app', 'merchant_id': 'TESTMERCHANT',
+        })
+        location = self.env['pos.square.location'].sudo().create({
+            'connection_id': connection.id, 'square_id': 'TESTNYC',
+            'name': 'New York', 'currency_code': 'USD',
+        })
+        terminal = {
+            'id': 'TERMINAL-ORDER', 'location_id': 'TESTNYC', 'state': 'COMPLETED',
+            'reference_id': 'odoo-' + uuid4().hex,
+        }
+        self.env['pos.square.order'].sudo().create({
+            'order_id': pos_order.id, 'order_uuid': pos_order.uuid,
+            'company_id': self.company.id, 'connection_id': connection.id, 'environment': 'sandbox',
+            'merchant_id': 'TESTMERCHANT', 'location_id': location.id, 'square_location_id': 'TESTNYC',
+            'reference': terminal['reference_id'], 'currency_code': 'USD', 'currency_digits': 2,
+            'total_minor': 5000, 'create_request': {'order': terminal}, 'square_order_id': terminal['id'],
+        })
+        website = {
+            'id': transaction.square_order_id, 'location_id': 'TESTNYC', 'state': 'COMPLETED',
+            'reference_id': transaction.square_order_reference,
+        }
+        register = {
+            'id': 'SQUARE-REGISTER', 'location_id': 'TESTNYC', 'state': 'OPEN',
+            'total_money': {'amount': 5000, 'currency': 'USD'},
+            'line_items': [{'uid': 'line', 'quantity': '1', 'name': self.product.name,
+                            'base_price_money': {'amount': 5000, 'currency': 'USD'}}],
+        }
+        resources = {f'/v2/orders/{order["id"]}': {'order': order} for order in (terminal, website, register)}
+        with self._pos_lookup(resources):
+            webhook = {
+                'id': transaction.provider_reference, 'order_id': transaction.square_order_id,
+                'location_id': 'TESTNYC', 'status': 'COMPLETED',
+            }
+            response = self._pos_event('payment.updated', 'website-payment', webhook)
+            self.assertEqual(response.json(), {'status': 'ignored', 'message': 'Square website operation'}, response.text)
+            response = self._pos_event('order.created', 'terminal-order', terminal)
+            self.assertEqual(response.json(), {
+                'status': 'ignored', 'message': 'Odoo POS Square Terminal operation',
+            }, response.text)
+            response = self._pos_event('order.created', 'register-order', register)
+            self.assertEqual(response.json()['status'], 'success', response.text)
+        self.assertEqual(cart.state, 'sale')
+        self.assertEqual(transaction.payment_id.amount, 50)
+        self.assertEqual(self.env['sale.order'].search([
+            ('square_order_id', 'in', [order['id'] for order in (terminal, website, register)]),
+        ]).square_order_id, 'SQUARE-REGISTER')
 
     def _resync_button(self, record, button):
         return self._result('/web/dataset/call_button', model=record._name, method=button,
