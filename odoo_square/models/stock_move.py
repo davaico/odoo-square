@@ -72,7 +72,7 @@ class StockMove(models.Model):
                 return
             sync, config = self.env["square.stock.sync"]._for_company(move.company_id)
             if config:
-                sync._sync_stock_changes(move.with_env(sync.env), config)
+                sync._sync_stock_changes(move, config)
 
         except PG_CONCURRENCY_EXCEPTIONS_TO_RETRY:
             raise

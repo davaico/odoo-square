@@ -100,18 +100,20 @@ class SquareStockSync(models.Model):
             ("warehouse_id.company_id", "=", config.company_id.id),
         ])
 
-    def _merchant_location_ids(self, config):
+    def _active_merchant_locations(self, config):
         locations = self.env["square.api.client"]._get_locations(square_config=config)
-        return [
-            location["id"] for location in locations
+        return {
+            location["id"]: location for location in locations
             if isinstance(location, dict)
             and location.get("status") == "ACTIVE"
             and isinstance(location.get("id"), str)
             and location["id"]
-        ]
+        }
 
     def _sync_stock_changes(self, move, config):
         """Synchronize affected warehouses after core completes a stock move."""
+        terminal_orders = getattr(move, "_square_terminal_inventory_orders", None)
+        move = move.with_env(self.env)
         if not self.auto_sync_enabled or move.state != "done":
             return
         if any((move | move.origin_returned_move_id).sale_line_id.order_id.mapped("square_order_id")):
@@ -123,7 +125,8 @@ class SquareStockSync(models.Model):
         mappings = self._get_location_mappings(config).filtered(
             lambda mapping: mapping.warehouse_id in warehouses
         )
-        self._queue_mapped_product(move.product_id, mappings)
+        orders_by_location = terminal_orders(config.square_environment) if mappings and terminal_orders else None
+        self._queue_mapped_product(move.product_id, mappings, orders_by_location=orders_by_location)
 
     def _sync_quant_change(self, quant, config):
         if not self._should_sync_product(quant.product_id, config.company_id):
@@ -133,11 +136,14 @@ class SquareStockSync(models.Model):
         )
         self._queue_mapped_product(quant.product_id, mappings)
 
-    def _queue_mapped_product(self, product, mappings):
+    def _queue_mapped_product(self, product, mappings, *, orders_by_location=None):
         counts = self.env["square.stock.count"]
+        orders_by_location = orders_by_location or {}
         for mapping in mappings:
             quantity = self._get_warehouse_stock(product, mapping.warehouse_id)
-            counts._queue_count(product, mapping, quantity)
+            counts._queue_count(
+                product, mapping, quantity, terminal_orders=orders_by_location.get(mapping.square_location_id),
+            )
 
     def manual_sync_all_products(self):
         """Synchronize stock from the configured company and its mapped warehouses."""
@@ -150,7 +156,7 @@ class SquareStockSync(models.Model):
     def _manual_sync_all_products(self):
         config = self.env["square.api.client"]._get_square_config()
         mappings = self._get_location_mappings(config)
-        merchant_location_ids = self._merchant_location_ids(config)
+        merchant_location_ids = list(self._active_merchant_locations(config))
         if not merchant_location_ids:
             raise UserError("No active Square locations could be verified for this configuration.")
 
