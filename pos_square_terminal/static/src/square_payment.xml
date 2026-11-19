@@ -10,6 +10,10 @@
         <xpath expr="//t[@t-if=&quot;line.payment_status == 'pending'&quot;]" position="before">
             <t t-if="this.isReservedSquarePayment(line) and line.payment_status != 'done'">
                 <div class="electronic_status" t-esc="this.squarePendingMessage(line)"/>
+                <button type="button" class="button btn btn-outline-primary square-check-status"
+                        t-if="line.square_attempt_state != 'blocked'"
+                        t-on-click="() => this.props.sendPaymentRequest(line)"
+                        t-esc="this.squareActionLabel(line)"/>
             </t>
         </xpath>
         <xpath expr="//t[@t-if=&quot;line.payment_status == 'pending'&quot;]" position="attributes">

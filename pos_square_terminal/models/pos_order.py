@@ -1,6 +1,8 @@
 from decimal import Decimal
 from uuid import uuid4
 
+from psycopg2.errors import UniqueViolation
+
 from odoo import Command, _, api, models
 from odoo.exceptions import AccessError, UserError
 
@@ -47,7 +49,7 @@ class PosOrder(models.Model):
         order, payment = self._square_checkout_records(order_uuid, payment_uuid)
         order._square_lock_checkout(touch=True)
         attempts = order._square_attempts()
-        attempt = attempts.filtered(lambda candidate: candidate.payment_id.id == payment.id)
+        attempt = attempts.filtered(lambda candidate: candidate.payment_id.id == payment.id)[-1:]
         if attempt:
             return attempt._cashier_status()
         order._square_check_session()
@@ -66,6 +68,11 @@ class PosOrder(models.Model):
             raise UserError(reason)
         terminal = method.sudo().square_terminal_id
 
+        connection = terminal.connection_id
+        device_key = attempts._device_key(connection.environment, connection.merchant_id, terminal.device_id)
+        if attempts.search_count([('active_device_key', '=', device_key)], limit=1):
+            return {'state': 'busy'}
+
         currency = terminal.location_id.currency_code
         digits = 0 if currency == 'JPY' else 2
         total_minor, line_items = order._square_priced_basket(digits)
@@ -75,49 +82,55 @@ class PosOrder(models.Model):
         ):
             raise UserError(_("The Square payment must cover the exact Odoo order total."))
 
-        connection = terminal.connection_id
         order_reference = 'odoo-' + uuid4().hex
-        order_link = self.env['pos.square.order'].sudo().create({
-            'order_id': order.id,
-            'order_uuid': order.uuid,
-            'company_id': order.company_id.id,
-            'connection_id': connection.id,
-            'environment': connection.environment,
-            'merchant_id': connection.merchant_id,
-            'location_id': terminal.location_id.id,
-            'square_location_id': terminal.location_id.square_id,
-            'reference': order_reference,
-            'currency_code': currency,
-            'currency_digits': digits,
-            'total_minor': total_minor,
-            'create_request': order._square_order_payload(terminal.location_id, order_reference, line_items),
-        })
-        attempt_reference = 'odoo-' + uuid4().hex
-        attempt = attempts.create({
-            'square_order_link_id': order_link.id,
-            'payment_id': payment.id,
-            'payment_uuid': payment.uuid,
-            'payment_method_id': method.id,
-            'terminal_id': terminal.id,
-            'square_device_id': terminal.device_id,
-            'application_id': connection.application_id,
-            'reference': attempt_reference,
-            'amount_minor': total_minor,
-            'checkout_request': {
-                'idempotency_key': str(uuid4()),
-                'checkout': {
-                    'reference_id': attempt_reference,
-                    'amount_money': {'amount': total_minor, 'currency': currency},
-                    'payment_options': {'autocomplete': True},
-                    'device_options': {
-                        'device_id': terminal.device_id,
-                        'show_itemized_cart': True,
-                        'allow_auto_card_surcharge': False,
-                        'tip_settings': {'allow_tipping': False},
+        try:
+            with self.env.cr.savepoint():
+                order_link = self.env['pos.square.order'].sudo().create({
+                    'order_id': order.id,
+                    'order_uuid': order.uuid,
+                    'company_id': order.company_id.id,
+                    'connection_id': connection.id,
+                    'environment': connection.environment,
+                    'merchant_id': connection.merchant_id,
+                    'location_id': terminal.location_id.id,
+                    'square_location_id': terminal.location_id.square_id,
+                    'reference': order_reference,
+                    'currency_code': currency,
+                    'currency_digits': digits,
+                    'total_minor': total_minor,
+                    'create_request': order._square_order_payload(terminal.location_id, order_reference, line_items),
+                })
+                attempt_reference = 'odoo-' + uuid4().hex
+                attempt = attempts.create({
+                    'square_order_link_id': order_link.id,
+                    'payment_id': payment.id,
+                    'payment_uuid': payment.uuid,
+                    'payment_method_id': method.id,
+                    'terminal_id': terminal.id,
+                    'square_device_id': terminal.device_id,
+                    'application_id': connection.application_id,
+                    'reference': attempt_reference,
+                    'amount_minor': total_minor,
+                    'checkout_request': {
+                        'idempotency_key': str(uuid4()),
+                        'checkout': {
+                            'reference_id': attempt_reference,
+                            'amount_money': {'amount': total_minor, 'currency': currency},
+                            'payment_options': {'autocomplete': True},
+                            'device_options': {
+                                'device_id': terminal.device_id,
+                                'show_itemized_cart': True,
+                                'allow_auto_card_surcharge': False,
+                                'tip_settings': {'allow_tipping': False},
+                            },
+                        },
                     },
-                },
-            },
-        })
+                })
+                attempt.flush_recordset(['active_device_key'])
+        except UniqueViolation as error:
+            if error.diag.constraint_name != 'pos_square_payment_attempt_active_device_unique':
+                raise
+            return {'state': 'busy'}
         return attempt._cashier_status()
 
     @api.model
@@ -127,14 +140,77 @@ class PosOrder(models.Model):
         return attempt._cashier_status()
 
     @api.model
-    def square_dispatch_payment(self, order_uuid, payment_uuid):
+    def square_mark_dispatching(self, order_uuid, payment_uuid, attempt_reference):
         attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
-        attempt._dispatch()
+        if attempt.reference == attempt_reference and attempt.state == 'ready':
+            attempt.state = 'dispatching'
+        return attempt._cashier_status()
+
+    @api.model
+    def square_dispatch_payment(self, order_uuid, payment_uuid, attempt_reference=None):
+        attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
+        if attempt.reference == attempt_reference:
+            attempt._dispatch()
+        return attempt._cashier_status()
+
+    @api.model
+    def square_retry_payment(self, order_uuid, payment_uuid, attempt_reference):
+        order, payment = self._square_checkout_records(order_uuid, payment_uuid)
+        order._square_lock_checkout(touch=True)
+        previous = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
+        if previous.reference != attempt_reference or previous.state != 'failed':
+            return previous._cashier_status()
+
+        order._square_check_session()
+        order._square_check_reserved_amounts(previous)
+        method = payment.payment_method_id
+        if (
+            not method.active or method not in order.config_id.payment_method_ids
+            or method.sudo().square_terminal_id.id != previous.terminal_id.id
+            or previous.terminal_id.device_id != previous.square_device_id
+        ):
+            raise UserError(_("Restore the original Square Terminal configuration before retrying."))
+        reason = method._square_readiness_error(order.config_id)
+        if reason:
+            raise UserError(reason)
+        previous._check_provider_scope()
+        device_key = previous._device_key(previous.environment, previous.merchant_id, previous.square_device_id)
+        if previous.search_count([('active_device_key', '=', device_key)], limit=1):
+            return {**previous._cashier_status(), 'busy': True}
+
+        reference = 'odoo-' + uuid4().hex
+        request = {
+            **previous.checkout_request,
+            'idempotency_key': str(uuid4()),
+            'checkout': {**previous.checkout_request['checkout'], 'reference_id': reference},
+        }
+        try:
+            with self.env.cr.savepoint():
+                attempt = previous.create({
+                    'square_order_link_id': previous.square_order_link_id.id,
+                    'payment_id': payment.id,
+                    'payment_uuid': payment.uuid,
+                    'payment_method_id': method.id,
+                    'terminal_id': previous.terminal_id.id,
+                    'square_device_id': previous.square_device_id,
+                    'application_id': previous.application_id,
+                    'reference': reference,
+                    'amount_minor': previous.amount_minor,
+                    'checkout_request': request,
+                    'state': 'ready',
+                })
+                attempt.flush_recordset(['active_device_key'])
+        except UniqueViolation as error:
+            if error.diag.constraint_name != 'pos_square_payment_attempt_active_device_unique':
+                raise
+            return {**previous._cashier_status(), 'busy': True}
         return attempt._cashier_status()
 
     @api.model
     def square_check_payment(self, order_uuid, payment_uuid):
-        attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=False)
+        attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=False, allow_missing=True)
+        if not attempt:
+            return {'state': 'unstarted'}
         attempt._refresh()
         return attempt._cashier_status()
 
@@ -155,18 +231,20 @@ class PosOrder(models.Model):
         return order, payment
 
     @api.model
-    def _square_requested_attempt(self, order_uuid, payment_uuid, *, must_be_open):
+    def _square_requested_attempt(self, order_uuid, payment_uuid, *, must_be_open, allow_missing=False):
         order, payment = self._square_checkout_records(order_uuid, payment_uuid)
         order._square_lock_checkout()
         attempt = order._square_attempts().filtered(lambda candidate: (
             candidate.payment_id.id == payment.id and candidate.payment_uuid == payment.uuid
-        ))
+        ))[-1:]
+        if not attempt and allow_missing and payment.payment_method_id.use_payment_terminal == 'square_terminal':
+            return attempt
         if len(attempt) != 1:
             raise UserError(_("Square Terminal has no reserved attempt for this payment."))
         self.env.cr.execute(
             'SELECT id FROM pos_square_payment_attempt WHERE id = %s FOR NO KEY UPDATE', [attempt.id],
         )
-        if must_be_open and attempt.state in ('prepared', 'ready'):
+        if must_be_open and attempt.state in ('prepared', 'ready', 'dispatching'):
             order._square_check_session()
             order._square_check_reserved_amounts(attempt)
         return attempt
@@ -250,7 +328,7 @@ class PosOrder(models.Model):
         }
 
     def _square_attempts(self):
-        return self.env['pos.square.payment.attempt'].sudo().search([('order_id', 'in', self.ids)])
+        return self.env['pos.square.payment.attempt'].sudo().search([('order_id', 'in', self.ids)], order='id')
 
     def _square_lock_checkout(self, *, touch=False):
         if not self.ids:
@@ -285,6 +363,7 @@ class PosOrder(models.Model):
             order_attempts = attempts.filtered(lambda attempt: attempt.order_id.id == order.id)
             if not order_attempts and not any(p.payment_method_id.use_payment_terminal == 'square_terminal' for p in order.payment_ids):
                 continue
+            order_attempts = order_attempts.filtered(lambda attempt: attempt.state != 'failed')
             if len(order_attempts) != 1 or order_attempts.state != 'verified':
                 raise UserError(_("Square has not verified payment for this sale."))
             order._square_check_reserved_amounts(order_attempts)

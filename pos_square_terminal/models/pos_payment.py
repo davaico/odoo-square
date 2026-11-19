@@ -8,6 +8,7 @@ class PosPayment(models.Model):
     _inherit = 'pos.payment'
 
     square_attempt_state = fields.Char(compute='_compute_square_attempt_state')
+    square_attempt_reference = fields.Char(compute='_compute_square_attempt_state')
 
     _square_evidence_fields = {
         'payment_status', 'transaction_id', 'card_type', 'card_brand', 'card_no', 'cardholder_name',
@@ -17,9 +18,11 @@ class PosPayment(models.Model):
 
     def _compute_square_attempt_state(self):
         attempts = self.pos_order_id._square_attempts()
-        states = {attempt.payment_id.id: attempt.state for attempt in attempts}
+        attempts_by_payment = {attempt.payment_id.id: attempt for attempt in attempts}
         for payment in self:
-            payment.square_attempt_state = states.get(payment.id, False)
+            attempt = attempts_by_payment.get(payment.id)
+            payment.square_attempt_state = attempt.state if attempt else False
+            payment.square_attempt_reference = attempt.reference if attempt else False
 
     @api.model_create_multi
     def create(self, vals_list):
@@ -83,7 +86,7 @@ class PosPayment(models.Model):
     def _square_set_verified(self, payment_id):
         self.ensure_one()
         super(PosPayment, self.sudo()).write({'payment_status': 'done', 'transaction_id': payment_id})
-        self.invalidate_recordset(['square_attempt_state'])
+        self.invalidate_recordset(['square_attempt_state', 'square_attempt_reference'])
 
     def unlink(self):
         self.check_access('unlink')
