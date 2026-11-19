@@ -28,6 +28,8 @@ To replace a device, close the register session, create a new terminal record an
 2. Wait for Odoo to verify the result on the original sale. When the full payment is verified, Odoo can complete the sale automatically. If the register requires manual validation, choose **Validate**. If Odoo needs a customer to invoice, select the customer on that same order and finish checkout with the existing verified payment.
 3. Issue the Odoo receipt. Square uses a matching catalog variation or a named item when possible. For a basket such as a complex combo, Square can show a receipt summary linked to the itemized Odoo receipt. Odoo blocks dispatch on a pricing or currency mismatch.
 
+If the register uses Odoo Global Discounts, Square receives the receipt summary with the verified discounts and taxes. With **Restrict Price Modifications to Managers** enabled, use an Odoo Point of Sale manager login to send a manually priced basket. A manager selected through the employee switcher also needs an authenticated manager login for Square Terminal checkout.
+
 For a split, enter exact shares using Odoo cash and one or more Square cards. For example, record €20 cash on a €60 sale, then select **Square Counter**, check the €40 balance and choose **Send**. A card share can show **Authorized by Square** while the original sale awaits the remaining shares. If the last share is cash, enter it and select **Validate**. Odoo settles all covered shares on the same Square order. For a cash-only sale, choose the Odoo cash method from the start. If Odoo flags an unsupported tender combination, correct it before dispatch.
 
 ### Tips

@@ -494,6 +494,10 @@ class PosOrder(models.Model):
         account_tax = self.env['account.tax']
         price_digits = self.env['decimal.precision'].precision_get('Product Price')
         pricelist = pricelist.with_company(self.company_id)
+        can_edit_price = not config.restrict_price_control or config.group_pos_manager_id in self.env.user.groups_id
+        discount_lines = self.env['pos.order.line']
+        if 'discount_product_id' in config._fields and config.module_pos_discount and config.discount_product_id:
+            discount_lines = self.lines.filtered(lambda line: line.product_id == config.discount_product_id)
         tip_lines = self.lines.filtered(lambda line: line.product_id == config.tip_product_id)
         tip_minor = minor_units(self.tip_amount, digits)
         if tip_minor or tip_lines:
@@ -509,34 +513,44 @@ class PosOrder(models.Model):
         for line in self.lines:
             product = line.product_id
             taxes = product.taxes_id._filter_taxes_by_company(self.company_id)
+            global_discount = line in discount_lines
             if (
                 not all(isfinite(value) for value in (line.qty, line.price_unit, line.discount))
-                or line.qty <= 0 or line.price_unit < 0 or not 0 <= line.discount <= 100
+                or line.qty <= 0 or (line.price_unit < 0 and not global_discount) or not 0 <= line.discount <= 100
                 or (line.discount and not config.manual_discount)
-                or (line.price_type == 'manual' and line not in tip_lines) or line.price_extra
+                or (line.price_type == 'manual' and line not in tip_lines and not global_discount and not can_edit_price)
+                or (global_discount and (
+                    line.price_type != 'manual' or line.qty != 1 or line.price_unit >= 0 or line.discount
+                    or line.combo_parent_id or line.combo_line_ids or line in tip_lines
+                ))
+                or line.price_extra
                 or line.refunded_orderline_id or (line.combo_item_id and line not in combo_prices)
                 or (line.combo_parent_id and line not in combo_prices)
                 or product.tracking != 'none'
                 or not product.active or not product.sale_ok
-                or (not product.available_in_pos and not line.combo_parent_id and line not in tip_lines)
+                or (not product.available_in_pos and not line.combo_parent_id and line not in tip_lines and not global_discount)
                 or (product.company_id and product.company_id != self.company_id)
-                or set(taxes.ids) != set(line.tax_ids.ids)
+                or (not global_discount and set(taxes.ids) != set(line.tax_ids.ids))
             ):
                 raise UserError(_("An Odoo basket item cannot be priced for Square Terminal."))
             if line in tip_lines:
                 price = self.tip_amount
             elif line in combo_prices:
                 price = combo_prices[line]
+            elif line.price_type == 'manual':
+                price = line.price_unit
             else:
                 price = pricelist._get_product_price(product, line.qty) if pricelist else product.lst_price
             if float_compare(price, line.price_unit, precision_digits=price_digits):
                 raise UserError(_("The Odoo basket price changed. Reload the register and check the sale."))
-            unit_prices[line] = float_round(price, precision_digits=price_digits)
+            unit_prices[line] = price if global_discount else float_round(price, precision_digits=price_digits)
 
         base_lines = self.lines._prepare_tax_base_line_values()
         for line, base in zip(self.lines, base_lines):
             base['price_unit'] = unit_prices[line]
         account_tax._add_tax_details_in_base_lines(base_lines, self.company_id)
+        discount_groups = {}
+        groups_by_line = {}
         for line, base in zip(self.lines, base_lines):
             account_tax._round_base_lines_tax_details([base], self.company_id)
             details = base['tax_details']
@@ -545,6 +559,24 @@ class PosOrder(models.Model):
                 or currency.compare_amounts(line.price_subtotal_incl, details['total_included_currency'])
             ):
                 raise UserError(_("The Odoo basket price changed. Reload the register and check the sale."))
+            if discount_lines and line not in tip_lines:
+                taxes = base['tax_ids']
+                discount_taxes = taxes.filtered(lambda tax: tax._can_be_discounted())
+                group = discount_groups.setdefault(frozenset(discount_taxes.ids), {
+                    'base': Decimal(0), 'tax_groups': set(), 'discounts': [], 'items': [],
+                })
+                groups_by_line[line] = group
+                if line in discount_lines:
+                    if discount_taxes != taxes:
+                        raise UserError(_("The Odoo global discount has unexpected taxes."))
+                    group['discounts'].append(-Decimal(str(line.price_unit)))
+                else:
+                    group['tax_groups'].add(frozenset(taxes.ids))
+                    # Odoo's Global Discount starts from each line's total less additive taxes.
+                    group['base'] += Decimal(str(details['total_included_currency'])) - sum(
+                        Decimal(str(tax['tax_amount_currency'])) for tax in details['taxes_data']
+                        if not tax['tax'].price_include
+                    )
 
         account_tax._round_base_lines_tax_details(base_lines, self.company_id)
         line_items = []
@@ -573,7 +605,7 @@ class PosOrder(models.Model):
                 'type': 'INCLUSIVE' if tax.price_include else 'ADDITIVE',
                 'percentage': decimal_string(tax.amount),
             } for tax, amount in taxes if amount]
-            line_items.append({
+            item = {
                 'product': line.product_id,
                 'name': line.product_id.with_context(display_default_code=False).display_name[:255],
                 'combo': line in combo_prices,
@@ -589,7 +621,10 @@ class PosOrder(models.Model):
                 ),
                 'tax_minor': tax_minor,
                 'discount_minor': base_before_discount - base_after_discount,
-            })
+            }
+            line_items.append(item)
+            if discount_lines:
+                groups_by_line[line]['items'].append(item)
         expected_total = sum(line['total_minor'] for line in line_items)
         expected_tax = sum(line['tax_minor'] for line in line_items)
         self.with_context(backend_recomputation=True)._compute_prices()
@@ -599,7 +634,45 @@ class PosOrder(models.Model):
             or minor_units(self.amount_total, digits) != expected_total + tip_minor
         ):
             raise UserError(_("The calculated Odoo amounts differ from the displayed basket."))
+        if discount_lines:
+            line_items = self._square_global_discount_basket(discount_groups.values(), digits, price_digits)
         return expected_total, line_items, tip_minor
+
+    def _square_global_discount_basket(self, groups, digits, price_digits):
+        receipt_items = []
+        min_rate, max_rate = Decimal(0), Decimal(1)
+        price_tolerance = Decimal(5).scaleb(-price_digits - 1)
+        for group in groups:
+            base, discounts, items = group['base'], group['discounts'], group['items']
+            discount = sum(discounts)
+            if base > 0:
+                margin = price_tolerance * max(1, len(discounts))
+                min_rate = max(min_rate, (discount - margin) / base)
+                max_rate = min(max_rate, (discount + margin) / base)
+            if len(discounts) > len(group['tax_groups']) or (discount and base <= 0) or min_rate > max_rate:
+                raise UserError(_("The Odoo global discount does not match the original basket."))
+            if not discounts:
+                receipt_items.extend(items)
+                continue
+
+            # Preserve the group's tax amounts when folding its negative discount lines into one Square line.
+            representative = next((item for item in items if item['product'].type == 'combo'), items[0])
+            taxed_items = [item for item in items if item['tax_minor']]
+            taxes = taxed_items[0]['taxes'] if taxed_items else []
+            receipt_items.append({
+                **representative,
+                'global_discount': True,
+                'total_minor': sum(item['total_minor'] for item in items),
+                'tax_minor': sum(item['tax_minor'] for item in items),
+                'inclusive_tax_minor': sum(item['inclusive_tax_minor'] for item in items),
+                'discount_minor': (
+                    minor_units(self.currency_id.round(float(discount)), digits)
+                    + sum(item['discount_minor'] for item in items)
+                ),
+                'taxes': taxes,
+                'summary_tax': any(item['summary_tax'] or item['taxes'] != taxes for item in taxed_items),
+            })
+        return receipt_items
 
     def _square_combo_prices(self, pricelist, digits):
         prices = {}
@@ -710,6 +783,8 @@ class PosOrder(models.Model):
         }
 
     def _square_summary_reason(self, line_items):
+        if any(line.get('global_discount') for line in line_items):
+            return 'global_discount'
         if any(line['combo'] for line in line_items):
             return 'combo'
         if any(

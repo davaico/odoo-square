@@ -1,5 +1,6 @@
 import { registry } from "@web/core/registry";
 import * as Chrome from "@point_of_sale/../tests/tours/utils/chrome_util";
+import * as Dialog from "@point_of_sale/../tests/tours/utils/dialog_util";
 import * as NumberPopup from "@point_of_sale/../tests/tours/utils/number_popup_util";
 import * as PaymentScreen from "@point_of_sale/../tests/tours/utils/payment_screen_util";
 import * as PartnerList from "@point_of_sale/../tests/tours/utils/partner_list_util";
@@ -53,6 +54,39 @@ registry.category("web_tour.tours").add("SquareTerminalDiscountedFraction", {
         { trigger: ".payment-screen .send_payment_request", run: "click" },
         ...ReceiptScreen.receiptIsThere(),
         ...ReceiptScreen.receiptAmountTotalIs("16.20"),
+        { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalGlobalDiscount", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.addOrderline("Monitor Stand"),
+        ...ProductScreen.clickControlButton("Discount"),
+        Dialog.confirm(),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "15.30"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("15.30"),
+        { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
+        { trigger: ".pos-receipt .orderline:contains('Monitor Stand')" },
+        { trigger: ".pos-receipt .orderline:contains('Discount')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalManualPrice", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad", 1, 11, "11.00"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "11.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("11.00"),
         { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
     ],
 });

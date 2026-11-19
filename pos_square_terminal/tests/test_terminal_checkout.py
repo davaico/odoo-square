@@ -1702,6 +1702,28 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertEqual(order.lines.qty, 1.5)
         self.assertEqual(order.lines.discount, 10)
 
+    def test_manager_price_control_allows_native_manual_price(self):
+        self.main_pos_config.restrict_price_control = True
+        self.pos_user.groups_id = [Command.link(self.env.ref('point_of_sale.group_pos_manager').id)]
+
+        def check_order(order):
+            line, = order['line_items']
+            self.assertEqual(line['name'], 'Desk Pad')
+            self.assertEqual(line['base_price_money'], self._money(1100))
+
+        self._run_priced_checkout('SquareTerminalManualPrice', ((1100, 0, 0),), check_order)
+        line = self.pos_session.order_ids.lines
+        self.assertEqual((line.price_type, line.price_unit), ('manual', 11))
+
+    def test_restricted_cashier_cannot_submit_manual_price(self):
+        self.main_pos_config.restrict_price_control = True
+        order = self._cashier_draft(amount=11)
+        order.lines.price_type = 'manual'
+        with patch('odoo.addons.pos_square_terminal.square_api.request') as provider:
+            with self.assertRaisesRegex(UserError, 'cannot be priced'), self.cr.savepoint():
+                order.square_prepare_payment(order.uuid, order.payment_ids.uuid)
+            provider.assert_not_called()
+
     def test_mixed_combo_recovers_original_cash_and_card_after_lost_settlement(self):
         euro = self.env.ref('base.EUR')
         euro.active = True
@@ -2336,3 +2358,53 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertEqual(order.payment_ids, payment)
         self.assertEqual(payment.transaction_id, 'SQUAREPAYMENT')
         self.assertEqual(order.picking_ids.move_ids.ids, picking_moves)
+
+
+@tagged('post_install', '-at_install', '-standard', 'square_terminal_discount')
+class TestSquareTerminalGlobalDiscount(TestSquareTerminalCheckout):
+    def test_global_discount_reaches_square_with_tax_and_itemized_odoo_receipt(self):
+        tax = self._included_vat()
+        self.desk_pad.write({'lst_price': 12, 'taxes_id': [Command.set(tax.ids)]})
+        self.monitor_stand.lst_price = 5
+        discount_product = self.env.ref('pos_discount.product_product_consumable')
+        self.pos_session.post_closing_cash_details(0)
+        self.pos_session.close_session_from_ui()
+        self.main_pos_config.write({
+            'module_pos_discount': True, 'discount_product_id': discount_product.id, 'discount_pc': 10,
+        })
+        self.main_pos_config.with_user(self.pos_user).open_ui()
+        self.pos_session = self.main_pos_config.current_session_id
+        self.pos_session.set_opening_control(0, '')
+
+        def check_order(order):
+            self.assertTrue(all(line['name'].startswith('Odoo receipt ') for line in order['line_items']))
+            self.assertEqual([line['base_price_money'] for line in order['line_items']], [self._money(1200), self._money(500)])
+            self.assertEqual([discount['amount_money'] for discount in order['discounts']], [self._money(120), self._money(50)])
+
+        self._run_priced_checkout('SquareTerminalGlobalDiscount', ((1080, 180, 120), (450, 0, 50)), check_order)
+        order = self.pos_session.order_ids
+        self.assertAlmostEqual(order.amount_total, 15.30)
+        self.assertAlmostEqual(order.amount_tax, 1.80)
+        self.assertEqual(order.lines.product_id, self.desk_pad | self.monitor_stand | discount_product)
+        self.assertEqual(sorted(order.lines.filtered(lambda line: line.product_id == discount_product).mapped('price_unit')), [-1.2, -0.5])
+
+        # A cashier cannot apply 10% to the taxed goods and 20% to the untaxed goods in one Global Discount.
+        with patch('odoo.addons.pos_square_terminal.square_api.request') as provider:
+            with self.assertRaisesRegex(UserError, 'global discount does not match'), self.cr.savepoint():
+                draft = self._cashier_draft(amount=14.80)
+                draft.lines.unlink()
+                draft.write({'amount_tax': 1.80, 'lines': [
+                    Command.create({
+                        'product_id': product.id, 'qty': 1, 'price_unit': price,
+                        'price_subtotal': net, 'price_subtotal_incl': price,
+                        'price_type': 'manual' if product == discount_product else 'original',
+                        'tax_ids': [Command.set(taxes)], 'uuid': str(uuid4()),
+                    }) for product, price, net, taxes in (
+                        (self.desk_pad, 12, 10, tax.ids),
+                        (self.monitor_stand, 5, 5, []),
+                        (discount_product, -1.2, -1, tax.ids),
+                        (discount_product, -1, -1, []),
+                    )
+                ]})
+                draft.square_prepare_payment(draft.uuid, draft.payment_ids.uuid)
+            provider.assert_not_called()
