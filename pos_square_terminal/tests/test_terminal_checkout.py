@@ -66,13 +66,15 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
     def test_signed_checkout_notification_recovers_original_payment_without_the_register(self):
         order = self._cashier_draft()
         payment = order.payment_ids
-        connection = self.method.sudo().square_terminal_id.connection_id
+        connection = self.method.sudo().square_terminal_id.connection_id.with_user(self.pos_admin)
         webhook_path = f'/pos/square/terminal/webhook/{connection.id}'
         webhook_url = f'https://register.example.test{webhook_path}'
         secret = 'terminal-webhook-secret'
         connection.write({
             'webhook_url': webhook_url, 'new_webhook_signature_key': secret,
         })
+        self.assertTrue(connection.has_webhook_signature_key)
+        self.assertFalse(connection.new_webhook_signature_key)
         checkout = {}
         requests = []
         money = {'amount': 1234, 'currency': self.currency}
@@ -80,8 +82,10 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         def square_response(method, url, **kwargs):
             path = urlsplit(url).path
             requests.append((method, path))
-            if (method, path) == ('POST', '/v2/orders'):
-                payload = {'order': {**kwargs['json']['order'], 'id': 'SQUAREORDER', 'total_money': money}}
+            if (method, path) == ('POST', '/v2/orders/calculate'):
+                payload = {'order': self._draft_provider_order(kwargs['json']['order'], 1234)}
+            elif (method, path) == ('POST', '/v2/orders'):
+                payload = {'order': {**self._draft_provider_order(kwargs['json']['order'], 1234), 'id': 'SQUAREORDER'}}
             elif (method, path) == ('POST', '/v2/terminals/checkouts'):
                 checkout.update(
                     kwargs['json']['checkout'], id='SQUARECHECKOUT', location_id='SQUARELOC', status='PENDING',
@@ -97,10 +101,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 }}
             else:
                 self.fail(f'Unexpected Square request: {method} {path}')
-            response = Response()
-            response.status_code = 200
-            response._content = json.dumps(payload).encode()
-            return response
+            return self._square_response(payload)
 
         def notify(event_id, *, merchant='SQUAREMERCHANT', signing_url=webhook_url):
             body = json.dumps({
@@ -128,14 +129,14 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             self.assertEqual(notify('checkout-updated', signing_url=webhook_url + '/wrong').status_code, 403)
             self.assertEqual(notify('checkout-updated').status_code, 204)
             self.assertEqual(notify('checkout-updated').status_code, 204)
-            self.assertEqual(len(requests), 2)
+            self.assertEqual(len(requests), 3)
             cron = self.env.ref('pos_square_terminal.ir_cron_square_terminal_webhooks')
             cron.method_direct_trigger()
             self.env.invalidate_all()
             self.assertEqual(order.payment_ids, payment)
             self.assertEqual(payment.payment_status, 'done')
             self.assertEqual(payment.transaction_id, 'SQUAREPAYMENT')
-            self.assertEqual(len(requests), 4)
+            self.assertEqual(len(requests), 5)
             self.assertEqual(notify('checkout-older').status_code, 204)
             cron.method_direct_trigger()
             self.env.invalidate_all()
@@ -155,8 +156,10 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         def square_response(method, url, **kwargs):
             path = urlsplit(url).path
             requests.append((method, path))
-            if (method, path) == ('POST', '/v2/orders'):
-                payload = {'order': {**kwargs['json']['order'], 'id': 'SQUAREORDER', 'total_money': money}}
+            if (method, path) == ('POST', '/v2/orders/calculate'):
+                payload = {'order': self._draft_provider_order(kwargs['json']['order'], 1234)}
+            elif (method, path) == ('POST', '/v2/orders'):
+                payload = {'order': {**self._draft_provider_order(kwargs['json']['order'], 1234), 'id': 'SQUAREORDER'}}
             elif (method, path) == ('POST', '/v2/terminals/checkouts'):
                 checkout.update(
                     kwargs['json']['checkout'], id='SQUARECHECKOUT', location_id='SQUARELOC',
@@ -174,10 +177,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 }}
             else:
                 self.fail(f'Unexpected Square request: {method} {path}')
-            response = Response()
-            response.status_code = 200
-            response._content = json.dumps(payload).encode()
-            return response
+            return self._square_response(payload)
 
         with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
             order.square_prepare_payment(order.uuid, payment.uuid)
@@ -192,7 +192,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             cron.method_direct_trigger()
 
         self.assertEqual(requests, [
-            ('POST', '/v2/orders'), ('POST', '/v2/terminals/checkouts'),
+            ('POST', '/v2/orders/calculate'), ('POST', '/v2/orders'), ('POST', '/v2/terminals/checkouts'),
             ('POST', '/v2/terminals/checkouts/search'), ('GET', '/v2/payments/SQUAREPAYMENT'),
         ])
         self.env.invalidate_all()
@@ -216,9 +216,11 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             if parsed.netloc == 'connect.squareupsandbox.com':
                 self.assertEqual(kwargs['headers']['Authorization'], 'Bearer replacement-token')
                 self.assertEqual(method, 'POST')
-                if path == '/v2/orders':
+                if path == '/v2/orders/calculate':
+                    payload = {'order': self._draft_provider_order(kwargs['json']['order'], 1234)}
+                elif path == '/v2/orders':
                     self.assertEqual(kwargs['json']['order']['location_id'], 'NEWLOCATION')
-                    payload = {'order': {**kwargs['json']['order'], 'id': 'NEWORDER', 'total_money': money}}
+                    payload = {'order': {**self._draft_provider_order(kwargs['json']['order'], 1234), 'id': 'NEWORDER'}}
                 else:
                     self.assertEqual(path, '/v2/terminals/checkouts')
                     checkout = kwargs['json']['checkout']
@@ -228,8 +230,12 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             else:
                 self.assertEqual(parsed.netloc, 'connect.squareup.com')
                 self.assertEqual(kwargs['headers']['Authorization'], 'Bearer square-access-token')
-                if (method, path) == ('POST', '/v2/orders'):
-                    payload = {'order': {**kwargs['json']['order'], 'id': 'SQUAREORDER', 'total_money': money}}
+                if (method, path) == ('POST', '/v2/orders/calculate'):
+                    payload = {'order': self._draft_provider_order(kwargs['json']['order'], 1234)}
+                elif (method, path) == ('POST', '/v2/orders'):
+                    payload = {'order': {
+                        **self._draft_provider_order(kwargs['json']['order'], 1234), 'id': 'SQUAREORDER',
+                    }}
                 elif (method, path) == ('POST', '/v2/terminals/checkouts'):
                     original_checkout.update(kwargs['json']['checkout'], id='SQUARECHECKOUT',
                                              location_id='SQUARELOC', status='PENDING')

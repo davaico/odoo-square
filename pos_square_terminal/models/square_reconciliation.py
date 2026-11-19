@@ -23,6 +23,7 @@ class SquarePaymentAttempt(models.Model):
     verified_tip = fields.Monetary(compute='_compute_reconciliation_amounts')
     reconciliation_error = fields.Char(copy=False)
     reconciliation_discrepancy = fields.Char(copy=False)
+    order_pricing_discrepancy = fields.Char(compute='_compute_order_pricing_discrepancy', compute_sudo=True)
     next_reconciliation_at = fields.Datetime(default=fields.Datetime.now, index=True, copy=False)
 
     @api.depends('amount_minor', 'verified_base_minor', 'verified_tip_minor', 'square_order_link_id.currency_digits')
@@ -32,6 +33,15 @@ class SquarePaymentAttempt(models.Model):
             attempt.requested_amount = attempt.amount_minor / divisor
             attempt.verified_base = attempt.verified_base_minor / divisor
             attempt.verified_tip = attempt.verified_tip_minor / divisor
+
+    @api.depends('square_order_link_id.pricing_issue')
+    def _compute_order_pricing_discrepancy(self):
+        descriptions = {
+            'preview_discrepancy': _("Square's price preview differed from the Odoo sale."),
+            'created_order_discrepancy': _("The linked Square order differed from the Odoo sale."),
+        }
+        for attempt in self:
+            attempt.order_pricing_discrepancy = descriptions.get(attempt.square_order_link_id.pricing_issue, False)
 
     @api.model
     def _square_reconcilable_states(self):

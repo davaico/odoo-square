@@ -41,6 +41,7 @@
                             <field name="state"/>
                             <field name="provider_status" string="Square Terminal Status"/>
                             <field name="last_checked_at" string="Last Successful Check"/>
+                            <field name="order_pricing_discrepancy" invisible="not order_pricing_discrepancy"/>
                             <field name="reconciliation_discrepancy" invisible="not reconciliation_discrepancy"/>
                             <field name="reconciliation_error" string="Latest Check Error"
                                    invisible="not reconciliation_error or reconciliation_error == reconciliation_discrepancy"/>
