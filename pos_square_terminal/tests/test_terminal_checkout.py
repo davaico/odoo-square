@@ -373,12 +373,15 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             self.assertTrue(attempt.refund_reconciliation_issue)
 
             pending = attempt.square_refund_ids.filtered(lambda refund: refund.square_refund_id == 'LATER-5')
+            pending_refund_filter = [('id', '=', attempt.id), ('refund_ids', 'in', pending.ids)]
+            self.assertFalse(attempt.search(pending_refund_filter))
             refunds['LATER-5'] = ('COMPLETED', 500, 'SQUAREPAYMENT', 'EUR')
             refund_ids = ['LATER-5', 'LATER-5']
             refunded_minor = 1500
             attempt.action_check_square_payment()
             self.assertEqual(set(attempt.refund_ids.mapped('square_refund_id')), {'MISSED-10', 'LATER-5'})
             self.assertEqual(pending.status, 'COMPLETED')
+            self.assertEqual(attempt.search(pending_refund_filter), attempt)
             self.assertEqual(attempt.refunded_amount, 15)
             self.assertFalse(attempt.refund_reconciliation_issue)
 

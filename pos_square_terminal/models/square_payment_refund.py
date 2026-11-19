@@ -14,6 +14,9 @@ class SquarePaymentRefund(models.Model):
     _rec_name = 'square_refund_id'
 
     attempt_id = fields.Many2one('pos.square.payment.attempt', required=True, ondelete='restrict', index=True)
+    confirmed_attempt_id = fields.Many2one(
+        'pos.square.payment.attempt', compute='_compute_confirmed_attempt', store=True, index=True,
+    )
     company_id = fields.Many2one(related='attempt_id.company_id', store=True)
     environment = fields.Char(required=True)
     merchant_id = fields.Char(required=True)
@@ -30,6 +33,11 @@ class SquarePaymentRefund(models.Model):
         ('square_refund_unique', 'unique(environment, merchant_id, square_refund_id)',
          'This Square refund has already been recorded.'),
     ]
+
+    @api.depends('attempt_id', 'status')
+    def _compute_confirmed_attempt(self):
+        for refund in self:
+            refund.confirmed_attempt_id = refund.attempt_id if refund.status == 'COMPLETED' else False
 
     @api.depends('amount_minor', 'attempt_id.square_order_link_id.currency_digits')
     def _compute_amount(self):
@@ -52,17 +60,12 @@ class SquarePaymentAttempt(models.Model):
 
     square_refund_ids = fields.One2many('pos.square.payment.refund', 'attempt_id', string='Square Refunds')
     refund_ids = fields.One2many(
-        'pos.square.payment.refund', compute='_compute_confirmed_refunds', string='Confirmed Square Refunds',
+        'pos.square.payment.refund', 'confirmed_attempt_id', string='Confirmed Square Refunds',
     )
     refunded_amount = fields.Monetary(
         string='Confirmed Refund Total', compute='_compute_refunded_amount', compute_sudo=True,
     )
     refund_reconciliation_issue = fields.Char(string='Refund Check Issue', copy=False)
-
-    @api.depends('square_refund_ids.status')
-    def _compute_confirmed_refunds(self):
-        for attempt in self:
-            attempt.refund_ids = attempt.square_refund_ids.filtered_domain([('status', '=', 'COMPLETED')])
 
     @api.depends('refund_ids.amount_minor', 'square_order_link_id.currency_digits')
     def _compute_refunded_amount(self):
