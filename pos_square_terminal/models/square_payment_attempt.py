@@ -462,9 +462,7 @@ class SquarePaymentAttempt(models.Model):
         status = self._cashier_tender_status()
         tip_line = self.square_order_link_id.device_tip_line_id
         if tip_line:
-            status['device_tip_line'] = tip_line.read(
-                tip_line._load_pos_data_fields(self.order_id.config_id.id), load=False,
-            )[0]
+            status['device_tip_line'] = tip_line._load_pos_data_read(tip_line, self.order_id.config_id)[0]
         if self.square_order_link_id.split:
             link = self.square_order_link_id
             status['cash_tenders'] = {

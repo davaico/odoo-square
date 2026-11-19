@@ -1,13 +1,13 @@
-# Square Terminal for Odoo 18 Point of Sale
+# Square Terminal for Odoo 19 Point of Sale
 
 Use this addon to take an in-person card payment on a Square Terminal for a sale started in Odoo. Odoo keeps the itemized receipt. Square receives a linked order and the verified tenders.
 
 ## Connect your Square application
 
-1. Put the `pos_square_terminal` addon on the Odoo 18 addons path and install **Square Terminal for Point of Sale** as a Point of Sale administrator. It requires **Point of Sale** and the Python packages `cryptography` and `requests`. The Square sales importer and website payment addon are optional. If **Square POS Integration** (`odoo_square`) is already installed, upgrade it to `18.0.1.4.3` from the same release to load its stock-count schema changes.
+1. Put the `pos_square_terminal` addon on the Odoo 19 Community addons path and install **Square Terminal for Point of Sale** as a Point of Sale administrator. It requires **Point of Sale** and the Python packages `cryptography` and `requests`. The Square sales importer and website payment addon are optional. If **Square POS Integration** (`odoo_square`) is already installed, upgrade it to `19.0.1.4.3` from the same release to load its stock-count schema changes.
 2. Generate a Fernet key with `python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`. Set `ODOO_SQUARE_TERMINAL_ENCRYPTION_KEY` in the Odoo server environment. Use the same key on all workers and keep it in your secret store so a database restore can still read the encrypted credentials.
 3. Under **Point of Sale → Configuration → Square Connections**, create a connection for the register's company. Select **Production** for physical hardware or **Sandbox** for simulated checkouts.
-4. In the merchant's [Square Developer Console](https://developer.squareup.com/apps), select or create the merchant-owned application. Register the **OAuth Redirect URL** displayed on the Odoo connection in the matching Square environment. Use the browser-visible HTTPS address as Odoo's `web.base.url`. Sandbox can use HTTP on localhost.
+4. In the merchant's [Square Developer Console](https://developer.squareup.com/apps), select or create the merchant-owned application. For Production, first make the Odoo instance reachable at an HTTPS URL. Set that address as Odoo's `web.base.url` and open Odoo through it during setup. Register the **OAuth Redirect URL** displayed on the Odoo connection in the matching Square environment. Sandbox can use HTTP on localhost for OAuth.
 5. Enter the **Application ID** and **New Application Secret** for that environment. Save and choose **Authorize or Reconnect with Square**. Sign in to the intended merchant account. Back in Odoo, verify the **Merchant ID** and the intended **Square Location**. The location must be active, support card processing, and use the same currency as the Odoo register and bank journal. Use **Refresh Locations** after changing a location in Square. [Square's supported regions](https://developer.squareup.com/docs/in-person-payment-options)
 6. In the same Square environment, create a webhook subscription using the saved connection's **Webhook Endpoint**. Subscribe to `terminal.checkout.created`, `terminal.checkout.updated`, `payment.created`, `payment.updated`, `refund.created`, and `refund.updated`. In **Square Notifications** on the Odoo connection, save the exact HTTPS URL and the subscription's signature key. Verify **Webhook Key Saved**. [Square webhook setup](https://developer.squareup.com/docs/webhooks/step2subscribe)
 
@@ -68,7 +68,7 @@ Square lists linked orders and itemization for the EU. Its delayed-capture and p
 
 ## Qualify the French terminal on hardware
 
-After automated acceptance, use the merchant's existing physical Square Terminal in France for the agreed anonymous €0.01 purchases. The automated suite exercises the €60 sale with €20 cash and €40 card, along with simulated recovery and handover. Hardware qualification requires observations from the actual Production account.
+Use an anonymous €0.01 card purchase for hardware qualification on the merchant's Production account. The automated suite exercises the €60 sale with €20 cash and €40 card, along with simulated recovery and handover. Record the physical result separately.
 
 1. Follow the connection, pairing and payment method steps above. If the approved production device is already paired, check readiness on that record and record that the previous pairing was reused. Record the Odoo revision, Square API version, Terminal app version, France/EUR location, selected method and readiness result.
 2. Use a POS-enabled service item priced at €0.01 in the register's active pricelist, with no tax, discount, or inventory tracking. Disable all-tender rounding and device tipping for the test register. Confirm the basket total is €0.01, with **Customer** blank and **Invoice** off. Enter one Square card share for €0.01.

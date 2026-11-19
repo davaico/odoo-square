@@ -27,6 +27,21 @@ jobs:
           - suite: combined
             modules: payment_square_online,website_sale_stock,payment_demo,odoo_square
             tags: /payment_square_online,/odoo_square
+          - suite: terminal
+            modules: pos_square_terminal
+            tags: standard/pos_square_terminal
+          - suite: terminal-importer
+            modules: pos_square_terminal,odoo_square
+            tags: standard/pos_square_terminal,/odoo_square,square_terminal_import
+          - suite: terminal-combined
+            modules: pos_square_terminal,payment_square_online,website_sale_stock,payment_demo,odoo_square
+            tags: standard/pos_square_terminal,/payment_square_online,/odoo_square,square_terminal_import
+          - suite: terminal-discounts
+            modules: pos_square_terminal,pos_discount
+            tags: square_terminal_discount/pos_square_terminal:TestSquareTerminalGlobalDiscount.test_global_discount_reaches_square_with_tax_and_itemized_odoo_receipt
+          - suite: terminal-admission-races
+            modules: pos_square_terminal,l10n_generic_coa
+            tags: ''
           - suite: refund-races
             modules: payment_square_online
             tags: ''
@@ -62,24 +77,52 @@ jobs:
               < payment_square_online/tests/refund_race.py 2>&1 | tee test-results/refund-races.log
             grep -Fq 'Verified local requests dispatched once, Square ingestion made no request, and each refund posted once.' \
               test-results/refund-races.log
+          elif [[ "$TEST_SUITE" == terminal-admission-races ]]; then
+            "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_test \
+              --init="$ODOO_INIT_MODULES" --stop-after-init --no-http 2>&1 \
+              | tee test-results/install.log
+            printf '%s\n' \
+              'from odoo.addons.pos_square_terminal.tests.test_terminal_admission_concurrency import run' \
+              'run(env.registry)' \
+              | "${compose[@]}" run --rm -T odoo odoo shell --database=odoo_square_test --no-http \
+              2>&1 | tee test-results/terminal-admission-races.log
+            grep -Eq '^Ran 1 test in ' test-results/terminal-admission-races.log
           else
             "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_test \
               --init="$ODOO_INIT_MODULES" --test-tags="$ODOO_TEST_TAGS" \
               --workers=0 --stop-after-init --log-level=test 2>&1 | tee test-results/odoo-tests.log
             log=test-results/odoo-tests.log
             grep -Eq '(^|[[:space:]])0 failed, 0 error\(s\) of [1-9][0-9]* tests when loading database' "$log"
-            if grep -Eq 'odoo\.addons\.(odoo_square|payment_square_online)\.tests\..*: skipped ' "$log"; then
+            if grep -Eq 'odoo\.addons\.(odoo_square|payment_square_online|pos_square_terminal)\.tests\..*: skipped ' "$log"; then
               echo 'A required addon test was skipped.' >&2
               exit 1
             fi
-            if [[ "$TEST_SUITE" != pos ]]; then
-              grep -Fq 'Starting TestSquareOnlineCheckout.test_mobile_browser_completes_bank_verification_and_submits_the_embedded_card ' "$log"
-            fi
-            if [[ "$TEST_SUITE" != online ]]; then
-              grep -Eq 'odoo\.addons\.odoo_square\.tests\..*: Starting ' "$log"
-            fi
-            if [[ "$TEST_SUITE" == combined ]]; then
-              grep -Fq 'Starting TestSquareOnlinePosCoexistence.' "$log"
+            case "$TEST_SUITE" in
+              online|combined|terminal-combined)
+                grep -Fq 'Starting TestSquareOnlineCheckout.test_mobile_browser_completes_bank_verification_and_submits_the_embedded_card ' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              pos|combined|terminal-importer|terminal-combined)
+                grep -Eq 'odoo\.addons\.odoo_square\.tests\..*: Starting ' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              combined|terminal-combined)
+                grep -Fq 'Starting TestSquareOnlinePosCoexistence.' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              terminal|terminal-importer|terminal-combined)
+                grep -Fq 'Starting TestSquareTerminalCheckout.test_first_card_is_verified_on_original_sale ' "$log"
+                grep -Fq 'Starting TestSquareTerminalCheckout.test_mixed_combo_recovers_original_cash_and_card_after_lost_settlement ' "$log"
+                ;;
+              terminal-discounts)
+                grep -Fq 'Starting TestSquareTerminalGlobalDiscount.test_global_discount_reaches_square_with_tax_and_itemized_odoo_receipt ' "$log"
+                ;;
+            esac
+            if [[ "$TEST_SUITE" == terminal-importer || "$TEST_SUITE" == terminal-combined ]]; then
+              grep -Fq 'Starting TestSquareTerminalImport.' "$log"
             fi
           fi
 

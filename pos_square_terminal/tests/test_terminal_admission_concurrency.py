@@ -85,7 +85,7 @@ class TestTerminalAdmissionConcurrency(TestCase):
             cashier = env['res.users'].with_context(no_reset_password=True).create({
                 'name': 'Square concurrency cashier', 'login': f'square-race-{unique}',
                 'company_id': company.id, 'company_ids': [Command.set(company.ids)],
-                'groups_id': [Command.set([
+                'group_ids': [Command.set([
                     env.ref('base.group_user').id, env.ref('point_of_sale.group_pos_user').id,
                 ])],
             })

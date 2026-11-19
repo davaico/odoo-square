@@ -10,6 +10,8 @@ Checkout, payment collection, and refund initiation happen in Square. The addon 
 
 For Odoo website checkout, install **Square Online Payments**. You can install either addon on its own or run both in the same database. See the [website setup guide](payment_square_online/README.md) and [combined setup](payment_square_online/README.md#run-alongside-square-pos).
 
+For a sale started in the Odoo register, install **Square Terminal for Point of Sale** to send the card payment to a paired Square Terminal. The addon works on its own or alongside the sales importer and website provider. See the [Square Terminal setup and cashier guide](pos_square_terminal/README.md).
+
 ## Features
 
 - Secure Square webhook endpoint at `/square/webhook` with HMAC-SHA256 validation when a webhook signature key is configured.
@@ -205,6 +207,10 @@ Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before openin
 ## Security
 
 Please do not open public issues for vulnerabilities. See [SECURITY.md](SECURITY.md) for the supported version and private reporting process.
+
+## Maintained by Davai
+
+This module is built and maintained by [Davai](https://davai.co), a Paris software studio. We build custom ERPs and adapt Odoo to our clients' operations: [ERP sur mesure et intégration Odoo](https://davai.co/fr/services/erp-sur-mesure). More of our open source work: [davai.co/fr/open-source](https://davai.co/fr/open-source).
 
 ## License
 
