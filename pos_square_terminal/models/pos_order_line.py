@@ -46,12 +46,16 @@ class PosOrderLine(models.Model):
             orders = self.order_id | self.env['pos.order'].browse(vals.get('order_id') or [])
             orders._square_lock_checkout(touch=True)
             reserved = set(orders._square_reserved_attempts().order_id.ids)
-            for line in self:
-                if (
-                    reserved.intersection({line.order_id.id, vals.get('order_id')})
-                    and any(not same_value(line, field, vals[field]) for field in changes)
-                ):
-                    raise UserError(_("The original goods are reserved by a Square payment."))
+            protected = self.filtered(lambda line: reserved.intersection({line.order_id.id, vals.get('order_id')}))
+            if any(not same_value(line, field, vals[field]) for line in protected for field in changes):
+                raise UserError(_("The original goods are reserved by a Square payment."))
+            if protected:
+                # Keep persisted values when native POS sync replays an equivalent number or relation.
+                other_values = {field: value for field, value in vals.items() if field not in changes}
+                if other_values:
+                    super(PosOrderLine, protected).write(other_values)
+                unprotected = self - protected
+                return super(PosOrderLine, unprotected).write(vals) if unprotected else True
         return super().write(vals)
 
     def unlink(self):
