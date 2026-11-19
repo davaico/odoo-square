@@ -1,5 +1,5 @@
 from decimal import Decimal
-from math import isfinite
+from math import isclose, isfinite
 from uuid import uuid4
 
 from psycopg2.errors import UniqueViolation
@@ -31,16 +31,20 @@ def same_value(record, field, value):
     field_type = record._fields[field].type
     if field_type == 'many2one':
         return current.id == value
-    if field_type == 'many2many':
+    if field_type in ('many2many', 'one2many'):
         ids = set(current.ids)
+        if value is False or value is None:
+            return not ids
+        if isinstance(value, tuple) or (value and not isinstance(value[0], (tuple, list))):
+            return all(type(record_id) is int for record_id in value) and set(value) == ids
         return all(
             (command[0] == Command.LINK and command[1] in ids)
             or (command[0] == Command.SET and set(command[2]) == ids)
             or (command[0] == Command.CLEAR and not ids)
             for command in value
         )
-    if field_type == 'one2many':
-        return not value
+    if field_type == 'float' and type(value) in (int, float):
+        return isclose(current, value, rel_tol=1e-15)
     return (current or False) == (value or False)
 
 
@@ -510,14 +514,14 @@ class PosOrder(models.Model):
                 raise UserError(_("The Odoo tip differs from the recorded tip line."))
         combo_prices = self._square_combo_prices(pricelist, digits)
         unit_prices = {}
-        manual_tax_fields = {'manual_tax_amounts', 'manual_total_excluded', 'manual_total_excluded_currency'}
+        manual_tax_fields = {'computation_key', 'manual_tax_amounts', 'manual_total_excluded', 'manual_total_excluded_currency'}
         for line in self.lines:
             product = line.product_id
             taxes = product.taxes_id._filter_taxes_by_company(self.company_id)
             global_discount = line in discount_lines
             if line.extra_tax_data and (
                 not isinstance(line.extra_tax_data, dict)
-                or manual_tax_fields.intersection(line.extra_tax_data)
+                or (not global_discount and manual_tax_fields.intersection(line.extra_tax_data))
             ):
                 raise UserError(_("Square Terminal cannot verify a basket with manual tax overrides."))
             if (
@@ -550,6 +554,13 @@ class PosOrder(models.Model):
             if float_compare(price, line.price_unit, precision_digits=price_digits):
                 raise UserError(_("The Odoo basket price changed. Reload the register and check the sale."))
             unit_prices[line] = price if global_discount else float_round(price, precision_digits=price_digits)
+
+        if discount_lines:
+            discountable_lines = self.lines - (discount_lines | tip_lines)
+            discountable_bases = discountable_lines._prepare_tax_base_line_values()
+            for line, base in zip(discountable_lines, discountable_bases):
+                base.update(price_unit=unit_prices[line], rate=1.0)
+            self._square_check_global_discount_tax_data(discount_lines, discountable_bases, price_digits)
 
         base_lines = self.lines._prepare_tax_base_line_values()
         for line, base in zip(self.lines, base_lines):
@@ -643,6 +654,33 @@ class PosOrder(models.Model):
         if discount_lines:
             line_items = self._square_global_discount_basket(discount_groups.values(), digits, price_digits)
         return expected_total, line_items, tip_minor
+
+    def _square_check_global_discount_tax_data(self, discount_lines, discounted_bases, price_digits):
+        account_tax = self.env['account.tax']
+        error = _("The Odoo global discount does not match the original basket.")
+        percent = (discount_lines[0].extra_tax_data or {}).get('discount_percentage')
+        if type(percent) not in (int, float) or not 0 < percent <= 100:
+            raise UserError(error)
+
+        # The POS tax engine builds the discount in the register currency with a rate of 1.
+        account_tax._add_tax_details_in_base_lines(discounted_bases, self.company_id)
+        account_tax._round_base_lines_tax_details(discounted_bases, self.company_id)
+        expected = {
+            frozenset(base['tax_ids'].ids): base
+            for base in account_tax._prepare_global_discount_lines(
+                discounted_bases, self.company_id, 'percent', percent,
+            )
+        }
+        for line in discount_lines:
+            base = expected.pop(frozenset(line.tax_ids.ids), None)
+            if not base or float_compare(line.price_unit, base['price_unit'], precision_digits=price_digits):
+                raise UserError(error)
+            canonical = account_tax._export_base_line_extra_tax_data(base)
+            canonical['discount_percentage'] = percent
+            if line.extra_tax_data != canonical:
+                raise UserError(error)
+        if expected:
+            raise UserError(error)
 
     def _square_global_discount_basket(self, groups, digits, price_digits):
         receipt_items = []
