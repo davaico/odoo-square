@@ -120,7 +120,8 @@ class SquareOrder(models.Model):
                 'idempotency_key': str(uuid5(NAMESPACE_URL, f'odoo-square:handover-definition:{identity}')),
                 'custom_attribute_definition': {
                     'key': ATTRIBUTE_KEY,
-                    'name': 'Odoo POS in-store handover',
+                    # Square scopes unqualified keys to the app, but visible names to the seller.
+                    'name': f'Odoo POS in-store handover ({self.connection_id.application_id})',
                     'description': 'When the goods were handed over at the Odoo Point of Sale counter.',
                     'visibility': 'VISIBILITY_READ_ONLY',
                     'schema': {'$ref': STRING_SCHEMA},

@@ -11,6 +11,8 @@ from odoo.fields import Domain
 
 _logger = logging.getLogger(__name__)
 
+_PROCESSED_RESOURCE_RETENTION = timedelta(days=7)
+
 _EVENT_OBJECTS = {
     'terminal.checkout.created': 'checkout',
     'terminal.checkout.updated': 'checkout',
@@ -31,13 +33,21 @@ class SquareWebhookEvent(models.Model):
     environment = fields.Char(required=True)
     event_id = fields.Char(required=True)
     event_type = fields.Char(required=True)
-    resource_id = fields.Char(required=True)
+    resource_id = fields.Char()
     resource_reference = fields.Char()
-    next_check_at = fields.Datetime(required=True, default=fields.Datetime.now, index=True)
+    next_check_at = fields.Datetime(required=True, default=fields.Datetime.now)
     processed_at = fields.Datetime()
 
     _unique_event = models.Constraint(
         'UNIQUE(connection_id, event_id)', 'This Square notification was already received.',
+    )
+    _pending_resource = models.Constraint(
+        'CHECK (processed_at IS NOT NULL OR resource_id IS NOT NULL)',
+        'An unprocessed Square notification must have a resource ID.',
+    )
+    _due_index = models.Index('(next_check_at, id) WHERE processed_at IS NULL')
+    _processed_resource_index = models.Index(
+        '(processed_at) WHERE processed_at IS NOT NULL AND resource_id IS NOT NULL',
     )
 
     @staticmethod
@@ -111,7 +121,7 @@ class SquareWebhookEvent(models.Model):
             # Genuine Square sales and unrelated application events need no Terminal work.
             return True
         attempt._lock_reconciliation()
-        return attempt._refresh()
+        return attempt._square_reconcile_payment(continue_checkout=True)
 
     def _process_refund_event(self):
         refund = self.env['pos.square.payment.refund']._read_square_refund(self.connection_id, self.resource_id)
@@ -141,7 +151,7 @@ class SquareWebhookEvent(models.Model):
             return True
         attempt._lock_reconciliation()
         if attempt.state != 'verified':
-            attempt._refresh()
+            attempt._square_reconcile_payment()
             if attempt.state != 'verified':
                 return False
         if attempt.square_payment_id != payment_id:
@@ -159,7 +169,12 @@ class SquareWebhookEvent(models.Model):
     @api.model
     def _cron_process_webhooks(self):
         now = fields.Datetime.now()
-        self.search([('processed_at', '<', now - timedelta(days=7))], limit=500).unlink()
+        # Keep the receipt for audit and duplicate detection. Only clear the
+        # provider resource details that the queue no longer needs.
+        self.search([
+            ('processed_at', '<', now - _PROCESSED_RESOURCE_RETENTION),
+            ('resource_id', '!=', False),
+        ], limit=500).write({'resource_id': False, 'resource_reference': False})
         due = [('processed_at', '=', False), ('next_check_at', '<=', now)]
         for event_id in self.search(due, order='next_check_at, id', limit=20).ids:
             try:

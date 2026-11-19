@@ -5,10 +5,11 @@ from .const import SQUARE_API_VERSION, SQUARE_BASE_URLS
 
 
 class SquareAPIError(Exception):
-    def __init__(self, status=None, codes=()):
+    def __init__(self, status=None, codes=(), *, error_only=False):
         super().__init__('Square API request failed')
         self.status = status
         self.codes = codes
+        self.error_only = error_only
 
     @property
     def is_authorization_error(self):
@@ -18,10 +19,12 @@ class SquareAPIError(Exception):
         )
 
 
-def square_request(environment, method, path, *, access_token=None, payload=None, params=None):
+def square_request(environment, method, path, *, access_token=None, payload=None, params=None, before_request=None):
     headers = {'Square-Version': SQUARE_API_VERSION, 'Accept': 'application/json'}
     if access_token:
         headers['Authorization'] = f'Bearer {access_token}'
+    if before_request:
+        before_request()
     try:
         response = request(
             method, SQUARE_BASE_URLS[environment] + path, headers=headers, json=payload,
@@ -38,5 +41,6 @@ def square_request(environment, method, path, *, access_token=None, payload=None
             error['code'] for error in errors
             if isinstance(error, dict) and isinstance(error.get('code'), str)
         ) if isinstance(errors, list) else ()
-        raise SquareAPIError(response.status_code, codes)
+        error_only = data.keys() == {'errors'} and bool(codes) and len(codes) == len(errors)
+        raise SquareAPIError(response.status_code, codes, error_only=error_only)
     return data

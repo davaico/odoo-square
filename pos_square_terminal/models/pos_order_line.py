@@ -66,3 +66,65 @@ class PosOrderLine(models.Model):
         if orders._square_reserved_attempts():
             raise UserError(_("The original goods are reserved by a Square payment."))
         return super().unlink()
+
+
+class PosSquareOrderLineDetail(models.AbstractModel):
+    _name = 'pos.square.order.line.detail'
+    _description = 'Protection for Square POS order line details'
+
+    @api.model_create_multi
+    def create(self, vals_list):
+        default_line = self.env.context.get('default_pos_order_line_id')
+        line_ids = {vals.get('pos_order_line_id', default_line) for vals in vals_list} - {None, False}
+        orders = self.env['pos.order.line'].browse(list(line_ids)).order_id
+        orders._square_lock_checkout(touch=True)
+        if orders._square_reserved_attempts():
+            raise UserError(_("The original goods are reserved by a Square payment."))
+        return super().create(vals_list)
+
+    def write(self, vals):
+        changes = self._square_detail_fields.intersection(vals)
+        if changes:
+            self.check_access('write')
+            destination = self.env['pos.order.line'].browse(vals.get('pos_order_line_id') or []).order_id
+            orders = self.pos_order_line_id.order_id | destination
+            orders._square_lock_checkout(touch=True)
+            reserved = orders._square_reserved_attempts().order_id
+            if any(
+                (detail.pos_order_line_id.order_id | destination) & reserved
+                and any(not same_value(detail, field, vals[field]) for field in changes)
+                for detail in self
+            ):
+                raise UserError(_("The original goods are reserved by a Square payment."))
+        return super().write(vals)
+
+    def unlink(self):
+        self.check_access('unlink')
+        orders = self.pos_order_line_id.order_id
+        orders._square_lock_checkout(touch=True)
+        if orders._square_reserved_attempts():
+            raise UserError(_("The original goods are reserved by a Square payment."))
+        return super().unlink()
+
+
+class PosPackOperationLot(models.Model):
+    _name = 'pos.pack.operation.lot'
+    _inherit = ['pos.pack.operation.lot', 'pos.square.order.line.detail']
+
+    _square_detail_fields = {'pos_order_line_id', 'lot_name', 'product_id', 'order_id'}
+
+    def copy(self, default=None):
+        self.ensure_one()
+        if self.pos_order_line_id.order_id._square_reserved_attempts():
+            # Native POS first copies the lot, then attaches the copy to the return line.
+            default = {'pos_order_line_id': False, **(default or {})}
+        return super().copy(default)
+
+
+class ProductAttributeCustomValue(models.Model):
+    _name = 'product.attribute.custom.value'
+    _inherit = ['product.attribute.custom.value', 'pos.square.order.line.detail']
+
+    _square_detail_fields = {
+        'pos_order_line_id', 'custom_product_template_attribute_value_id', 'custom_value',
+    }

@@ -8,7 +8,7 @@ from odoo import api, fields, models
 from odoo.exceptions import UserError
 
 from ..square_api import SquareAPIError
-from .pos_order import minor_units
+from .pos_order_pricing import minor_units
 
 
 def matches_money(value, amount, currency):
@@ -77,8 +77,6 @@ class SquareOrder(models.Model):
         order = self.connection_id._request('POST', '/v2/orders/calculate', payload=payload).get('order')
         if not self._matches_order_totals(order):
             self.pricing_issue = 'preview_discrepancy'
-            return False
-        return True
 
     def _create_square_order(self):
         self.ensure_one()
@@ -166,13 +164,26 @@ class SquareOrder(models.Model):
         )
 
     def _matches_quantity_unit(self, line, requested):
-        if not requested:
+        if requested is None:
             return True
+        if requested is False:
+            return line.get('quantity_unit') is None
         unit = line.get('quantity_unit')
         if not isinstance(unit, dict) or type(unit.get('precision')) is not int:
             return False
         if 'catalog_object_id' in requested:
-            return unit.get('catalog_object_id') == requested['catalog_object_id'] and unit['precision'] == requested['precision']
+            expected_measurement = requested.get('measurement_unit')
+            actual_measurement = unit.get('measurement_unit')
+            return (
+                unit.get('catalog_object_id') == requested['catalog_object_id']
+                and unit['precision'] == requested['precision']
+                and (not expected_measurement or (
+                    isinstance(actual_measurement, dict)
+                    and {
+                        field: value for field, value in actual_measurement.items() if field.endswith('_unit')
+                    } == expected_measurement
+                ))
+            )
         measurement = unit.get('measurement_unit')
         return (
             unit['precision'] == requested['precision'] and isinstance(measurement, dict)
@@ -371,7 +382,7 @@ class SquareOrder(models.Model):
         except (SquareAPIError, UserError, ValueError):
             return
 
-    def _settle(self, attempts, *, allow_square_capture=True):
+    def _settle(self, attempts, *, allow_square_capture=True, for_release=False):
         self.ensure_one()
         request = self.settlement_request
         if not request or request['payment_ids'] != self._settlement_payment_ids(attempts):
@@ -379,17 +390,28 @@ class SquareOrder(models.Model):
         path = '/v2/orders/' + quote(self.square_order_id, safe='')
         try:
             self.order_id._square_check_reserved_amounts(attempts)
-            order, payments = self._read_settlement(path, attempts)
+            order, payments = self._read_settlement(path, attempts, for_release=for_release)
             all_approved = (
-                order['state'] == 'OPEN' and order.get('version') == request['order_version']
+                order['state'] == 'OPEN'
                 and self._matches_settlement_tenders(order, attempts, complete=False)
                 and all(payment['status'] == 'APPROVED' for payment in payments)
             )
             if all_approved and not allow_square_capture:
                 return 'authorizations_only'
             if all_approved and not self.cancel_requested:
+                version = order.get('version')
+                if type(version) is not int or version < 1:
+                    return 'unresolved'
+                capture_request = request
+                if version != request['order_version']:
+                    # Square binds idempotency to the request body. Keep one stable
+                    # key per verified version and use that version as a capture precondition.
+                    capture_request = {
+                        **request, 'order_version': version,
+                        'idempotency_key': str(uuid5(NAMESPACE_URL, f"{request['idempotency_key']}/{version}")),
+                    }
                 try:
-                    self.connection_id._request('POST', path + '/pay', payload=deepcopy(request))
+                    self.connection_id._request('POST', path + '/pay', payload=deepcopy(capture_request))
                 except (SquareAPIError, UserError):
                     # A missed response can still mean Square captured every tender.
                     pass
@@ -419,21 +441,28 @@ class SquareOrder(models.Model):
         )
         return 'released_tender_confirmed' if self.settlement_blocked else 'unresolved'
 
-    def _read_settlement(self, path, attempts):
+    def _read_settlement(self, path, attempts, *, for_release=False):
         for attempt in attempts:
             attempt._check_provider_scope()
-        order = self._read_settlement_order(path, attempts)
-        payments = [attempt._read_payment(attempt.square_payment_id) for attempt in attempts]
+        order = self._read_settlement_order(path, attempts, for_release=for_release)
+        payments = [attempt._read_settlement_payment() for attempt in attempts]
         payments.extend(self._read_cash_tender(tender) for tender in self.cash_tenders or [])
         return order, payments
 
-    def _read_settlement_order(self, path, attempts):
+    def _read_settlement_order(self, path, attempts, *, for_release=False):
         order = self.connection_id._request('GET', path).get('order')
         if (
             not isinstance(order, dict) or order.get('id') != self.square_order_id
+            or order.get('reference_id') != self.reference or order.get('location_id') != self.square_location_id
             or order.get('state') not in ('OPEN', 'COMPLETED', 'CANCELED')
         ):
             raise ValueError('Square order does not match the original split sale')
+        # The prices on an externally edited unpaid order can no longer be captured.
+        # Its identified authorizations can still be released after tender verification.
+        if for_release and order['state'] != 'COMPLETED':
+            return order
+        if order['state'] == 'OPEN' and order.get('fulfillments', []) != []:
+            raise ValueError('Square added a fulfillment to the original counter sale')
         expected_tip = sum(attempts.mapped('authorized_tip_minor')) + sum(
             tender['request'].get('tip_money', {}).get('amount', 0) for tender in self.cash_tenders or []
         )
