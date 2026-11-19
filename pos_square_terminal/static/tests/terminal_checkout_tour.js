@@ -765,7 +765,7 @@ registry.category("web_tour.tours").add("SquareTerminalInvoiceCustomer", {
                 this.anchor.click();
             },
         },
-        PartnerList.clickPartner("Square Invoice Customer"),
+        ...PartnerList.clickPartner("Square Invoice Customer"),
         ...ReceiptScreen.receiptIsThere(),
         ...ReceiptScreen.receiptAmountTotalIs("12.34"),
         { trigger: ".pos-receipt .paymentlines:contains('Square Counter')" },
