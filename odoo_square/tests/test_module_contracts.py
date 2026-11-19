@@ -21,7 +21,7 @@ class TestSquareModuleContracts(TransactionCase):
         manifest = Manifest.for_addon("odoo_square")
 
         self.assertEqual(manifest["license"], "AGPL-3")
-        self.assertEqual(manifest["version"], "19.0.1.4.2")
+        self.assertEqual(manifest["version"], "19.0.1.4.3")
         self.assertTrue(manifest["installable"])
         self.assertTrue(manifest["application"])
         self.assertIn("requests", manifest["external_dependencies"]["python"])
@@ -74,7 +74,7 @@ class TestSquareModuleContracts(TransactionCase):
         self.assertEqual(config.square_application_id, "square_app_test")
         self.assertEqual(config.square_access_token, "square_token_test")
         self.assertEqual(config.square_webhook_signature_key, "square_key_test")
-        self.assertEqual(config.module_version_display, "1.4.2")
+        self.assertEqual(config.module_version_display, "1.4.3")
         self.assertEqual(config.get_payment_journal().id, journal.id)
         self.assertEqual(
             config.get_warehouse_for_location("LOCATION_SECOND").id, second_warehouse.id

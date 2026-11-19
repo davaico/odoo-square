@@ -13,6 +13,10 @@
                                 type="object"
                                 class="oe_highlight"
                                 invisible="state != 'preview'"/>
+                        <button name="action_scan_missing_orders"
+                                string="Scan Again"
+                                type="object"
+                                invisible="state not in ('results', 'done') or not deferred_order_references"/>
                         <button name="action_validate_resync"
                                 string="Validate and Resync"
                                 type="object"
@@ -54,6 +58,11 @@
                                 <field name="missing_total" widget="integer"/>
                                 <field name="selected_total" widget="integer"/>
                             </group>
+                            <div class="alert alert-warning" role="alert"
+                                 invisible="state not in ('results', 'done') or not deferred_order_references">
+                                <span>These Square orders need another ownership check.</span>
+                                <field name="deferred_order_references" nolabel="1"/>
+                            </div>
                             <separator string="Missing Orders" colspan="4" invisible="state != 'results'"/>
                             <field name="line_ids" nolabel="1" invisible="state != 'results'" readonly="False">
                                 <list string="Missing Orders" editable="bottom" create="0" delete="0">

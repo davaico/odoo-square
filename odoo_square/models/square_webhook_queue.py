@@ -211,6 +211,8 @@ class SquareWebhookQueue(models.Model):
                 return False
 
             # Check if dependency is met (order exists)
+            processor = self.env["square.order.processor"].with_company(self.company_id)
+            routing = None
             if self.depends_on_order and self.square_order_id:
                 order_exists = (
                     self.env["sale.order"]
@@ -219,6 +221,10 @@ class SquareWebhookQueue(models.Model):
                 )
 
                 if not order_exists:
+                    config = processor._square_terminal_import_config()
+                    routing = processor._square_terminal_order_result(self.square_order_id, config)
+
+                if not order_exists and not routing:
                     # Order still doesn't exist, schedule next retry with exponential backoff
                     retry_delay = min(30 * (2**self.retry_count), 3600)  # Max 1 hour
                     next_retry = fields.Datetime.now() + timedelta(seconds=retry_delay)
@@ -250,7 +256,7 @@ class SquareWebhookQueue(models.Model):
 
                     return False
 
-            result = self.env["square.order.processor"].with_company(self.company_id)._process_order_event(
+            result = routing or processor._process_order_event(
                 order_data, "updated", self.webhook_event_id,
                 merchant_id=self.merchant_id, environment=self.environment,
             )

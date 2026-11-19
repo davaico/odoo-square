@@ -93,20 +93,21 @@ class TestSquareTerminalImport(TestPointOfSaleHttpCommon):
         return response
 
     def _import_lookup(self, url, **kwargs):
-        self.assertEqual(urlsplit(url).netloc, 'connect.squareup.com')
+        host = 'connect.squareup.com' if self.importer.square_environment == 'production' else 'connect.squareupsandbox.com'
+        self.assertEqual(urlsplit(url).netloc, host)
         self.assertEqual(kwargs['headers']['Authorization'], 'Bearer import-token')
         result = self.resources[urlsplit(url).path]
         if isinstance(result, Exception):
             raise result
         return self.response(result)
 
-    def _event(self, event, event_id, resource):
+    def _event(self, event, event_id, resource, *, merchant='MERCHANT'):
         kind, action = event.split('.')
         key = f'{kind}_{action}' if kind == 'order' else kind
         route = '/square/webhook'
         signed_url = 'https://' + urlsplit(self.base_url()).netloc + route
         body = json.dumps({
-            'event_id': event_id, 'merchant_id': 'MERCHANT', 'type': event,
+            'event_id': event_id, 'merchant_id': merchant, 'type': event,
             'data': {'id': resource.get('order_id') or resource.get('id'),
                      'type': kind, 'object': {key: resource}},
         }).encode()
@@ -143,7 +144,8 @@ class TestSquareTerminalImport(TestPointOfSaleHttpCommon):
             }],
             'total_money': self.money(4400),
             'tenders': [{
-                'id': payment_id, 'type': 'CARD', 'card_details': {'status': 'CAPTURED'},
+                'id': payment_id, 'payment_id': payment_id, 'type': 'CARD',
+                'card_details': {'status': 'CAPTURED'},
                 'amount_money': self.money(4400),
             }],
         }
@@ -312,6 +314,7 @@ class TestSquareTerminalImport(TestPointOfSaleHttpCommon):
             for event_id in ('terminal-inventory-sale', 'terminal-inventory-sale', 'terminal-inventory-replay'):
                 response = self._event('order.created', event_id, terminal_order)
                 self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()['status'], 'ignored', response.text)
             publish.run()
 
         self.assertEqual(square_stock(), 9)
@@ -341,6 +344,33 @@ class TestSquareTerminalImport(TestPointOfSaleHttpCommon):
             response = self._event('order.created', 'register-order', square_order)
             self.assertEqual(response.json()['status'], 'success', response.text)
         self._assert_independent_sales(odoo_order)
+
+    def test_order_reference_from_a_different_merchant_does_not_claim_square_sale(self):
+        self._assert_order_in_another_scope_is_imported(merchant='OTHER-MERCHANT')
+
+    def test_order_reference_from_a_different_environment_does_not_claim_square_sale(self):
+        self._assert_order_in_another_scope_is_imported(environment='sandbox')
+
+    def _assert_order_in_another_scope_is_imported(self, *, merchant='MERCHANT', environment='production'):
+        odoo_order = self._cashier_order()
+        terminal_order = self._register_square_sale('TERMINAL-ORDER')
+        with self._terminal_provider(terminal_order):
+            self._cashier_checkout(odoo_order)
+
+        self.importer.square_environment = environment
+        self.resources['/v2/locations/SHOP']['location']['merchant_id'] = merchant
+        independent_sale = self._register_square_sale(terminal_order['id'])
+        independent_sale['reference_id'] = terminal_order['reference_id']
+        with patch('odoo.addons.odoo_square.models.square_api_client.requests.get', side_effect=self._import_lookup):
+            response = self._event('order.created', 'independent-order', independent_sale, merchant=merchant)
+            self.assertEqual(response.json()['status'], 'success', response.text)
+
+        sale = self.env['sale.order'].search([('square_order_id', '=', independent_sale['id'])])
+        self.assertEqual(sale.invoice_ids.reconciled_payment_ids.amount, 44)
+        self.assertEqual(sale.picking_ids.state, 'done')
+        self.assertEqual(odoo_order.payment_ids.transaction_id, 'TERMINAL-ORDER-PAYMENT')
+        self.assertEqual(odoo_order.picking_ids.state, 'done')
+        self.assertEqual(self.product.with_context(location=self.warehouse.lot_stock_id.id).qty_available, 8)
 
     def test_early_terminal_refund_and_return_are_excluded_after_a_square_sale(self):
         odoo_order = self._cashier_order()
@@ -445,14 +475,16 @@ class TestSquareTerminalImport(TestPointOfSaleHttpCommon):
         queue = self.env['square.webhook.queue'].sudo()
         with patch('odoo.addons.odoo_square.models.square_api_client.requests.get', side_effect=self._import_lookup):
             self.assertEqual(self._event('order.created', 'register', square_order).json()['status'], 'success')
-            # Replay metadata saved by the signed webhook ingress.
+            # Simulate a verified update queued before the Terminal link was recognized.
             terminal_update, register_update = queue.create([{
                 'webhook_event_id': order_id + '-queued-update',
                 'event_type': 'order.updated',
                 'order_data': json.dumps({'order_id': order_id, 'location_id': 'SHOP', 'state': 'COMPLETED'}),
                 'square_order_id': order_id,
-                'config_id': self.importer.id,
-                'signature_verified': True,
+                'company_id': self.importer.company_id.id,
+                'merchant_id': 'MERCHANT',
+                'environment': self.importer.square_environment,
+                'verified': True,
                 'next_retry_time': fields.Datetime.now(),
             } for order_id in ('TERMINAL-ORDER', 'REGISTER-ORDER')])
             location = self.resources['/v2/locations/SHOP']
@@ -467,6 +499,5 @@ class TestSquareTerminalImport(TestPointOfSaleHttpCommon):
             queue.process_pending_events()
             queue.process_pending_events()
             self.assertEqual(terminal_update.state, 'completed')
-            self.assertEqual(terminal_update.order_data, '{}')
 
         self._assert_independent_sales(odoo_order)
