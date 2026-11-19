@@ -345,6 +345,34 @@ class TestSquareOnlinePosCoexistence(SquareOnlineCheckoutCase):
         pos_api.side_effect = self._pos_api
 
         self.assertEqual(self._notify("payment.updated", payment).json()["status"], "ignored")
+        # Website and Terminal ownership must use one Square response per order
+        # for this delivery, including missing reads and a return's original sale.
+        terminal_return = self._square_order("TERMINAL-RETURN", source_order_id=terminal["id"])
+        return_path = "/v2/orders/" + terminal_return["id"]
+        original_path = "/v2/orders/" + terminal["id"]
+        pos_api.reset_mock()
+        self.pos_objects[return_path] = {}
+        response = self._order_notification(terminal_return["id"], event_id="return-retry")
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual([urlsplit(call.args[0]).path for call in pos_api.call_args_list], [return_path])
+
+        self.pos_objects[return_path] = {"order": terminal_return}
+        self.pos_objects[original_path] = {}
+        pos_api.reset_mock()
+        response = self._order_notification(terminal_return["id"], event_id="return-retry")
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual([urlsplit(call.args[0]).path for call in pos_api.call_args_list], [return_path, original_path])
+
+        self.pos_objects[original_path] = {"order": terminal}
+        pos_api.reset_mock()
+        response = self._order_notification(terminal_return["id"], event_id="return-retry")
+        self.assertEqual(response.json(), {
+            "status": "ignored", "message": "Odoo POS Square Terminal operation",
+        }, response.text)
+        reads = [urlsplit(call.args[0]).path for call in pos_api.call_args_list]
+        self.assertEqual(reads.count(return_path), 1)
+        self.assertEqual(reads.count(original_path), 1)
+
         response = self._notify("order.created", terminal, event_id="terminal-order")
         self.assertEqual(response.json(), {
             "status": "ignored", "message": "Odoo POS Square Terminal operation",

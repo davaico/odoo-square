@@ -1,4 +1,5 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
+from functools import cache
 from urllib.parse import quote
 
 from odoo import _, models
@@ -54,13 +55,12 @@ class SquareOrderProcessor(models.Model):
                 return self._square_terminal_retry()
             return {"status": "ignored", "message": _("Odoo POS Square Terminal operation")}
 
-    def _square_terminal_order_result(self, order_id, config, *, full_order=None, merchant_id=None):
+    def _square_terminal_order_result(self, order_id, config, *, full_order=None, merchant_id=None, read_order=None):
         if not order_id or not config:
             return None
-        order = full_order if full_order is not None else self._square_read_routing_resource(
-            "orders", "order", order_id, config,
-        )
-        if not order or order.get("id") != order_id or not order.get("location_id"):
+        read_order = read_order or self.env["square.api.client"].sudo().get_order
+        order = full_order if full_order is not None else read_order(order_id, square_config=config)
+        if not isinstance(order, dict) or order.get("id") != order_id or not order.get("location_id"):
             return self._square_terminal_retry()
 
         retry = self._square_terminal_resource_result("order", order, config, expected_merchant=merchant_id)
@@ -72,8 +72,8 @@ class SquareOrderProcessor(models.Model):
             if isinstance(entry, dict) and isinstance(entry.get("source_order_id"), str) and entry["source_order_id"]
         }
         for source_id in sorted(source_ids - {order_id}):
-            source = self._square_read_routing_resource("orders", "order", source_id, config)
-            if not source or not source.get("location_id"):
+            source = read_order(source_id, square_config=config)
+            if not isinstance(source, dict) or source.get("id") != source_id or not source.get("location_id"):
                 retry = retry or self._square_terminal_retry()
                 continue
             result = self._square_terminal_resource_result("order", source, config, expected_merchant=merchant_id)
@@ -111,13 +111,15 @@ class SquareOrderProcessor(models.Model):
     def _square_pos_order_result(
         self, *, order_id, location_id=None, merchant_id=None, environment=None, square_config=None, full_order=None,
     ):
+        # Both classifiers must see the same authenticated order, including a failed read.
+        read_order = cache(self.env["square.api.client"].sudo().get_order)
         website = self._square_online_event_result(
             order_id=order_id, location_id=location_id, merchant_id=merchant_id,
-            environment=environment, square_config=square_config, full_order=full_order,
+            environment=environment, square_config=square_config, full_order=full_order, read_order=read_order,
         )
         if website and website["status"] == "ignored":
             return website
         config = self._square_terminal_import_config(square_config, environment=environment)
         return self._square_terminal_order_result(
-            order_id, config, full_order=full_order, merchant_id=merchant_id,
+            order_id, config, full_order=full_order, merchant_id=merchant_id, read_order=read_order,
         ) or website

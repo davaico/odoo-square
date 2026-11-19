@@ -4,6 +4,7 @@ from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo import models, fields
 from odoo.exceptions import UserError
 import logging
+from functools import cache
 
 _logger = logging.getLogger(__name__)
 
@@ -997,9 +998,12 @@ class SquareOrderProcessor(models.Model):
 
             # Fetch full order details from Square API to check for exchanges
             api_client = self.env["square.api.client"].sudo()
-            order_data = api_client.get_order(order_id)
+            read_order = cache(api_client.get_order)
+            order_data = read_order(order_id)
 
-            terminal_order = self._square_terminal_order_result(order_id, config, full_order=order_data or {})
+            terminal_order = self._square_terminal_order_result(
+                order_id, config, full_order=order_data or {}, read_order=read_order,
+            )
             if terminal_order or terminal_payment or routing:
                 return terminal_order or terminal_payment or routing
 
@@ -1013,7 +1017,7 @@ class SquareOrderProcessor(models.Model):
                 }
 
             has_returns, routing = self._check_square_exchange_order(
-                order_id, order_data, merchant_id=merchant_id, environment=environment,
+                order_id, order_data, merchant_id=merchant_id, environment=environment, read_order=read_order,
             )
             if routing:
                 return routing
