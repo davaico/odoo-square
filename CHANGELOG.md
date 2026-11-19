@@ -1,14 +1,10 @@
 # Changelog
 
-This project follows Odoo addon versioning: `17.0.x.y.z`.
+## Odoo 19 (unreleased)
 
-## Unreleased
-
-- Expanded open-source project documentation.
-- Added contributor and security guidance.
-- Added addon contract tests for metadata, logging, webhook queue behavior, and version formatting.
-- Included manual resync tests in the addon test loader.
+- Added Square Terminal for Odoo Point of Sale, with recovery on the original sale, split tenders, tips, and refund reconciliation.
+- Updated the sales importer to recognize Terminal-originated activity and account for Square’s stock deductions on linked orders.
 
 ## 17.0.1.3.0
 
-- Current public addon release declared by `addons/odoo_square/__manifest__.py`.
+- Square POS Integration release for Odoo 17.

@@ -1,49 +1,23 @@
-# Square POS Integration
+# Square integrations for Odoo 19
 
 [![CI](https://github.com/davaico/odoo-square/actions/workflows/ci.yml/badge.svg)](https://github.com/davaico/odoo-square/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Odoo](https://img.shields.io/badge/Odoo-19.0-875A7B.svg)](https://www.odoo.com)
 
-Odoo 19 Community addon for integrating Square POS with Odoo Sales, Accounting, and Inventory.
+Install any of these addons independently or use all three in one Odoo 19 Community database.
 
-Checkout, payment collection, and refund initiation happen in Square. The addon processes Square webhooks and records the resulting sales, payments, refunds, exchanges, and stock movements in Odoo.
+| Where the sale starts | Addon | What it does |
+| --- | --- | --- |
+| Square POS | [Square POS Integration](#square-configuration) | Imports sales, EUR refunds, and supported exchanges. Publishes Odoo warehouse counts to mapped Square locations. |
+| Odoo Point of Sale | [Square Terminal for Point of Sale](pos_square_terminal/README.md) | Sends a card share to a paired terminal. Odoo POS keeps the sale and itemized receipt. |
+| Odoo website | [Square Online Payments](payment_square_online/README.md) | Takes website payments through Square and lets Accounting refund the original payment. |
 
-For Odoo website checkout, install **Square Online Payments**. You can install either addon on its own or run both in the same database. See the [website setup guide](payment_square_online/README.md) and [combined setup](payment_square_online/README.md#run-alongside-square-pos).
+## Importer requirements
 
-For a sale started in the Odoo register, install **Square Terminal for Point of Sale** to send the card payment to a paired Square Terminal. The addon works on its own or alongside the sales importer and website provider. See the [Square Terminal setup and cashier guide](pos_square_terminal/README.md).
-
-## Features
-
-- Secure Square webhook endpoint at `/square/webhook` with HMAC-SHA256 validation when a webhook signature key is configured.
-- Square order import and supported updates and cancellations. Completed sales post invoices, record payments collected by Square, and deduct tracked stock from the mapped warehouse.
-- Full and partial EUR refunds with credit notes, outbound payment records, and stock returns where applicable. Supported exchanges process returned and replacement items and record any price difference.
-- Square location to Odoo warehouse mapping for multi-location inventory workflows.
-- Outbound updates of on-hand stock counts for matching SKUs after supported Odoo stock movements and applied inventory adjustments in mapped warehouses.
-- Manual resync wizard for finding and replaying missing Square orders.
-- Integration log models and views for monitoring webhook, order, refund, exchange, and stock sync activity.
-- Docker Compose development and CI test setup.
-
-## Requirements
-
-- A fresh Odoo 19.0 Community database and PostgreSQL. The included Compose setup builds from the official Odoo Community image with Ubuntu package updates and uses PostgreSQL 17.
+- Odoo 19 Community and PostgreSQL.
 - Python package `requests` in the Odoo environment. The Compose image includes it.
 - A Square Developer account with an application, access token, location IDs, and webhook signature key.
 - Docker and Docker Compose for the included local setup.
-
-## Compatibility
-
-Use release branch `19.0` for Odoo 19 Community. The Square sales importer version is `19.0.1.4.3`. Upgrade the installed importer when adding Square Terminal so its inventory queue can account for stock deductions already made by Square.
-
-The addon manifest declares the following Odoo dependencies:
-
-- `base`
-- `web`
-- `sale`
-- `sales_team`
-- `account`
-- `stock`
-- `sale_stock`
-- `payment`
 
 ## Quick Start
 
@@ -95,13 +69,7 @@ Use a publicly reachable HTTPS URL for the webhook. When a reverse proxy termina
 
 ## Development
 
-Start the local stack.
-
-```bash
-docker compose up -d
-```
-
-To refresh the Odoo 19.0 and PostgreSQL 17 images and apply current Ubuntu package updates, rebuild the images and recreate the services with the existing volumes.
+To refresh the base images and apply current Ubuntu package updates, rebuild the images and recreate the services with the existing volumes.
 
 ```bash
 docker compose build --pull --no-cache
@@ -132,73 +100,36 @@ docker compose up -d odoo
 
 ## Testing
 
-Use the test Compose project for a fresh addon installation and test run.
+From the repository root, run the importer suite in a fresh Compose project.
 
 ```bash
-docker compose -f docker-compose.test.yml down -v
-docker compose -f docker-compose.test.yml run --rm -T odoo
-docker compose -f docker-compose.test.yml down -v
+(
+  set -eu
+  compose=(docker compose -p "odoo-square-v19-test-$BASHPID" -f docker-compose.test.yml)
+  trap '"${compose[@]}" down -v' EXIT
+  "${compose[@]}" build
+  "${compose[@]}" run --rm -T odoo
+)
 ```
 
-These commands reset only the `odoo-square-v19-test` project. The test run should report zero failures and errors and a nonzero test count. The suite uses real Odoo records and mocked Square API responses. It covers order import and updates, payments, refunds, exchanges, stock movements and counts, manual order resync, webhook validation, and addon contracts.
+Use Bash for the command above. For a focused importer run, add the desired `--test-tags` to the [Compose service command](docker-compose.test.yml). For browser, coexistence, or concurrency tests, follow the matching [CI matrix entry and commands](.github/workflows/ci.yml) in a fresh project. The browser image includes Chrome and the Python WebSocket dependency. The concurrency suites commit test records and need disposable databases.
 
-## Project Structure
-
-```text
-odoo-square/
-├── odoo_square/
-│   ├── controllers/            # Public webhook endpoint
-│   ├── data/                   # Default users and Square products
-│   ├── models/                 # Odoo business models and services
-│   ├── security/               # ir.model.access.csv
-│   ├── static/description/     # Odoo app listing assets
-│   ├── tests/                  # Odoo TransactionCase and HttpCase tests
-│   └── views/                  # Backend UI views and menus
-├── config/                     # Odoo container configuration
-├── .github/workflows/          # CI
-├── docker-compose.yml          # Local development stack
-├── docker-compose.test.yml     # Test stack used by CI
-└── README.md
-```
-
-## Architecture
-
-```mermaid
-flowchart TB
-    Square["Square POS and API"]
-    Webhook["/square/webhook"]
-    Queue["square.webhook.queue"]
-    Processor["square.order.processor"]
-    Sale["sale.order"]
-    Accounting["Invoices, credit notes, and payment records"]
-    Stock["Stock pickings, moves, and quants"]
-    Sync["square.stock.sync"]
-    Log["square.integration.log"]
-
-    Square -->|"webhook events"| Webhook
-    Webhook -->|"out-of-order updates"| Queue
-    Queue --> Processor
-    Webhook --> Processor
-    Processor --> Sale
-    Processor --> Accounting
-    Processor --> Stock
-    Stock --> Sync
-    Sync -->|"inventory adjustments"| Square
-    Webhook --> Log
-    Processor --> Log
-    Sync --> Log
-```
+Check that the intended tests ran, with a nonzero test count and zero failures, errors, or skipped addon tests. The suites simulate Square responses.
 
 ## Operational Notes
 
-When upgrading Square POS Integration to `19.0.1.4.2`, update the installed module to apply the refund schema change. Unverified legacy refunds retain their claimed Square ID and document links for review. Confirmed Square deliveries can use the same ID to record the verified refund. If your installation already ran the 19.0.1.4.1 migration and a historical refund was removed, consult a backup taken before that operation for its original links.
+When adding Square Terminal to a database with the importer, upgrade `odoo_square` to at least `19.0.1.4.3` before resuming stock sync. The importer needs the new inventory queue metadata to account for stock deductions already made by Square.
+
+When upgrading an existing Square Terminal installation from a prerelease build, update `pos_square_terminal` to apply the payment and notification schema changes. Replay protection covers the notification IDs present at upgrade and new notifications received afterward.
+
+When upgrading from an importer earlier than `19.0.1.4.2`, update the installed module to apply the refund schema change. Unverified legacy refunds keep their Square ID and document links for review. If the `19.0.1.4.1` migration removed a historical refund, consult a backup taken before the migration for its original links.
 
 - Configure the webhook signature key in Odoo before exposing the endpoint publicly.
 - Keep Square access tokens out of Git. Use Odoo configuration records, environment-specific secrets management, or encrypted backups.
 - Map every active Square location to the intended Odoo warehouse before enabling production inventory sync.
-- Automatic stock counts are queued with the stock change. The **Square POS: Send inventory counts** scheduled action sends committed warehouse quantities every minute and retries failed requests after five minutes. A newer observation replaces an older queued count for the same SKU and location. Square accepts observations up to 24 hours old. After that, or after correcting an ambiguous SKU, use **Synchronize All Products** to send a fresh count.
+- **Square POS: Send inventory counts** publishes the latest queued warehouse quantity for each mapped product and location. Odoo takes a fresh measurement when a queued count is more than 24 hours old. If duplicate Square catalog SKUs paused a count, make the SKU unique and choose **Synchronize All Products**.
 - Review **Square Integration Logs** after installation and after every Square credential or webhook change.
-- To recover missing Square orders, open **Manual Resync Orders** from **Square > Configuration**, scan the relevant dates, and select the orders to import.
+- To recover missing Square orders, open **Manual Resync Orders** from **Square > Configuration**, scan the relevant dates, and select the orders to import. If references are waiting for ownership verification, recover the listed sales and scan again after Square access is restored.
 
 ## Contributing
 
