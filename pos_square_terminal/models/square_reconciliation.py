@@ -13,23 +13,30 @@ _logger = logging.getLogger(__name__)
 class SquarePaymentAttempt(models.Model):
     _inherit = 'pos.square.payment.attempt'
 
-    currency_id = fields.Many2one(related='order_id.currency_id')
+    currency_id = fields.Many2one('res.currency', compute='_compute_reconciliation_amounts', compute_sudo=True)
     square_order_id = fields.Char(related='square_order_link_id.square_order_id')
     verified_base_minor = fields.Integer(copy=False)
     verified_tip_minor = fields.Integer(copy=False)
     has_verified_amounts = fields.Boolean(copy=False)
-    requested_amount = fields.Monetary(compute='_compute_reconciliation_amounts')
-    verified_base = fields.Monetary(compute='_compute_reconciliation_amounts')
-    verified_tip = fields.Monetary(compute='_compute_reconciliation_amounts')
+    requested_amount = fields.Monetary(compute='_compute_reconciliation_amounts', compute_sudo=True)
+    verified_base = fields.Monetary(compute='_compute_reconciliation_amounts', compute_sudo=True)
+    verified_tip = fields.Monetary(compute='_compute_reconciliation_amounts', compute_sudo=True)
     reconciliation_error = fields.Char(copy=False)
     reconciliation_discrepancy = fields.Char(copy=False)
     order_pricing_discrepancy = fields.Char(compute='_compute_order_pricing_discrepancy', compute_sudo=True)
     next_reconciliation_at = fields.Datetime(default=fields.Datetime.now, index=True, copy=False)
 
-    @api.depends('amount_minor', 'verified_base_minor', 'verified_tip_minor', 'square_order_link_id.currency_digits')
+    @api.depends(
+        'amount_minor', 'verified_base_minor', 'verified_tip_minor', 'currency_code', 'square_order_link_id.currency_digits',
+    )
     def _compute_reconciliation_amounts(self):
-        for attempt in self.sudo():
+        currencies = self.env['res.currency'].with_context(active_test=False).search([
+            ('name', 'in', self.mapped('currency_code')),
+        ])
+        currencies_by_code = {currency.name: currency for currency in currencies}
+        for attempt in self:
             divisor = 10 ** attempt.square_order_link_id.currency_digits
+            attempt.currency_id = currencies_by_code.get(attempt.currency_code, False)
             attempt.requested_amount = attempt.amount_minor / divisor
             attempt.verified_base = attempt.verified_base_minor / divisor
             attempt.verified_tip = attempt.verified_tip_minor / divisor

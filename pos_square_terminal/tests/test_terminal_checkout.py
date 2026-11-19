@@ -268,6 +268,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             attempt = manager_payments.search(action['domain'])
             self.assertEqual(attempt.payment_id.id, payment.id)
             self.assertEqual(attempt.requested_amount, 12.34)
+            self.assertEqual(attempt.currency_id.name, self.currency)
             self.assertEqual(attempt.square_order_id, 'SQUAREORDER')
             self.assertEqual(attempt.square_checkout_id, 'SQUARECHECKOUT')
             with self.assertRaises(AccessError):
