@@ -10,6 +10,7 @@
                 <field name="currency_id" column_invisible="True"/>
                 <field name="requested_amount"/>
                 <field name="state"/>
+                <field name="handover_state" optional="show"/>
                 <field name="square_payment_id"/>
                 <field name="last_checked_at" string="Last Successful Check"/>
                 <field name="connection_id" optional="hide"/>
@@ -46,6 +47,11 @@
                             <field name="reconciliation_error" string="Latest Check Error"
                                    invisible="not reconciliation_error or reconciliation_error == reconciliation_discrepancy"/>
                         </group>
+                    </group>
+                    <group string="Counter Handover" invisible="not handover_state">
+                        <field name="handover_state"/>
+                        <field name="handover_at"/>
+                        <field name="handover_error" invisible="not handover_error"/>
                     </group>
                     <group string="Original Square References">
                         <group>

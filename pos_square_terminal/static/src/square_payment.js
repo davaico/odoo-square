@@ -1,3 +1,4 @@
+import { useEffect } from "@odoo/owl";
 import { AlertDialog } from "@web/core/confirmation_dialog/confirmation_dialog";
 import { _t } from "@web/core/l10n/translation";
 import { RPCError } from "@web/core/network/rpc";
@@ -207,6 +208,23 @@ patch(PosStore.prototype, {
 });
 
 patch(PaymentScreen.prototype, {
+    setup() {
+        super.setup(...arguments);
+        useEffect(
+            () => {
+                const order = this.currentOrder;
+                if (
+                    this.pos.config.auto_validate_terminal_payment &&
+                    this.pos.get_order()?.uuid === order?.uuid &&
+                    order?.state === "draft" && order.is_paid() &&
+                    order.payment_ids.some((line) => line.square_attempt_state === "verified")
+                ) {
+                    this.validateOrder(false);
+                }
+            },
+            () => [this.currentOrder?.uuid, this.currentOrder?.get_partner()?.id, this.currentOrder?.to_invoice]
+        );
+    },
     onMounted() {
         for (const line of this.paymentLines.filter((line) => line.square_attempt_state === "cancelled")) {
             this.currentOrder.remove_paymentline(line);
@@ -236,6 +254,9 @@ patch(PaymentScreen.prototype, {
         }
     },
     async validateOrder() {
+        if (this.squarePaymentReserved && this.pos.get_order()?.uuid !== this.currentOrder.uuid) {
+            return;
+        }
         if (this.paymentLines.some((line) => isSquarePayment(line) && line.square_attempt_state !== "verified")) {
             showSquareMessage(this.dialog, _t("Wait for Square to verify this payment before validating the sale."));
             return;

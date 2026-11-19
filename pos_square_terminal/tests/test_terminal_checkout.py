@@ -2,6 +2,7 @@ import hmac
 import json
 import os
 from base64 import b64encode
+from datetime import timedelta
 from unittest.mock import patch
 from uuid import uuid4
 from urllib.parse import urlsplit
@@ -10,7 +11,7 @@ from cryptography.fernet import Fernet
 from freezegun import freeze_time
 from requests import ConnectionError, Response
 
-from odoo import Command, api
+from odoo import Command, api, fields
 from odoo.exceptions import AccessError, UserError
 from odoo.tests import tagged
 from odoo.addons.point_of_sale.tests.test_frontend import TestPointOfSaleHttpCommon
@@ -933,7 +934,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
     def _money(self, amount):
         return {'amount': amount, 'currency': self.currency}
 
-    def _run_priced_checkout(self, tour, line_amounts, check_order):
+    def _run_priced_checkout(self, tour, line_amounts, check_order, *, expected_state='paid'):
         fields = ('total_money', 'total_tax_money', 'total_discount_money')
         gross = sum(amounts[0] for amounts in line_amounts)
         totals = {field: self._money(sum(amounts)) for field, amounts in zip(fields, zip(*line_amounts))}
@@ -983,7 +984,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         ])
         self.env.invalidate_all()
         order = self.pos_session.order_ids
-        self.assertEqual(order.state, 'paid')
+        self.assertEqual(order.state, expected_state)
         self.assertEqual(order.payment_ids.transaction_id, 'SQUAREPAYMENT')
 
     def _cashier_draft(self, method=None, session=None):
@@ -1085,3 +1086,132 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertEqual(calls, ['/v2/orders/calculate', '/v2/orders'])
         self.assertEqual(order.state, 'draft')
         self.assertFalse(payment.transaction_id)
+
+    def test_uncertain_payment_blocks_register_close_and_another_sale_can_continue(self):
+        checkout = {}
+
+        def square_response(method, url, **kwargs):
+            path = urlsplit(url).path
+            if method == 'POST' and path in ('/v2/orders/calculate', '/v2/orders'):
+                order = self._draft_provider_order(kwargs['json']['order'], 1234)
+                return self._square_response({'order': {**order, 'id': 'SQUAREORDER'}})
+            if (method, path) == ('POST', '/v2/terminals/checkouts'):
+                checkout.update(kwargs['json']['checkout'])
+                checkout.update(id='SQUARECHECKOUT', location_id='SQUARELOC', status='PENDING')
+                return self._square_response({'checkout': checkout})
+            if (method, path) == ('GET', '/v2/terminals/checkouts/SQUARECHECKOUT'):
+                raise ConnectionError('Square timeout')
+            self.fail(f'Unexpected Square request: {method} {path}')
+
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
+            self.start_pos_tour('SquareTerminalCloseWithUncertainPayment')
+
+        self.env.invalidate_all()
+        session = self.pos_session
+        self.assertEqual(session.state, 'opened')
+        draft = session.order_ids.filtered(lambda order: order.state == 'draft')
+        self.assertEqual(len(draft), 1)
+        self.assertFalse(draft.payment_ids.transaction_id)
+        other = session.order_ids - draft
+        self.assertEqual(other.state, 'paid')
+        self.assertEqual(other.payment_ids.payment_method_id, self.cash_method)
+        for close in (session.action_pos_session_closing_control, session.action_pos_session_close):
+            with self.assertRaisesRegex(UserError, 'Square payment'), self.cr.savepoint():
+                close()
+
+    def test_verified_payment_resumes_invoice_after_selecting_the_customer(self):
+        customer = self.env['res.partner'].create({'name': 'Square Invoice Customer'})
+        self.pos_user.groups_id += self.env.ref('account.group_account_invoice')
+
+        def check_order(order):
+            self.assertNotIn('customer_id', order)
+            self.assertNotIn('fulfillments', order)
+
+        self._run_priced_checkout(
+            'SquareTerminalInvoiceCustomer', ((1234, 0, 0),), check_order, expected_state='invoiced',
+        )
+        order = self.pos_session.order_ids
+        self.assertEqual(order.partner_id, customer)
+        self.assertEqual(order.account_move.partner_id, customer)
+        self.assertEqual(order.account_move.state, 'posted')
+        self.assertEqual(len(order.payment_ids), 1)
+
+    def test_pending_handover_retries_on_the_original_connection_after_session_close(self):
+        self.desk_pad.is_storable = True
+        self._run_priced_checkout('SquareTerminalCounterHandover', ((1234, 0, 0),), lambda _order: None)
+        session = self.pos_session.with_user(self.pos_user)
+        order = session.order_ids
+        payment = order.payment_ids
+        picking_moves = order.picking_ids.move_ids.ids
+        self.assertTrue(picking_moves)
+
+        action = order.with_user(self.pos_admin).action_open_square_reconciliation()
+        attempt = self.env[action['res_model']].with_user(self.pos_admin).search(action['domain'])
+        self.assertEqual(attempt.handover_state, 'pending')
+        attempt.connection_id.action_archive()
+        original_reference = attempt.sudo().square_order_link_id.reference
+
+        order_path = '/v2/orders/SQUAREORDER'
+        attribute_path = order_path + '/custom-attributes/odoo-pos-in-store-handover'
+        definition_path = '/v2/orders/custom-attribute-definitions'
+        upserts = []
+        definition = {}
+        attribute = {}
+        missing = self._square_response({'errors': [{'code': 'NOT_FOUND'}]})
+        missing.status_code = 404
+
+        def square_response(method, url, **kwargs):
+            path = urlsplit(url).path
+            self.assertEqual(urlsplit(url).netloc, 'connect.squareup.com')
+            self.assertEqual(kwargs['headers']['Authorization'], 'Bearer square-access-token')
+            if (method, path) == ('GET', order_path):
+                return self._square_response({'order': {
+                    'id': 'SQUAREORDER', 'location_id': 'SQUARELOC',
+                    'reference_id': original_reference, 'state': 'COMPLETED',
+                }})
+            if (method, path) == ('GET', attribute_path):
+                return self._square_response({'custom_attribute': attribute}) if attribute else missing
+            if (method, path) == ('GET', definition_path + '/odoo-pos-in-store-handover'):
+                return self._square_response({'custom_attribute_definition': definition}) if definition else missing
+            if (method, path) == ('POST', definition_path):
+                self.assertFalse(definition)
+                definition.update(kwargs['json']['custom_attribute_definition'])
+                self.assertEqual(definition['key'], 'odoo-pos-in-store-handover')
+                self.assertEqual(definition['visibility'], 'VISIBILITY_READ_ONLY')
+                return self._square_response({'custom_attribute_definition': definition})
+            if (method, path) == ('POST', attribute_path):
+                body = kwargs['json']
+                self.assertEqual(set(body), {'idempotency_key', 'custom_attribute'})
+                self.assertTrue(body['idempotency_key'])
+                self.assertEqual(set(body['custom_attribute']), {'value'})
+                self.assertRegex(body['custom_attribute']['value'], r'^In-store handover at .+Z$')
+                upserts.append(body)
+                if len(upserts) == 2:
+                    attribute.update(key=definition['key'], **body['custom_attribute'])
+                raise ConnectionError('Square response lost')
+            self.fail(f'Unexpected Square request: {method} {path}')
+
+        cron = self.env.ref('pos_square_terminal.ir_cron_square_terminal_handover')
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
+            cron.method_direct_trigger()
+            self.env.invalidate_all()
+            self.assertEqual(attempt.handover_state, 'pending')
+            self.assertTrue(attempt.handover_error)
+            self.assertEqual(len(upserts), 1)
+            self.assertEqual(session.close_session_from_ui(), {'successful': True})
+            self.assertEqual(session.state, 'closed')
+            with freeze_time(fields.Datetime.now() + timedelta(minutes=6)):
+                cron.method_direct_trigger()
+                self.env.invalidate_all()
+                self.assertEqual(attempt.handover_state, 'pending')
+            with freeze_time(fields.Datetime.now() + timedelta(minutes=12)):
+                cron.method_direct_trigger()
+                self.env.invalidate_all()
+                self.assertEqual(attempt.handover_state, 'sent')
+                self.assertFalse(attempt.handover_error)
+                cron.method_direct_trigger()
+        self.assertEqual(len(upserts), 2)
+        self.assertEqual(upserts[0], upserts[1])
+        self.assertEqual(order.payment_ids, payment)
+        self.assertEqual(payment.transaction_id, 'SQUAREPAYMENT')
+        self.assertEqual(order.picking_ids.move_ids.ids, picking_moves)

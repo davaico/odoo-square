@@ -3,3 +3,4 @@ from . import square_order, square_payment_attempt, pos_order, pos_order_line, p
 from . import square_import_ownership
 from . import square_webhook_configuration, square_webhook_event, square_reconciliation
 from . import stock_picking
+from . import pos_session, square_handover
