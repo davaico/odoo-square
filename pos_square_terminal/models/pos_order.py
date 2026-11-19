@@ -55,6 +55,7 @@ class PosOrder(models.Model):
     @api.model
     def square_prepare_payment(self, order_uuid, payment_uuid):
         order, payment = self._square_checkout_records(order_uuid, payment_uuid)
+        order.session_id._square_lock_admission(touch=True)
         order._square_lock_checkout(touch=True)
         attempt = order._square_attempts().filtered(lambda candidate: candidate.payment_uuid == payment.uuid)[-1:]
         if attempt:
@@ -753,8 +754,11 @@ class PosOrder(models.Model):
             self._square_lock_checkout()
             self._square_require_verified()
         result = super()._process_saved_order(draft)
-        if not draft and self._square_reserved_attempts() and self.state not in PAID_STATES:
-            raise UserError(_("Odoo could not complete the verified Square sale."))
+        if not draft:
+            attempts = self._square_reserved_attempts()
+            if attempts and self.state not in PAID_STATES:
+                raise UserError(_("Odoo could not complete the verified Square sale."))
+            attempts.filtered_domain([('state', '=', 'verified')]).square_order_link_id._square_queue_handover()
         return result
 
     @api.model_create_multi

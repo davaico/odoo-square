@@ -1,6 +1,7 @@
 import { registry } from "@web/core/registry";
 import * as Chrome from "@point_of_sale/../tests/tours/utils/chrome_util";
 import * as PaymentScreen from "@point_of_sale/../tests/tours/utils/payment_screen_util";
+import * as PartnerList from "@point_of_sale/../tests/tours/utils/partner_list_util";
 import * as ProductScreen from "@point_of_sale/../tests/tours/utils/product_screen_util";
 import * as ReceiptScreen from "@point_of_sale/../tests/tours/utils/receipt_screen_util";
 import { inLeftSide, refresh } from "@point_of_sale/../tests/tours/utils/common";
@@ -300,5 +301,93 @@ registry.category("web_tour.tours").add("SquareTerminalAbandonSplit", {
         ...ReceiptScreen.receiptIsThere(),
         ...ReceiptScreen.receiptAmountTotalIs("12.34"),
         { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalCloseWithUncertainPayment", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Square payment outcome needs verification')" },
+        ...Chrome.clickMenuOption("Close Register"),
+        { trigger: ".close-pos-popup .btn-primary:contains('Close Register')", run: "click" },
+        {
+            trigger: ".modal-body:contains('Square payment'):contains('12.34'):contains('PENDING')",
+            run() {
+                if (!this.anchor.textContent.includes(window.posmodel.get_order().pos_reference)) {
+                    throw new Error("Register close must identify the original order");
+                }
+            },
+        },
+        { trigger: ".modal:not(.o_inactive_modal) .modal-footer .btn-primary", run: "click" },
+        { trigger: ".pos-topheader .list-plus-btn", run: "click" },
+        ...ProductScreen.addOrderline("Monitor Stand"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        ...PaymentScreen.clickValidate(),
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("3.19"),
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalInvoiceCustomer", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickInvoiceButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        {
+            trigger: ".payment-screen .send_payment_request",
+            run() {
+                const order = window.posmodel.get_order();
+                sessionStorage.setItem("squareInvoiceOrder", order.uuid);
+                sessionStorage.setItem("squareInvoiceTender", order.payment_ids[0].uuid);
+                this.anchor.click();
+            },
+        },
+        {
+            trigger: ".modal:contains('Please select the Customer') .modal-footer .btn-secondary",
+            run: "click",
+        },
+        { trigger: ".payment-screen .electronic_status:contains('Payment Successful')" },
+        refresh(),
+        { trigger: "body:not(:has(.pos-loader))" },
+        {
+            trigger: ".modal:contains('Please select the Customer') .modal-footer .btn-primary",
+            run() {
+                const order = window.posmodel.get_order();
+                const [tender] = order.payment_ids;
+                if (
+                    order.uuid !== sessionStorage.getItem("squareInvoiceOrder") ||
+                    tender.uuid !== sessionStorage.getItem("squareInvoiceTender") ||
+                    tender.transaction_id !== "SQUAREPAYMENT" ||
+                    order.get_partner()
+                ) {
+                    throw new Error("The native prompt must finish the original verified invoice payment");
+                }
+                this.anchor.click();
+            },
+        },
+        PartnerList.clickPartner("Square Invoice Customer"),
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("12.34"),
+        { trigger: ".pos-receipt .paymentlines:contains('Square Counter')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalCounterHandover", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("12.34"),
+        { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
     ],
 });

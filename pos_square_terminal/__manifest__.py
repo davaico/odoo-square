@@ -25,6 +25,7 @@
             "pos_square_terminal/static/src/payment_readiness.xml",
             "pos_square_terminal/static/src/square_payment.js",
             "pos_square_terminal/static/src/square_payment.xml",
+            "pos_square_terminal/static/src/square_register_close.js",
         ],
     },
     "installable": True,

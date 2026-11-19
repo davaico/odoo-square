@@ -35,3 +35,13 @@ In the [Square Developer Console](https://developer.squareup.com/apps), add a we
 Odoo continues checking unresolved payments and looking for Square refunds after the register browser closes. In **Point of Sale → Orders → Square Terminal Payments**, open an attempt and choose **Check Square Payment** to read its current status from Square. You can also find the attempts under **Square Payments** on the original POS order. Use the last successful check, verified amounts, and Square references when investigating discrepancies. If authorization has expired or been revoked, open and reauthorize the original connection listed on the attempt.
 
 The original payment shows each confirmed Square refund amount and reference. Review those entries to determine the accounting correction or goods return to handle in Odoo.
+
+## Finish and close the register
+
+Keep the original order when Square has verified payment but Odoo needs more information. If an invoice needs a customer, reopen the order and select the customer on the payment screen. Odoo completes checkout when its usual requirements are met and automatic terminal validation is enabled.
+
+When a Square payment is unresolved or its verified sale is still in draft, Odoo identifies the order, amount, and latest known Square status when you try to close the register. Review the original tender or finish the original sale before closing.
+
+For walk-in checkout, completing the sale at the Odoo counter records the handover time. Odoo sends the timestamp as a custom attribute on the original Square order. Managers can see pending handovers in **Square Terminal Payments**. Odoo retries on the original Square connection after session closure. [Square order custom attributes](https://developer.squareup.com/docs/orders-custom-attributes-api/custom-attributes)
+
+Use Square Transactions to review the payment. Use the linked Square order and payment IDs in Odoo for reconciliation. Availability in Square Dashboard Orders depends on Square's order visibility rules. [Square order visibility](https://developer.squareup.com/docs/orders-api/create-orders#view-orders-in-the-square-dashboard-or-square-products)
