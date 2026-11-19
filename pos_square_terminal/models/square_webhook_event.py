@@ -1,5 +1,6 @@
 import logging
 from datetime import timedelta
+from urllib.parse import quote
 
 from psycopg2.errors import DeadlockDetected, SerializationFailure, UniqueViolation
 
@@ -112,7 +113,47 @@ class SquareWebhookEvent(models.Model):
         return attempt._refresh()
 
     def _process_refund_event(self):
-        return True
+        refund = self.env['pos.square.payment.refund']._read_square_refund(self.connection_id, self.resource_id)
+        payment_id = self._identifier(refund.get('payment_id'))
+        if not payment_id or refund.get('unlinked') or refund['status'] in ('FAILED', 'REJECTED'):
+            return True
+
+        attempts = self.env['pos.square.payment.attempt']
+        scope = self._attempt_scope()
+        attempt = attempts.search(scope + [('square_payment_id', '=', payment_id)], limit=1)
+        if not attempt:
+            # The original payment ID may not have been observed yet. Use the
+            # authenticated payment to locate the attempt, then verify its checkout.
+            payment = self.connection_id._request('GET', '/v2/payments/' + quote(payment_id, safe='')).get('payment')
+            if not isinstance(payment, dict) or payment.get('id') != payment_id:
+                return False
+            reference = self._identifier(payment.get('reference_id'))
+            order_id = self._identifier(payment.get('order_id'))
+            location_id = self._identifier(payment.get('location_id'))
+            if not (reference and order_id and location_id):
+                return True
+            attempt = attempts.search(scope + [
+                ('reference', '=', reference), ('square_order_id', '=', order_id),
+                ('square_location_id', '=', location_id),
+            ], limit=1)
+        if not attempt or attempt.state not in attempt._square_reconcilable_states():
+            return True
+        attempt._lock_reconciliation()
+        if attempt.state != 'verified':
+            attempt._refresh()
+            if attempt.state != 'verified':
+                return False
+        if attempt.square_payment_id != payment_id:
+            return True
+        try:
+            recorded = attempt._record_square_refund(refund)
+        except ValueError:
+            attempt.refund_reconciliation_issue = attempt._square_refund_verification_issue()
+            return False
+        issue = attempt._square_refund_total_issue()
+        if issue:
+            attempt.refund_reconciliation_issue = issue
+        return recorded
 
     @api.model
     def _cron_process_webhooks(self):

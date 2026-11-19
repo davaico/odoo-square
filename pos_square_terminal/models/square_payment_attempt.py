@@ -293,10 +293,7 @@ class SquarePaymentAttempt(models.Model):
         status = payment.get('status')
         if status not in ('COMPLETED', 'APPROVED', 'PENDING', 'FAILED', 'CANCELED'):
             raise ValueError('Unknown Square payment status')
-        if status == 'COMPLETED' and (
-            self.state == 'verified' or 'refunded_money' not in payment
-            or matches_money(payment['refunded_money'], 0, self.currency_code)
-        ):
+        if status == 'COMPLETED':
             if self.state != 'verified':
                 self.write({'square_payment_id': payment_id, 'state': 'verified'})
                 self.payment_id._square_set_verified(payment_id)
