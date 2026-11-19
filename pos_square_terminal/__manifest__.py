@@ -1,8 +1,10 @@
 {
     "name": "Square Terminal for Point of Sale",
     "summary": "Take Odoo Point of Sale payments on Square Terminal",
-    "version": "18.0.1.0.0",
+    "version": "19.0.1.0.0",
     "category": "Sales/Point of Sale",
+    "author": "Davai",
+    "website": "https://github.com/davaico/odoo-square",
     "license": "AGPL-3",
     "depends": ["point_of_sale"],
     "external_dependencies": {"python": ["cryptography", "requests"]},

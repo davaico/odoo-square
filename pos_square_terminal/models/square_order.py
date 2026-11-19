@@ -57,12 +57,13 @@ class SquareOrder(models.Model):
     cancelled = fields.Boolean(copy=False)
     active_order_key = fields.Char(compute='_compute_active_order_key', store=True)
 
-    _sql_constraints = [
-        ('order_unique', 'unique(order_id, active_order_key)', 'An Odoo POS order can have only one active Square order.'),
-        ('reference_unique', 'unique(reference)', 'The Square order reference already exists.'),
-        ('square_order_unique', 'unique(environment, merchant_id, square_order_id)',
-         'This Square order already belongs to another Odoo sale.'),
-    ]
+    _order_unique = models.Constraint(
+        'UNIQUE(order_id, active_order_key)', 'An Odoo POS order can have only one active Square order.',
+    )
+    _reference_unique = models.Constraint('UNIQUE(reference)', 'The Square order reference already exists.')
+    _square_order_unique = models.Constraint(
+        'UNIQUE(environment, merchant_id, square_order_id)', 'This Square order already belongs to another Odoo sale.',
+    )
 
     @api.depends('cancelled')
     def _compute_active_order_key(self):

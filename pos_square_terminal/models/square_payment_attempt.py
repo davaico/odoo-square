@@ -56,14 +56,16 @@ class SquarePaymentAttempt(models.Model):
     provider_status = fields.Char(copy=False)
     last_checked_at = fields.Datetime(copy=False)
 
-    _sql_constraints = [
-        ('active_device_unique', 'unique(active_device_key)', 'The Square terminal already has an active checkout.'),
-        ('reference_unique', 'unique(reference)', 'The Square checkout reference already exists.'),
-        ('square_checkout_unique', 'unique(environment, merchant_id, square_checkout_id)',
-         'This Square checkout already belongs to another Odoo payment.'),
-        ('square_payment_unique', 'unique(environment, merchant_id, square_payment_id)',
-         'This Square payment already belongs to another Odoo payment.'),
-    ]
+    _active_device_unique = models.Constraint(
+        'UNIQUE(active_device_key)', 'The Square terminal already has an active checkout.',
+    )
+    _reference_unique = models.Constraint('UNIQUE(reference)', 'The Square checkout reference already exists.')
+    _square_checkout_unique = models.Constraint(
+        'UNIQUE(environment, merchant_id, square_checkout_id)', 'This Square checkout already belongs to another Odoo payment.',
+    )
+    _square_payment_unique = models.Constraint(
+        'UNIQUE(environment, merchant_id, square_payment_id)', 'This Square payment already belongs to another Odoo payment.',
+    )
 
     @staticmethod
     def _device_key(environment, merchant_id, device_id):

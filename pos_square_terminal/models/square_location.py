@@ -19,9 +19,9 @@ class SquareLocation(models.Model):
     is_available = fields.Boolean()
     unavailable_reason = fields.Char()
 
-    _sql_constraints = [
-        ('connection_square_id', 'unique(connection_id, square_id)', 'This Square location is already on this connection.'),
-    ]
+    _connection_square_id = models.Constraint(
+        'UNIQUE(connection_id, square_id)', 'This Square location is already on this connection.',
+    )
 
     def _square_catalog_variation(self, sku):
         self.ensure_one()

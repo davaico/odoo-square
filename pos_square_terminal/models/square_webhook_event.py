@@ -35,9 +35,9 @@ class SquareWebhookEvent(models.Model):
     next_check_at = fields.Datetime(required=True, default=fields.Datetime.now, index=True)
     processed_at = fields.Datetime()
 
-    _sql_constraints = [
-        ('unique_event', 'unique(connection_id, event_id)', 'This Square notification was already received.'),
-    ]
+    _unique_event = models.Constraint(
+        'UNIQUE(connection_id, event_id)', 'This Square notification was already received.',
+    )
 
     @staticmethod
     def _identifier(value):
