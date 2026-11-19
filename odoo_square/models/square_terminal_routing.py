@@ -27,12 +27,12 @@ class SquareOrderProcessor(models.Model):
             config.company_id.id, config.square_environment, kind, resource, merchant_id=merchant_id,
         )
 
-    def _square_read_routing_resource(self, collection, kind, resource_id, config):
+    def _square_read_routing_resource(self, kind, resource_id, config):
         if not isinstance(resource_id, str) or not resource_id:
             return None
         try:
             response = self.env["square.api.client"].sudo()._make_api_request(
-                f"/v2/{collection}/{quote(resource_id, safe='')}", square_config=config,
+                f"/v2/{kind}s/{quote(resource_id, safe='')}", square_config=config,
             )
         except UserError:
             return None
@@ -44,9 +44,11 @@ class SquareOrderProcessor(models.Model):
         return {"status": "retry", "message": _("Could not verify Odoo POS Square Terminal ownership")}
 
     def _square_terminal_resource_result(self, kind, resource, config, *, expected_merchant=None):
+        if not resource or not resource.get("location_id"):
+            return self._square_terminal_retry()
         if not self._square_terminal_matches(kind, resource, config):
             return None
-        location = self._square_read_routing_resource("locations", "location", resource["location_id"], config)
+        location = self._square_read_routing_resource("location", resource["location_id"], config)
         merchant_id = location and location.get("merchant_id")
         if not isinstance(merchant_id, str) or not merchant_id:
             return self._square_terminal_retry()
@@ -85,24 +87,20 @@ class SquareOrderProcessor(models.Model):
     def _square_terminal_payment_result(self, notice, config):
         if not config or not self._square_terminal_matches("payment", notice, config):
             return None
-        payment = self._square_read_routing_resource("payments", "payment", notice["id"], config)
-        if not payment or not payment.get("location_id"):
-            return self._square_terminal_retry()
+        payment = self._square_read_routing_resource("payment", notice["id"], config)
         return self._square_terminal_resource_result("payment", payment, config)
 
     def _square_terminal_refund_result(self, refund_id):
         config = self._square_terminal_import_config()
         if not config:
             return None
-        refund = self._square_read_routing_resource("refunds", "refund", refund_id, config)
+        refund = self._square_read_routing_resource("refund", refund_id, config)
         if not refund or not refund.get("location_id"):
             return self._square_terminal_retry()
         # A return has its own Square order, while payment_id points to the original sale.
         if not refund.get("payment_id"):
             return self._square_terminal_order_result(refund.get("order_id"), config)
-        payment = self._square_read_routing_resource("payments", "payment", refund["payment_id"], config)
-        if not payment or not payment.get("location_id"):
-            return self._square_terminal_retry()
+        payment = self._square_read_routing_resource("payment", refund["payment_id"], config)
         routing = self._square_terminal_resource_result("payment", payment, config)
         if routing or not payment.get("order_id"):
             return routing

@@ -201,9 +201,10 @@ class SquareOrder(models.Model):
         request = tender['request']
         return request['amount_money']['amount'] + request.get('tip_money', {}).get('amount', 0)
 
-    def _cash_total_minor(self):
+    def _covered_gross_minor(self, attempts):
         self.ensure_one()
-        return sum(self._cash_tender_gross(tender) for tender in self.cash_tenders or [])
+        cash = sum(self._cash_tender_gross(tender) for tender in self.cash_tenders or [])
+        return sum(attempts.mapped('amount_minor')) + cash
 
     def _cash_square_payment_ids(self):
         self.ensure_one()
@@ -213,7 +214,7 @@ class SquareOrder(models.Model):
         return attempts.mapped('square_payment_id') + self._cash_square_payment_ids()
 
     def _covered_tender_amounts(self, attempts):
-        gross = sum(attempts.mapped('amount_minor')) + self._cash_total_minor()
+        gross = self._covered_gross_minor(attempts)
         tip = sum(attempt._requested_tip_minor() for attempt in attempts) + sum(
             tender['request'].get('tip_money', {}).get('amount', 0) for tender in self.cash_tenders or []
         )
@@ -328,7 +329,7 @@ class SquareOrder(models.Model):
             for entry in self.cash_tenders
         ]
 
-    def _release_cash_tenders(self, *, request):
+    def _release_cash_tenders(self):
         self.ensure_one()
         if not self.cash_recording:
             return True
@@ -338,14 +339,12 @@ class SquareOrder(models.Model):
                     continue
                 payment_id = tender.get('payment_id')
                 if not payment_id:
-                    if not request:
-                        return False
                     self.connection_id._request('POST', '/v2/payments/cancel', payload={
                         'idempotency_key': tender['request']['idempotency_key'],
                     })
                 else:
                     payment = self._read_cash_tender(tender)
-                    if request and payment['status'] == 'APPROVED':
+                    if payment['status'] == 'APPROVED':
                         path = '/v2/payments/' + quote(payment_id, safe='') + '/cancel'
                         self.connection_id._request('POST', path)
                         payment = self._read_cash_tender(tender)
@@ -506,7 +505,7 @@ class SquareOrder(models.Model):
                 return False
         return not complete or not expected
 
-    def _cancel_unpaid_order(self, released_payment_ids, *, request):
+    def _cancel_unpaid_order(self, released_payment_ids):
         self.ensure_one()
         if not self.square_order_id:
             self.cancelled = True
@@ -515,7 +514,7 @@ class SquareOrder(models.Model):
         path = '/v2/orders/' + quote(self.square_order_id, safe='')
         try:
             order = self._read_unpaid_order(path, released_payment_ids)
-            if request and order and order['state'] == 'OPEN':
+            if order and order['state'] == 'OPEN':
                 version = order.get('version')
                 if type(version) is not int or version < 1:
                     return

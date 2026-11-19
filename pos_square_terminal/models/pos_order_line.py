@@ -7,6 +7,12 @@ from odoo.exceptions import UserError
 from .pos_order import same_value
 
 
+def check_goods_unreserved(orders):
+    orders._square_lock_checkout(touch=True)
+    if orders._square_reserved_attempts():
+        raise UserError(_("The original goods are reserved by a Square payment."))
+
+
 class PosOrderLine(models.Model):
     _inherit = 'pos.order.line'
 
@@ -22,9 +28,7 @@ class PosOrderLine(models.Model):
         orders = self.env['pos.order'].browse(list({
             vals.get('order_id', self.env.context.get('default_order_id')) for vals in vals_list
         } - {None, False}))
-        orders._square_lock_checkout(touch=True)
-        if orders._square_reserved_attempts():
-            raise UserError(_("The original goods are reserved by a Square payment."))
+        check_goods_unreserved(orders)
         return super().create(vals_list)
 
     def _square_create_device_tip(self, order, product, amount):
@@ -61,10 +65,7 @@ class PosOrderLine(models.Model):
 
     def unlink(self):
         self.check_access('unlink')
-        orders = self.order_id
-        orders._square_lock_checkout(touch=True)
-        if orders._square_reserved_attempts():
-            raise UserError(_("The original goods are reserved by a Square payment."))
+        check_goods_unreserved(self.order_id)
         return super().unlink()
 
 
@@ -77,9 +78,7 @@ class PosSquareOrderLineDetail(models.AbstractModel):
         default_line = self.env.context.get('default_pos_order_line_id')
         line_ids = {vals.get('pos_order_line_id', default_line) for vals in vals_list} - {None, False}
         orders = self.env['pos.order.line'].browse(list(line_ids)).order_id
-        orders._square_lock_checkout(touch=True)
-        if orders._square_reserved_attempts():
-            raise UserError(_("The original goods are reserved by a Square payment."))
+        check_goods_unreserved(orders)
         return super().create(vals_list)
 
     def write(self, vals):
@@ -100,10 +99,7 @@ class PosSquareOrderLineDetail(models.AbstractModel):
 
     def unlink(self):
         self.check_access('unlink')
-        orders = self.pos_order_line_id.order_id
-        orders._square_lock_checkout(touch=True)
-        if orders._square_reserved_attempts():
-            raise UserError(_("The original goods are reserved by a Square payment."))
+        check_goods_unreserved(self.pos_order_line_id.order_id)
         return super().unlink()
 
 

@@ -165,7 +165,7 @@ class SquarePaymentAttempt(models.Model):
         link = self.square_order_link_id
         if continue_checkout and link.cancel_requested and not link.cancelled and self.state != 'verified':
             order._square_lock_checkout(touch=True)
-            order._square_finish_cancellation(self, request=True)
+            order._square_finish_cancellation(self)
             checked = link.cancelled or self.state == 'verified'
         else:
             checked = self._refresh()

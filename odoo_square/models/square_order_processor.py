@@ -997,15 +997,15 @@ class SquareOrderProcessor(models.Model):
                 return terminal_payment
 
             # Fetch full order details from Square API to check for exchanges
-            api_client = self.env["square.api.client"].sudo()
-            read_order = cache(api_client.get_order)
+            read_order = cache(self.env["square.api.client"].sudo().get_order)
             order_data = read_order(order_id)
 
             terminal_order = self._square_terminal_order_result(
                 order_id, config, full_order=order_data or {}, read_order=read_order,
             )
-            if terminal_order or terminal_payment or routing:
-                return terminal_order or terminal_payment or routing
+            routing = terminal_order or terminal_payment or routing
+            if routing:
+                return routing
 
             if not order_data or (order_data.get("id") or order_data.get("order_id")) != order_id:
                 _logger.error(

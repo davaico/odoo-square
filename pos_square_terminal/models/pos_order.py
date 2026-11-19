@@ -252,7 +252,7 @@ class PosOrder(models.Model):
                     attempt._refresh()
                 elif attempt.square_order_link_id.cancel_requested:
                     attempt.state = 'failed'
-                    attempt.order_id._square_finish_cancellation(attempt, request=True)
+                    attempt.order_id._square_finish_cancellation(attempt)
                 else:
                     attempt._dispatch(mark_submitted)
                 return attempt._cashier_status()
@@ -261,14 +261,14 @@ class PosOrder(models.Model):
 
     @api.model
     def square_retry_payment(self, order_uuid, payment_uuid, attempt_reference):
-        order, payment = self._square_checkout_records(order_uuid, payment_uuid)
-        order._square_lock_checkout(touch=True)
         previous = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
         if previous.reference != attempt_reference or previous._cashier_state() != 'failed':
             return previous._cashier_status()
         if not previous._refresh(recheck_failed=True) or previous._cashier_state() != 'failed':
             return previous._cashier_status()
 
+        payment = previous.payment_id.with_env(self.env)
+        order = payment.pos_order_id
         order._square_check_session()
         attempts = order._square_current_attempts()
         order._square_check_reserved_amounts(attempts)
@@ -326,7 +326,7 @@ class PosOrder(models.Model):
             return {'state': 'unstarted'}
         link = attempt.square_order_link_id
         if attempt._cashier_state() == 'canceling':
-            attempt.order_id._square_finish_cancellation(attempt, request=True)
+            attempt.order_id._square_finish_cancellation(attempt)
         elif not link.settlement_request:
             attempt._refresh()
         return attempt._cashier_status()
@@ -354,7 +354,7 @@ class PosOrder(models.Model):
         if any(line.payment_method_id.use_payment_terminal == 'square_terminal' for line in pending):
             return
         cash = self._square_cash_tenders(pending, link.currency_digits)
-        covered = link._cash_total_minor() + sum(attempts.mapped('amount_minor'))
+        covered = link._covered_gross_minor(attempts)
         added_cash = sum(minor_units(line.amount, link.currency_digits) for line in cash)
         if covered + added_cash != link.total_minor + link.tip_minor:
             return
@@ -409,10 +409,10 @@ class PosOrder(models.Model):
                 if outcome not in ('authorizations_only', 'released_tender_confirmed'):
                     return attempt._cashier_status()
             link.cancel_requested = True
-            order._square_finish_cancellation(attempt, request=True)
+            order._square_finish_cancellation(attempt)
         return attempt._cashier_status()
 
-    def _square_finish_cancellation(self, attempt, *, request=False):
+    def _square_finish_cancellation(self, attempt):
         link = attempt.square_order_link_id
         related_attempts = self._square_reserved_attempts().filtered(
             lambda candidate: candidate.square_order_link_id == link,
@@ -420,7 +420,7 @@ class PosOrder(models.Model):
         orphaned = related_attempts.browse()
         checks_complete = True
         for share in related_attempts:
-            result = share._cancel_checkout() if request else share._refresh(recheck_failed=True)
+            result = share._cancel_checkout()
             if result == UNPAID_ORDER_WITHOUT_CHECKOUT:
                 orphaned |= share
             elif not result or share.state not in ('failed', 'blocked'):
@@ -431,13 +431,13 @@ class PosOrder(models.Model):
             attempt._check_provider_scope()
         except UserError:
             return
-        if not link._release_cash_tenders(request=request):
+        if not link._release_cash_tenders():
             return
         released_payment_ids = [
             payment_id for share in related_attempts for payment_id in share._known_payment_ids()
         ]
         released_payment_ids.extend(filter(None, link._cash_square_payment_ids()))
-        link._cancel_unpaid_order(released_payment_ids, request=request)
+        link._cancel_unpaid_order(released_payment_ids)
         if link.cancelled:
             # An open order without a visible checkout is ambiguous until Square
             # confirms the versioned cancellation. CANCELED is terminal and unpaid.
@@ -544,14 +544,14 @@ class PosOrder(models.Model):
             or any(card.is_change or not card.uuid for card in cards)
             or any(minor_units(card.amount, link.currency_digits) <= 0 for card in cards)
             or sum(minor_units(line.amount, link.currency_digits) for line in cash | cards)
-            > link.total_minor + link.tip_minor - link._cash_total_minor() - sum(attempts.mapped('amount_minor'))
+            > link.total_minor + link.tip_minor - link._covered_gross_minor(attempts)
         ):
             raise UserError(_("Add cash or one Square card share within the remaining balance."))
 
     def _square_check_reserved_amounts(self, attempts):
         self.ensure_one()
         link = attempts.square_order_link_id
-        total = sum(attempts.mapped('amount_minor')) + link._cash_total_minor()
+        total = link._covered_gross_minor(attempts)
         digits = link.currency_digits
         cash = link._cash_payment_lines()
         if (
@@ -581,7 +581,7 @@ class PosOrder(models.Model):
             if (
                 not attempts or any(attempt.state != 'verified' for attempt in attempts)
                 or (link.split and (
-                    sum(attempts.mapped('amount_minor')) + link._cash_total_minor() != link.total_minor + link.tip_minor
+                    link._covered_gross_minor(attempts) != link.total_minor + link.tip_minor
                     or link._settlement_payment_ids(attempts) != (link.settlement_request or {}).get('payment_ids')
                     or not link._matches_native_cash(link._cash_payment_lines(), verified=True)
                 ))
