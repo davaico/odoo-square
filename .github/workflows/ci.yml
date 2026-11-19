@@ -26,7 +26,16 @@ jobs:
             tags: standard/payment_square_online
           - suite: combined
             modules: payment_square_online,sale_stock,odoo_square
-            tags: standard/payment_square_online,standard/odoo_square,square_coexistence
+            tags: standard/payment_square_online,standard/odoo_square,square_coexistence,-/payment_square_online:TestSquareCoexistence.test_website_and_terminal_ownership_coexist_at_the_same_square_location
+          - suite: terminal
+            modules: pos_square_terminal
+            tags: /pos_square_terminal
+          - suite: terminal-importer
+            modules: pos_square_terminal,odoo_square
+            tags: standard/pos_square_terminal,standard/odoo_square,square_terminal_import
+          - suite: terminal-combined
+            modules: pos_square_terminal,payment_square_online,sale_stock,odoo_square
+            tags: standard/pos_square_terminal,standard/payment_square_online,standard/odoo_square,square_coexistence,square_terminal_import
           - suite: refund-races
             modules: payment_square_online,sale_stock
             tags: ''
@@ -66,18 +75,37 @@ jobs:
               --workers=0 --stop-after-init --log-level=test 2>&1 | tee test-results/odoo-tests.log
             log=test-results/odoo-tests.log
             grep -Eq '(^|[[:space:]])0 failed, 0 error\(s\) of [1-9][0-9]* tests when loading database' "$log"
-            if grep -Eq 'odoo\.addons\.(odoo_square|payment_square_online)\.tests\..*: skipped ' "$log"; then
+            if grep -Eq 'odoo\.addons\.(odoo_square|payment_square_online|pos_square_terminal)\.tests\..*: skipped ' "$log"; then
               echo 'A required addon test was skipped.' >&2
               exit 1
             fi
-            if [[ "$TEST_SUITE" != pos ]]; then
-              grep -Fq 'Starting TestSquareCheckout.test_mobile_browser_can_cancel_and_complete_square_authentication ' "$log"
-            fi
-            if [[ "$TEST_SUITE" != online ]]; then
-              grep -Eq 'odoo\.addons\.odoo_square\.tests\..*: Starting ' "$log"
-            fi
-            if [[ "$TEST_SUITE" == combined ]]; then
-              grep -Fq 'Starting TestSquareCoexistence.' "$log"
+            case "$TEST_SUITE" in
+              online|combined|terminal-combined)
+                grep -Fq 'Starting TestSquareCheckout.test_mobile_browser_can_cancel_and_complete_square_authentication ' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              pos|combined|terminal-importer|terminal-combined)
+                grep -Eq 'odoo\.addons\.odoo_square\.tests\..*: Starting ' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              combined|terminal-combined)
+                grep -Fq 'Starting TestSquareCoexistence.' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              terminal*)
+                grep -Fq 'Starting TestSquareTerminalCheckout.test_first_card_is_verified_on_original_sale ' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              terminal-importer|terminal-combined)
+                grep -Fq 'Starting TestSquareTerminalImport.' "$log"
+                ;;
+            esac
+            if [[ "$TEST_SUITE" == terminal-combined ]]; then
+              grep -Fq 'Starting TestSquareCoexistence.test_website_and_terminal_ownership_coexist_at_the_same_square_location ' "$log"
             fi
           fi
 

@@ -1,10 +1,14 @@
 from decimal import Decimal
+from math import isfinite
 from uuid import uuid4
 
 from psycopg2.errors import UniqueViolation
 
 from odoo import Command, _, api, models
 from odoo.exceptions import AccessError, UserError
+from odoo.tools.float_utils import float_compare, float_round
+
+from ..square_api import SquareAPIError
 
 
 PAID_STATES = ('paid', 'done', 'invoiced')
@@ -15,6 +19,10 @@ def minor_units(amount, digits):
     if not value.is_finite() or value != value.to_integral_value():
         raise UserError(_("The Odoo amount cannot be represented in the Square location currency."))
     return int(value)
+
+
+def decimal_string(amount):
+    return format(Decimal(str(amount)).normalize(), 'f')
 
 
 def same_value(record, field, value):
@@ -75,7 +83,9 @@ class PosOrder(models.Model):
 
         currency = terminal.location_id.currency_code
         digits = 0 if currency == 'JPY' else 2
-        total_minor, line_items = order._square_priced_basket(digits)
+        total_minor, line_items, tip_minor = order._square_priced_basket(digits)
+        if tip_minor:
+            raise UserError(_("Square Terminal cannot send an Odoo-entered tip with this payment."))
         if (
             total_minor < 1 or total_minor > 2_147_483_647
             or minor_units(payment.amount, digits) != total_minor
@@ -83,6 +93,12 @@ class PosOrder(models.Model):
             raise UserError(_("The Square payment must cover the exact Odoo order total."))
 
         order_reference = 'odoo-' + uuid4().hex
+        try:
+            create_request, pricing_snapshot = order._square_order_payload(
+                terminal.location_id, order_reference, line_items,
+            )
+        except SquareAPIError:
+            raise UserError(_("Square could not check the catalog. Try again before sending the payment.")) from None
         try:
             with self.env.cr.savepoint():
                 order_link = self.env['pos.square.order'].sudo().create({
@@ -98,8 +114,14 @@ class PosOrder(models.Model):
                     'currency_code': currency,
                     'currency_digits': digits,
                     'total_minor': total_minor,
-                    'create_request': order._square_order_payload(terminal.location_id, order_reference, line_items),
+                    'tip_minor': tip_minor,
+                    'create_request': create_request,
+                    'pricing_snapshot': pricing_snapshot,
                 })
+                try:
+                    preview_matches = order_link._preview_square_order()
+                except SquareAPIError:
+                    raise UserError(_("Square could not check the order pricing. Try again before sending the payment.")) from None
                 attempt_reference = 'odoo-' + uuid4().hex
                 attempt = attempts.create({
                     'square_order_link_id': order_link.id,
@@ -111,6 +133,7 @@ class PosOrder(models.Model):
                     'application_id': connection.application_id,
                     'reference': attempt_reference,
                     'amount_minor': total_minor,
+                    'state': 'prepared' if preview_matches else 'blocked',
                     'checkout_request': {
                         'idempotency_key': str(uuid4()),
                         'checkout': {
@@ -267,7 +290,7 @@ class PosOrder(models.Model):
         allowed_pricelists = config._get_available_pricelists()
         pricelist = self.pricelist_id if config.use_pricelist else self.env['product.pricelist']
         if (
-            not self.lines or self.amount_return > 0 or self.is_tipped or self.tip_amount or self.shipping_date
+            not self.lines or self.amount_return > 0 or self.shipping_date
             or (config.cash_rounding and not config.only_round_cash_method)
             or (config.use_pricelist and pricelist not in allowed_pricelists)
             or (not config.use_pricelist and self.pricelist_id and self.pricelist_id != config.pricelist_id)
@@ -276,56 +299,278 @@ class PosOrder(models.Model):
             raise UserError(_("This sale configuration is unavailable for Square Terminal."))
         client_total = minor_units(self.amount_total, digits)
         client_tax = minor_units(self.amount_tax, digits)
-        line_items = []
-        expected_total = 0
+        currency = self.currency_id
+        account_tax = self.env['account.tax']
+        price_digits = self.env['decimal.precision'].precision_get('Product Price')
+        pricelist = pricelist.with_company(self.company_id)
+        tip_lines = self.lines.filtered(lambda line: line.product_id == config.tip_product_id)
+        tip_minor = minor_units(self.tip_amount, digits)
+        if tip_minor or tip_lines:
+            if (
+                tip_minor < 0 or not self.is_tipped or len(tip_lines) != 1
+                or tip_lines.qty != 1 or tip_lines.discount or tip_lines.tax_ids
+                or tip_lines.combo_parent_id or tip_lines.combo_line_ids
+                or minor_units(tip_lines.price_unit, digits) != tip_minor
+            ):
+                raise UserError(_("The Odoo tip differs from the recorded tip line."))
+        combo_prices = self._square_combo_prices(pricelist, digits)
+        unit_prices = {}
         for line in self.lines:
             product = line.product_id
             taxes = product.taxes_id._filter_taxes_by_company(self.company_id)
             if (
-                line.qty <= 0 or line.qty != int(line.qty) or line.price_unit <= 0 or line.discount
-                or line.price_type == 'manual' or line.price_extra or line.refunded_orderline_id
-                or line.combo_parent_id or line.combo_item_id or product.type == 'combo'
+                not all(isfinite(value) for value in (line.qty, line.price_unit, line.discount))
+                or line.qty <= 0 or line.price_unit < 0 or not 0 <= line.discount <= 100
+                or (line.discount and not config.manual_discount)
+                or (line.price_type == 'manual' and line not in tip_lines) or line.price_extra
+                or line.refunded_orderline_id or (line.combo_item_id and line not in combo_prices)
+                or (line.combo_parent_id and line not in combo_prices)
                 or product.tracking != 'none'
-                or not product.active or not product.sale_ok or not product.available_in_pos
+                or not product.active or not product.sale_ok
+                or (not product.available_in_pos and not line.combo_parent_id and line not in tip_lines)
                 or (product.company_id and product.company_id != self.company_id)
                 or set(taxes.ids) != set(line.tax_ids.ids)
-                or line.tax_ids_after_fiscal_position
-                or (config.tip_product_id and product == config.tip_product_id)
             ):
-                raise UserError(_("Square Terminal currently supports ordinary untaxed items at their configured price."))
-            price = (
-                pricelist.with_company(self.company_id)._get_product_price(product, line.qty)
-                if pricelist else product.lst_price
-            )
-            unit_minor = minor_units(line.price_unit, digits)
-            subtotal = unit_minor * int(line.qty)
+                raise UserError(_("An Odoo basket item cannot be priced for Square Terminal."))
+            if line in tip_lines:
+                price = self.tip_amount
+            elif line in combo_prices:
+                price = combo_prices[line]
+            else:
+                price = pricelist._get_product_price(product, line.qty) if pricelist else product.lst_price
+            if float_compare(price, line.price_unit, precision_digits=price_digits):
+                raise UserError(_("The Odoo basket price changed. Reload the register and check the sale."))
+            unit_prices[line] = float_round(price, precision_digits=price_digits)
+
+        base_lines = self.lines._prepare_tax_base_line_values()
+        for line, base in zip(self.lines, base_lines):
+            base['price_unit'] = unit_prices[line]
+        account_tax._add_tax_details_in_base_lines(base_lines, self.company_id)
+        for line, base in zip(self.lines, base_lines):
+            account_tax._round_base_lines_tax_details([base], self.company_id)
+            details = base['tax_details']
             if (
-                minor_units(price, digits) != unit_minor or minor_units(line.price_subtotal, digits) != subtotal
-                or minor_units(line.price_subtotal_incl, digits) != subtotal
+                currency.compare_amounts(line.price_subtotal, details['total_excluded_currency'])
+                or currency.compare_amounts(line.price_subtotal_incl, details['total_included_currency'])
             ):
                 raise UserError(_("The Odoo basket price changed. Reload the register and check the sale."))
-            expected_total += subtotal
+
+        account_tax._round_base_lines_tax_details(base_lines, self.company_id)
+        line_items = []
+        for line, base in zip(self.lines, base_lines):
+            if line in tip_lines:
+                continue
+            details = base['tax_details']
+            net_minor = minor_units(currency.round(
+                details['total_excluded_currency'] + details['delta_total_excluded_currency'],
+            ), digits)
+            taxes = [
+                (tax_data['tax'], minor_units(tax_data['tax_amount_currency'], digits))
+                for tax_data in details['taxes_data']
+            ]
+            tax_minor = sum(amount for _tax, amount in taxes)
+            unit_price = unit_prices[line]
+            base_before_discount = minor_units(currency.round(unit_price * line.qty), digits)
+            base_after_discount = minor_units(
+                currency.round(unit_price * line.qty * (1 - line.discount / 100)), digits,
+            )
+            unit_minor = Decimal(str(unit_price)).scaleb(digits)
+            square_taxes = [{
+                'uid': f'tax-{tax.id}',
+                'name': tax.name[:255],
+                'scope': 'LINE_ITEM',
+                'type': 'INCLUSIVE' if tax.price_include else 'ADDITIVE',
+                'percentage': decimal_string(tax.amount),
+            } for tax, amount in taxes if amount]
             line_items.append({
-                'name': product.display_name[:255],
-                'quantity': str(int(line.qty)),
-                'base_price_money': {'amount': unit_minor, 'currency': self.currency_id.name},
+                'product': line.product_id,
+                'name': line.product_id.with_context(display_default_code=False).display_name[:255],
+                'combo': line in combo_prices,
+                'quantity': decimal_string(line.qty),
+                'unit_minor': int(unit_minor) if unit_minor == unit_minor.to_integral_value() else None,
+                'total_minor': net_minor + tax_minor,
+                'taxes': square_taxes,
+                'inclusive_tax_minor': sum(amount for tax, amount in taxes if tax.price_include),
+                'summary_tax': any(
+                    tax.amount_type != 'percent' or tax.amount < 0 or tax.include_base_amount
+                    or len(decimal_string(tax.amount)) > 10
+                    for tax, amount in taxes if amount
+                ),
+                'tax_minor': tax_minor,
+                'discount_minor': base_before_discount - base_after_discount,
             })
+        expected_total = sum(line['total_minor'] for line in line_items)
+        expected_tax = sum(line['tax_minor'] for line in line_items)
         self.with_context(backend_recomputation=True)._compute_prices()
         if (
-            client_tax or client_total != expected_total
-            or minor_units(self.amount_tax, digits) or minor_units(self.amount_total, digits) != expected_total
+            client_tax != expected_tax or client_total != expected_total + tip_minor
+            or minor_units(self.amount_tax, digits) != expected_tax
+            or minor_units(self.amount_total, digits) != expected_total + tip_minor
         ):
             raise UserError(_("The calculated Odoo amounts differ from the displayed basket."))
-        return expected_total, line_items
+        return expected_total, line_items, tip_minor
+
+    def _square_combo_prices(self, pricelist, digits):
+        prices = {}
+        for parent in self.lines.filtered(lambda line: line.product_id.type == 'combo'):
+            groups = parent.product_id.combo_ids
+            children = parent.combo_line_ids.sorted('id')
+            if (
+                parent.combo_parent_id or not groups or len(children) != len(groups)
+                or set(children.combo_item_id.combo_id.ids) != set(groups.ids)
+                or any(
+                    child not in self.lines or child.product_id != child.combo_item_id.product_id
+                    or child.qty != parent.qty or child.attribute_value_ids
+                    for child in children
+                )
+            ):
+                raise UserError(_("The Odoo combo no longer matches its configured choices."))
+            prices[parent] = 0
+            product = parent.product_id
+            price = pricelist._get_product_price(product, 1) if pricelist else product.lst_price
+            weight = sum(groups.mapped('base_price'))
+            remaining = price
+            for child in children:
+                item = child.combo_item_id
+                if child == children[-1]:
+                    share = remaining
+                else:
+                    share = float_round(item.combo_id.base_price * price / weight, precision_digits=digits) if weight else 0
+                remaining -= share
+                prices[child] = share + item.extra_price
+        return prices
 
     def _square_order_payload(self, location, reference, line_items):
         self.ensure_one()
-        return {
-            'idempotency_key': str(uuid4()),
-            'order': {
-                'location_id': location.square_id, 'reference_id': reference, 'state': 'OPEN', 'line_items': line_items,
-            },
+        summary_reason = self._square_summary_reason(line_items)
+        if summary_reason:
+            line_items = self._square_receipt_summary(line_items)
+        currency = self.currency_id.name
+        order = {
+            'location_id': location.square_id,
+            'reference_id': reference,
+            'state': 'OPEN',
+            'pricing_options': {'auto_apply_discounts': False, 'auto_apply_taxes': False},
+            'line_items': [],
+            'taxes': [],
+            'discounts': [],
         }
+        expected = {}
+        variations = {}
+        units = {}
+        for index, line in enumerate(line_items, 1):
+            product = line['product']
+            sku = product.default_code if product else None
+            quantity = line['quantity']
+            precision = len(quantity.partition('.')[2])
+            if sku and sku not in variations:
+                variations[sku] = location._square_catalog_variation(sku)
+            variation = variations.get(sku)
+            uid = f'line-{index}'
+            payload = {
+                'uid': uid,
+                'quantity': quantity,
+                'base_price_money': {'amount': line['unit_minor'], 'currency': currency},
+            }
+            catalog_unit = None
+            if precision:
+                if variation:
+                    if variation['id'] not in units:
+                        units[variation['id']] = location._square_catalog_quantity_unit(variation)
+                    catalog_unit = units[variation['id']]
+                    if not catalog_unit or precision > catalog_unit['precision']:
+                        variation = catalog_unit = None
+                if not variation:
+                    name = product.uom_id.name
+                    payload['quantity_unit'] = {
+                        'measurement_unit': {'custom_unit': {'name': name[:50], 'abbreviation': name[:10]}},
+                        'precision': precision,
+                    }
+            if variation:
+                payload['catalog_object_id'] = variation['id']
+                if variation.get('version'):
+                    payload['catalog_version'] = variation['version']
+            else:
+                payload['name'] = line['name']
+            for tax in line['taxes']:
+                tax_uid = tax['uid']
+                if tax not in order['taxes']:
+                    order['taxes'].append(tax)
+                payload.setdefault('applied_taxes', []).append({'tax_uid': tax_uid})
+            if line['discount_minor']:
+                discount_uid = f'discount-{index}'
+                order['discounts'].append({
+                    'uid': discount_uid, 'name': _("Odoo line discount"), 'scope': 'LINE_ITEM',
+                    'type': 'FIXED_AMOUNT',
+                    'amount_money': {'amount': line['discount_minor'], 'currency': currency},
+                })
+                payload['applied_discounts'] = [{'discount_uid': discount_uid}]
+            order['line_items'].append(payload)
+            expected[uid] = {
+                'total_money': line['total_minor'],
+                'total_tax_money': line['tax_minor'],
+                'total_discount_money': line['discount_minor'],
+            }
+            if catalog_unit:
+                expected[uid]['quantity_unit'] = catalog_unit
+        return {'idempotency_key': str(uuid4()), 'order': order}, {
+            'lines': expected,
+            'summary_reason': summary_reason,
+        }
+
+    def _square_summary_reason(self, line_items):
+        if any(line['combo'] for line in line_items):
+            return 'combo'
+        if any(
+            line['unit_minor'] is None or len(line['quantity']) > 12
+            or len(line['quantity'].partition('.')[2]) > 5
+            for line in line_items
+        ):
+            return 'precision'
+        if any(line['summary_tax'] for line in line_items):
+            return 'tax'
+        return False
+
+    def _square_receipt_summary(self, line_items):
+        combo_names = list(dict.fromkeys(line['name'] for line in line_items if line['product'].type == 'combo'))
+        name = _("Odoo receipt %(receipt)s — %(description)s",
+                 receipt=self.pos_reference or self.name, description=', '.join(combo_names) or _("Basket"))[:255]
+        untaxed = {
+            'product': None, 'name': name, 'quantity': '1', 'unit_minor': 0,
+            'total_minor': 0, 'tax_minor': 0, 'discount_minor': 0, 'taxes': [],
+        }
+        summary = []
+        for index, line in enumerate(line_items, 1):
+            total, tax, discount = line['total_minor'], line['tax_minor'], line['discount_minor']
+            if not tax:
+                untaxed['unit_minor'] += total + discount
+                untaxed['total_minor'] += total
+                untaxed['discount_minor'] += discount
+                continue
+            taxes = line['taxes']
+            tax_included = line['inclusive_tax_minor']
+            if line['summary_tax']:
+                # Square takes percentages, so report a single effective receipt tax for this amount.
+                net = total - tax
+                if net <= 0 or tax < 0:
+                    raise UserError(_("The Odoo receipt tax cannot be represented on a Square order."))
+                percentage = decimal_string(round(100 * Decimal(tax) / net, 7))
+                if len(percentage) > 10:
+                    percentage = percentage[:10].rstrip('.')
+                tax_included = tax if tax_included == tax else 0
+                taxes = [{
+                    'uid': f'receipt-tax-{index}', 'name': _("Odoo receipt tax"),
+                    'scope': 'LINE_ITEM', 'type': 'INCLUSIVE' if tax_included else 'ADDITIVE',
+                    'percentage': percentage,
+                }]
+            summary.append({
+                'product': None, 'name': name, 'quantity': '1',
+                'unit_minor': total - tax + tax_included + discount,
+                'total_minor': total, 'tax_minor': tax, 'discount_minor': discount, 'taxes': taxes,
+            })
+        if untaxed['unit_minor']:
+            summary.append(untaxed)
+        return summary
 
     def _square_attempts(self):
         return self.env['pos.square.payment.attempt'].sudo().search([('order_id', 'in', self.ids)], order='id')

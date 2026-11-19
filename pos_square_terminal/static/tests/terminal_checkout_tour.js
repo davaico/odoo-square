@@ -1,9 +1,9 @@
-import { refresh } from "@point_of_sale/../tests/tours/utils/common";
 import { registry } from "@web/core/registry";
 import * as Chrome from "@point_of_sale/../tests/tours/utils/chrome_util";
 import * as PaymentScreen from "@point_of_sale/../tests/tours/utils/payment_screen_util";
 import * as ProductScreen from "@point_of_sale/../tests/tours/utils/product_screen_util";
 import * as ReceiptScreen from "@point_of_sale/../tests/tours/utils/receipt_screen_util";
+import { inLeftSide, refresh } from "@point_of_sale/../tests/tours/utils/common";
 
 registry.category("web_tour.tours").add("SquareTerminalCardCheckout", {
     steps: () => [
@@ -34,6 +34,58 @@ registry.category("web_tour.tours").add("SquareTerminalCashOnly", {
         ...PaymentScreen.clickValidate(),
         ...ReceiptScreen.receiptIsThere(),
         { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalDiscountedFraction", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad", 1.5),
+        ...inLeftSide([
+            ...ProductScreen.addDiscount(10),
+            ...ProductScreen.selectedOrderlineHasDirect("Desk Pad", 1.5, "16.20"),
+        ]),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "16.20"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("16.20"),
+        { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalComboSummary", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Lunch Combo"),
+        ...ProductScreen.addOrderline("Whiteboard Pen"),
+        ...inLeftSide([
+            ...ProductScreen.addDiscount(10),
+            ...ProductScreen.selectedOrderlineHasDirect("Whiteboard Pen", 1, "18.00"),
+        ]),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "60.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("60.00"),
+        { trigger: ".pos-receipt .orderline:contains('Lunch Combo')" },
+        { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
+        { trigger: ".pos-receipt .orderline:contains('Monitor Stand')" },
+        { trigger: ".pos-receipt .orderline:contains('Whiteboard Pen')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalPreviewDiscrepancy", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "12.34"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('The Square order total differs from the Odoo sale.')" },
     ],
 });
 
