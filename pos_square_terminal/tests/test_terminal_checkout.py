@@ -163,6 +163,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         connection.write({'webhook_url': webhook_url, 'new_webhook_signature_key': secret})
         checkout = {}
         requests = []
+        refund_status = 'PENDING'
 
         def square_response(method, url, **kwargs):
             parsed = urlsplit(url)
@@ -197,7 +198,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             if (method, path) == ('GET', '/v2/refunds/REFUND-10'):
                 return self._square_response({'refund': {
                     'id': 'REFUND-10', 'payment_id': 'SQUAREPAYMENT', 'location_id': 'SQUARELOC',
-                    'order_id': 'REFUND-ORDER', 'status': 'COMPLETED', 'amount_money': self._money(1000),
+                    'order_id': 'REFUND-ORDER', 'status': refund_status, 'amount_money': self._money(1000),
                 }})
             self.fail(f'Unexpected Square request: {method} {path}')
 
@@ -233,6 +234,14 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             attempt = self.env[action['res_model']].with_user(self.pos_admin).search(action['domain'])
             self.assertEqual(attempt.verified_base, 44)
             self.assertEqual(attempt.currency_id.name, 'EUR')
+            self.assertEqual(attempt.square_refund_ids.status, 'PENDING')
+            self.assertFalse(attempt.refund_ids)
+
+            refund_status = 'COMPLETED'
+            notify('refund-completed', 'refund.updated', 'refund', refund_notice)
+            cron.method_direct_trigger()
+            self.env.invalidate_all()
+            self.assertEqual(attempt.square_refund_ids.status, 'COMPLETED')
             self.assertEqual(attempt.refund_ids.mapped(lambda refund: (refund.square_refund_id, refund.amount)), [
                 ('REFUND-10', 10),
             ])

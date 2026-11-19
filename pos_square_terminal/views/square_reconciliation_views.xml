@@ -50,6 +50,16 @@
                                    invisible="not reconciliation_error or reconciliation_error == reconciliation_discrepancy"/>
                         </group>
                     </group>
+                    <group string="Square Refunds" invisible="not square_refund_ids">
+                        <field name="square_refund_ids" nolabel="1" readonly="1">
+                            <list create="0" edit="0" delete="0">
+                                <field name="currency_id" column_invisible="True"/>
+                                <field name="square_refund_id"/>
+                                <field name="amount"/>
+                                <field name="status"/>
+                            </list>
+                        </field>
+                    </group>
                     <group string="Counter Handover" invisible="not handover_state">
                         <field name="handover_state"/>
                         <field name="handover_at"/>
@@ -70,15 +80,6 @@
                             <field name="square_checkout_id"/>
                             <field name="square_payment_id"/>
                         </group>
-                    </group>
-                    <group string="Confirmed Square Refunds" invisible="not refund_ids">
-                        <field name="refund_ids" nolabel="1" readonly="1">
-                            <list create="0" edit="0" delete="0">
-                                <field name="currency_id" column_invisible="True"/>
-                                <field name="square_refund_id"/>
-                                <field name="amount"/>
-                            </list>
-                        </field>
                     </group>
                 </sheet>
             </form>

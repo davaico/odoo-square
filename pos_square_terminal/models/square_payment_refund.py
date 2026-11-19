@@ -10,7 +10,7 @@ from ..square_api import SquareAPIError
 
 class SquarePaymentRefund(models.Model):
     _name = 'pos.square.payment.refund'
-    _description = 'Confirmed Square Terminal Refund'
+    _description = 'Square Terminal Refund'
     _rec_name = 'square_refund_id'
 
     attempt_id = fields.Many2one('pos.square.payment.attempt', required=True, ondelete='restrict', index=True)
@@ -19,6 +19,10 @@ class SquarePaymentRefund(models.Model):
     merchant_id = fields.Char(required=True)
     currency_id = fields.Many2one(related='attempt_id.currency_id')
     square_refund_id = fields.Char(string='Square Refund Reference', required=True)
+    status = fields.Selection(
+        [('PENDING', 'Pending'), ('COMPLETED', 'Completed'), ('REJECTED', 'Rejected'), ('FAILED', 'Failed')],
+        string='Square Refund Status', required=True, default='COMPLETED',
+    )
     amount_minor = fields.Integer(required=True)
     amount = fields.Monetary(compute='_compute_amount', compute_sudo=True)
 
@@ -46,11 +50,19 @@ class SquarePaymentRefund(models.Model):
 class SquarePaymentAttempt(models.Model):
     _inherit = 'pos.square.payment.attempt'
 
-    refund_ids = fields.One2many('pos.square.payment.refund', 'attempt_id', string='Confirmed Square Refunds')
+    square_refund_ids = fields.One2many('pos.square.payment.refund', 'attempt_id', string='Square Refunds')
+    refund_ids = fields.One2many(
+        'pos.square.payment.refund', compute='_compute_confirmed_refunds', string='Confirmed Square Refunds',
+    )
     refunded_amount = fields.Monetary(
         string='Confirmed Refund Total', compute='_compute_refunded_amount', compute_sudo=True,
     )
     refund_reconciliation_issue = fields.Char(string='Refund Check Issue', copy=False)
+
+    @api.depends('square_refund_ids.status')
+    def _compute_confirmed_refunds(self):
+        for attempt in self:
+            attempt.refund_ids = attempt.square_refund_ids.filtered_domain([('status', '=', 'COMPLETED')])
 
     @api.depends('refund_ids.amount_minor', 'square_order_link_id.currency_digits')
     def _compute_refunded_amount(self):
@@ -110,7 +122,11 @@ class SquarePaymentAttempt(models.Model):
                 return _("Square's refund total has an invalid amount or currency.")
             if reported_minor > captured_minor:
                 return _("Square's reported refunds exceed the original captured amount.")
-            if reported_minor != confirmed_minor:
+            pending_refunds = self.square_refund_ids.filtered_domain([
+                ('status', '=', 'PENDING'), ('square_refund_id', 'in', payment.get('refund_ids', [])),
+            ])
+            pending_minor = sum(pending_refunds.mapped('amount_minor'))
+            if reported_minor not in (confirmed_minor, confirmed_minor + pending_minor):
                 return _("Square's refund total differs from the confirmed refund details.")
         return False
 
@@ -122,8 +138,7 @@ class SquarePaymentAttempt(models.Model):
             or refund.get('location_id', self.square_location_id) != self.square_location_id
         ):
             raise ValueError('Square refund does not match the original payment')
-        if refund['status'] != 'COMPLETED':
-            return refund['status'] != 'PENDING'
+        status = refund['status']
         amount_minor = self._square_refund_amount_minor(refund.get('amount_money'))
         if amount_minor is None or amount_minor <= 0:
             raise ValueError('Invalid Square refund amount or currency')
@@ -134,19 +149,23 @@ class SquarePaymentAttempt(models.Model):
         ], limit=1)
         if existing:
             if existing.attempt_id != self or existing.amount_minor != amount_minor:
-                raise ValueError('Square refund differs from the previously confirmed refund')
-        else:
-            try:
-                with self.env.cr.savepoint():
-                    refunds.create({
-                        'attempt_id': self.id,
-                        'environment': self.environment,
-                        'merchant_id': self.merchant_id,
-                        'square_refund_id': refund['id'],
-                        'amount_minor': amount_minor,
-                    })
-            except UniqueViolation as error:
-                if error.diag.constraint_name != 'pos_square_payment_refund_square_refund_unique':
-                    raise
-                raise ValueError('Square refund already belongs to another payment') from None
-        return True
+                raise ValueError('Square refund differs from the previously recorded refund')
+            # A stale pending response must not regress a refund observed after it.
+            if existing.status not in ('COMPLETED', status) and status != 'PENDING':
+                existing.status = status
+            return existing.status != 'PENDING'
+        try:
+            with self.env.cr.savepoint():
+                refunds.create({
+                    'attempt_id': self.id,
+                    'environment': self.environment,
+                    'merchant_id': self.merchant_id,
+                    'square_refund_id': refund['id'],
+                    'amount_minor': amount_minor,
+                    'status': status,
+                })
+        except UniqueViolation as error:
+            if error.diag.constraint_name != 'pos_square_payment_refund_square_refund_unique':
+                raise
+            raise ValueError('Square refund already belongs to another payment') from None
+        return status != 'PENDING'

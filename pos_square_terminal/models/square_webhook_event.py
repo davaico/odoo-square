@@ -115,7 +115,7 @@ class SquareWebhookEvent(models.Model):
     def _process_refund_event(self):
         refund = self.env['pos.square.payment.refund']._read_square_refund(self.connection_id, self.resource_id)
         payment_id = self._identifier(refund.get('payment_id'))
-        if not payment_id or refund.get('unlinked') or refund['status'] in ('FAILED', 'REJECTED'):
+        if not payment_id or refund.get('unlinked'):
             return True
 
         attempts = self.env['pos.square.payment.attempt']
