@@ -28,6 +28,10 @@ For a replacement device, add a new terminal record and switch the payment metho
 
 For a mixed sale, enter the cash collected and send each Square card share for the balance. After a card authorization, you can also enter the remaining cash and select **Validate**. Use exact shares that add up to the sale total. Odoo keeps the original tenders and records the cash on the same Square order when the full balance is covered. If checkout is interrupted, reopen the original sale and choose **Check status** on a Square line. Cash-only sales use the existing Odoo cash method.
 
+## Enable tips on the terminal
+
+In **Point of Sale → Configuration → Settings**, select the register and enable **Square Terminal Tips**. Under **Tips**, select an active, tax-free service product for the receipt. Choose this product for each register that prompts for tips. For a split card payment, each cardholder can tip on their own share. The Odoo receipt shows one line for the combined tip and each card payment shows what that cardholder paid.
+
 ## Recover and review payments
 
 In the [Square Developer Console](https://developer.squareup.com/apps), add a webhook subscription in the connection's environment. Copy **Webhook Endpoint** from the saved Odoo connection. Register this HTTPS URL for `terminal.checkout.created`, `terminal.checkout.updated`, `payment.created`, `payment.updated`, `refund.created`, and `refund.updated`. Copy the exact registered URL and the subscription's signature key into **Square Notifications** on that Odoo connection. Keep the original subscription and authorization available when you replace or archive a connection. [Square webhook setup](https://developer.squareup.com/docs/webhooks/step2subscribe)

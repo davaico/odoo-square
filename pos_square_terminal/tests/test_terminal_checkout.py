@@ -578,6 +578,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertEqual(requests.count(('POST', '/v2/terminals/checkouts')), 2)
 
     def test_first_card_is_verified_on_original_sale(self):
+        self.main_pos_config.tip_product_id = False
         self.desk_pad.default_code = 'DESK-PAD'
         self.monitor_stand.default_code = 'MONITOR-STAND'
         mutations = []
@@ -1041,6 +1042,167 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             (5.00, 'done', 'TENDER-1'), (7.34, 'done', 'TENDER-3'),
         })
 
+    def test_split_device_tips_survive_lost_settlement_and_reload(self):
+        eur = self.env.ref('base.EUR')
+        eur.active = True
+        self.main_pos_config.journal_id.currency_id = eur
+        self.method.sudo().square_terminal_id.location_id.write({'currency_code': 'EUR', 'country_code': 'FR'})
+        self.currency = self.main_pos_config.currency_id.name
+        self.assertEqual(self.currency, 'EUR')
+        self.desk_pad.list_price = 100
+        tip_product = self._configure_device_tip(odoo_tipping=True)
+        provider_order = {}
+        checkouts = {}
+        payments = {}
+        mutations = []
+        lose_readback = False
+
+        def square_response(method, url, **kwargs):
+            nonlocal lose_readback
+            path = urlsplit(url).path
+            if method != 'GET':
+                mutations.append(path)
+            if (method, path) == ('POST', '/v2/orders/calculate'):
+                order = kwargs['json']['order']
+                self.assertEqual(len(order['line_items']), 1)
+                payload = {'order': self._draft_provider_order(order, 10000, line_total=10000)}
+            elif (method, path) == ('POST', '/v2/orders'):
+                provider_order.update(self._draft_provider_order(kwargs['json']['order'], 10000, line_total=10000),
+                                      id='TIPPEDORDER', version=1)
+                payload = {'order': provider_order}
+            elif (method, path) == ('POST', '/v2/terminals/checkouts'):
+                number = len(checkouts) + 1
+                base, tip, gross = ((4000, 300, 4300), (6000, 200, 6200))[number - 1]
+                checkout = kwargs['json']['checkout']
+                self.assertEqual(checkout['amount_money'], self._money(base))
+                self.assertEqual(checkout['order_id'], 'TIPPEDORDER')
+                self.assertEqual(checkout['payment_options'], {'autocomplete': False})
+                self.assertTrue(checkout['device_options']['tip_settings']['allow_tipping'])
+                checkout_id, payment_id = f'CHECKOUT-{number}', f'TIPPED-CARD-{number}'
+                checkouts[checkout_id] = {
+                    **checkout, 'id': checkout_id, 'location_id': 'SQUARELOC',
+                    'status': 'COMPLETED', 'payment_ids': [payment_id],
+                }
+                payments[payment_id] = {
+                    'id': payment_id, 'order_id': 'TIPPEDORDER', 'location_id': 'SQUARELOC',
+                    'reference_id': checkout['reference_id'], 'terminal_checkout_id': checkout_id,
+                    'status': 'APPROVED', 'amount_money': self._money(base),
+                    'tip_money': self._money(tip), 'total_money': self._money(gross), 'source_type': 'CARD',
+                }
+                payload = {'checkout': {**checkouts[checkout_id], 'status': 'PENDING'}}
+            elif method == 'GET' and path.startswith('/v2/terminals/checkouts/'):
+                payload = {'checkout': checkouts[path.rsplit('/', 1)[1]]}
+            elif method == 'GET' and path.startswith('/v2/payments/'):
+                payload = {'payment': payments[path.rsplit('/', 1)[1]]}
+            elif (method, path) == ('GET', '/v2/orders/TIPPEDORDER'):
+                if lose_readback:
+                    lose_readback = False
+                    raise ConnectionError('Square settlement read unavailable')
+                payload = {'order': provider_order}
+            elif (method, path) == ('POST', '/v2/orders/TIPPEDORDER/pay'):
+                request = kwargs['json']
+                self.assertEqual(request['payment_ids'], ['TIPPED-CARD-1', 'TIPPED-CARD-2'])
+                self.assertEqual(request['order_version'], 1)
+                self.assertTrue(request['idempotency_key'])
+                tenders = []
+                for payment in payments.values():
+                    payment['status'] = 'COMPLETED'
+                    tenders.append({
+                        'payment_id': payment['id'], 'location_id': 'SQUARELOC', 'type': 'CARD',
+                        'amount_money': payment['total_money'], 'tip_money': payment['tip_money'],
+                    })
+                provider_order.update(
+                    state='COMPLETED', version=2, total_money=self._money(10500),
+                    total_tip_money=self._money(500), tenders=tenders,
+                )
+                lose_readback = True
+                raise ConnectionError('Square settled the original sale before losing the response')
+            else:
+                self.fail(f'Unexpected Square request: {method} {path}')
+            return self._square_response(payload)
+
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
+            self.start_pos_tour('SquareTerminalSplitDeviceTips')
+            self.env.invalidate_all()
+            order = self.pos_session.order_ids
+            original_tip_line = order.lines.filtered(lambda line: line.product_id == tip_product)
+            attempts = self.env['pos.square.payment.attempt'].with_user(self.pos_admin).search([
+                ('order_id', '=', order.id),
+            ])
+            for attempt in attempts:
+                attempt.action_check_square_payment()
+                self.assertFalse(attempt.reconciliation_error)
+            # Reconciliation can see later conflicting evidence, which must preserve
+            # the original captured payment and POS accounting for the manager.
+            first = attempts.filtered(lambda line: line.square_payment_id == 'TIPPED-CARD-1')
+            payments['TIPPED-CARD-1'].update(tip_money=self._money(400), total_money=self._money(4400))
+            first.action_check_square_payment()
+            self.assertIn('total or tip differs', first.reconciliation_discrepancy)
+
+        self.assertEqual(mutations, [
+            '/v2/orders/calculate', '/v2/orders', '/v2/terminals/checkouts',
+            '/v2/terminals/checkouts', '/v2/orders/TIPPEDORDER/pay',
+        ])
+        self.env.invalidate_all()
+        order = self.pos_session.order_ids
+        self.assertEqual(len(order), 1)
+        self.assertEqual(order.state, 'paid')
+        self.assertEqual((order.amount_total, order.amount_paid, order.tip_amount), (105, 105, 5))
+        tip_line = order.lines.filtered(lambda line: line.product_id == tip_product)
+        self.assertEqual(len(tip_line), 1)
+        self.assertEqual(tip_line, original_tip_line)
+        self.assertEqual((tip_line.qty, tip_line.price_subtotal_incl), (1, 5))
+        self.assertEqual({(line.amount, line.transaction_id) for line in order.payment_ids}, {
+            (43, 'TIPPED-CARD-1'), (62, 'TIPPED-CARD-2'),
+        })
+        attempts = self.env['pos.square.payment.attempt'].sudo().search([('order_id', '=', order.id)])
+        self.assertEqual({(line.square_payment_id, line.verified_base, line.verified_tip) for line in attempts}, {
+            ('TIPPED-CARD-1', 40, 3), ('TIPPED-CARD-2', 60, 2),
+        })
+        with self.assertRaisesRegex(UserError, 'original goods are reserved'):
+            tip_line.with_user(self.pos_user).write({'price_unit': 12})
+        with self.assertRaisesRegex(UserError, 'original tender is reserved'):
+            order.payment_ids[:1].with_user(self.pos_user).write({'amount': 12})
+
+    def test_device_tip_missing_product_stops_before_dispatch(self):
+        self.main_pos_config.write({'square_terminal_tipping': True, 'tip_product_id': False})
+        with patch('odoo.addons.pos_square_terminal.square_api.request') as provider:
+            self.start_pos_tour('SquareTerminalDeviceTipMissingProduct')
+        provider.assert_not_called()
+        self.env.invalidate_all()
+        self.assertEqual(self.pos_session.order_ids.state, 'draft')
+        self.assertFalse(self.pos_session.order_ids.payment_ids.transaction_id)
+
+    def test_device_tip_zero_leaves_receipt_unchanged(self):
+        self._configure_device_tip()
+        self._run_priced_checkout('SquareTerminalDeviceTipZero', ((1234, 0, 0),), lambda order: None, device_tip_minor=0)
+        order = self.pos_session.order_ids
+        self.assertEqual(order.lines.product_id, self.desk_pad)
+        self.assertEqual((order.amount_total, order.amount_paid, order.tip_amount), (12.34, 12.34, 0))
+
+    def test_device_tip_on_one_card_updates_native_receipt(self):
+        tip_product = self._configure_device_tip()
+        self._run_priced_checkout(
+            'SquareTerminalSingleDeviceTip', ((1234, 0, 0),), lambda order: None, device_tip_minor=330,
+        )
+        order = self.pos_session.order_ids
+        tip_line = order.lines.filtered(lambda line: line.product_id == tip_product)
+        self.assertEqual((len(tip_line), tip_line.price_subtotal_incl), (1, 3.30))
+        self.assertEqual((order.amount_total, order.amount_paid, order.tip_amount), (15.64, 15.64, 3.30))
+
+    def _configure_device_tip(self, *, odoo_tipping=False):
+        tip_product = self.env['product.product'].create({
+            'name': 'Terminal Gratuity', 'type': 'service', 'taxes_id': [Command.clear()],
+        })
+        settings = self.env['res.config.settings'].create({
+            'pos_config_id': self.main_pos_config.id,
+            'pos_square_terminal_tipping': True,
+            'pos_iface_tipproduct': odoo_tipping,
+            'pos_tip_product_id': tip_product.id,
+        })
+        self.assertEqual(settings.pos_tip_product_id, tip_product)
+        return tip_product
+
     def test_abandon_split_releases_each_approval_before_replacement_cash(self):
         provider_order = {}
         checkouts = {}
@@ -1443,8 +1605,9 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertEqual(order.amount_total, 60.0)
         self.assertEqual(order.amount_tax, 3.50)
 
-    def test_cash_after_two_card_authorizations_recovers_recording_and_closes_accounting(self):
+    def test_cash_after_two_tipped_card_authorizations_recovers_recording_and_closes_accounting(self):
         self.desk_pad.lst_price = 12
+        tip_product = self._configure_device_tip(odoo_tipping=True)
         other_cash = (self.main_pos_config.payment_method_ids - self.cash_method).filtered('is_cash_count')
         self.main_pos_config.with_context(bypass_payment_method_ids_forbidden_change=True).write({
             'payment_method_ids': [Command.unlink(method.id) for method in other_cash],
@@ -1452,14 +1615,19 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         cash_journal = self.cash_method.journal_id
         cash_account = cash_journal.default_account_id
         self._run_mixed_checkout(
-            'SquareTerminalCardsThenCash', ((1200, 0, 0),), 300, (500, 400), lose_cash=True,
+            'SquareTerminalCardsThenCash', ((1200, 0, 0),), 300, (500, 400),
+            card_tips=(50, 25), lose_cash=True,
         )
         session = self.pos_session.with_user(self.pos_user)
+        order = session.order_ids
+        tip_line = order.lines.filtered(lambda line: line.product_id == tip_product)
+        self.assertEqual(tip_line.price_subtotal_incl, 0.75)
+        self.assertEqual(order.amount_total, 12.75)
         closing = session.get_closing_control_data()
         self.assertEqual(closing['default_cash_details']['payment_amount'], 3)
         self.assertEqual(
             [(method['amount'], method['number']) for method in closing['non_cash_payment_methods']
-             if method['id'] == self.method.id], [(9, 2)],
+             if method['id'] == self.method.id], [(9.75, 2)],
         )
         self.assertEqual(session.post_closing_cash_details(3), {'successful': True})
         self.assertEqual(session.close_session_from_ui(), {'successful': True})
@@ -1469,7 +1637,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertEqual(statement_lines.move_id.state, 'posted')
         self.assertEqual(statement_lines.move_id.line_ids.filtered(lambda line: line.account_id == cash_account).debit, 3)
         bank_payment = session.sudo().bank_payment_ids.filtered(lambda payment: payment.pos_payment_method_id == self.method)
-        self.assertEqual(bank_payment.amount, 9)
+        self.assertEqual(bank_payment.amount, 9.75)
         self.assertEqual(bank_payment.journal_id, self.method.journal_id)
 
     def test_unsupported_voucher_is_explained_before_any_square_request(self):
@@ -1487,9 +1655,10 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertFalse(self.env['pos.square.order'].sudo().search_count([('order_id', '=', order.id)]))
 
     def _run_mixed_checkout(self, tour, line_amounts, cash, cards, *, check_order=lambda order: None,
-                            lose_settlement=False, lose_cash=False):
+                            card_tips=(), lose_settlement=False, lose_cash=False):
         fields = ('total_money', 'total_tax_money', 'total_discount_money')
         totals = {field: self._money(sum(amounts)) for field, amounts in zip(fields, zip(*line_amounts))}
+        tips = card_tips or (0,) * len(cards)
         provider_order = {}
         checkouts = {}
         payments = {}
@@ -1501,6 +1670,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         def square_response(method, url, **kwargs):
             nonlocal lose_readback
             path = urlsplit(url).path
+            self.assertEqual(kwargs['headers']['Authorization'], 'Bearer square-access-token')
             if method == 'POST':
                 mutations.append(path)
             if method == 'POST' and path in ('/v2/orders/calculate', '/v2/orders'):
@@ -1522,6 +1692,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 self.assertEqual(checkout['order_id'], 'MIXEDORDER')
                 self.assertEqual(checkout['payment_options'], {'autocomplete': False})
                 self.assertEqual(checkout['amount_money'], self._money(cards[number - 1]))
+                self.assertEqual(checkout['device_options']['tip_settings']['allow_tipping'], bool(card_tips))
                 self.assertTrue(all(payment['status'] == 'APPROVED' for payment in payments.values()))
                 checkout_id = f'CHECKOUT-{number}'
                 payment_id = f'CARD-{number}'
@@ -1532,7 +1703,8 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 payments[payment_id] = {
                     'id': payment_id, 'order_id': 'MIXEDORDER', 'location_id': 'SQUARELOC',
                     'reference_id': checkout['reference_id'], 'source_type': 'CARD', 'status': 'APPROVED',
-                    'amount_money': self._money(cards[number - 1]), 'total_money': self._money(cards[number - 1]),
+                    'amount_money': self._money(cards[number - 1]), 'tip_money': self._money(tips[number - 1]),
+                    'total_money': self._money(cards[number - 1] + tips[number - 1]),
                 }
                 return self._square_response({'checkout': {**checkouts[checkout_id], 'status': 'PENDING', 'payment_ids': []}})
             if method == 'GET' and path.startswith('/v2/terminals/checkouts/'):
@@ -1591,9 +1763,12 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                     payment['status'] = 'COMPLETED'
                     tenders.append({
                         'payment_id': payment_id, 'location_id': 'SQUARELOC', 'type': payment['source_type'],
-                        'amount_money': payment['total_money'],
+                        'amount_money': payment['total_money'], 'tip_money': payment.get('tip_money', self._money(0)),
                     })
-                provider_order.update(state='COMPLETED', version=2, tenders=tenders)
+                provider_order.update(
+                    state='COMPLETED', version=2, tenders=tenders, total_tip_money=self._money(sum(tips)),
+                    total_money=self._money(totals['total_money']['amount'] + sum(tips)),
+                )
                 if lose_settlement:
                     lose_readback = True
                     raise ConnectionError('Square settled the mixed order before the response was lost')
@@ -1618,7 +1793,8 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         card_lines = order.payment_ids - cash_line
         self.assertCountEqual(
             [(payment.amount, payment.payment_status, payment.transaction_id) for payment in card_lines],
-            [(amount / 100, 'done', f'CARD-{number}') for number, amount in enumerate(cards, 1)],
+            [((base + tip) / 100, 'done', f'CARD-{number}')
+             for number, (base, tip) in enumerate(zip(cards, tips), 1)],
         )
         self.assertEqual({payment['status'] for payment in payments.values()}, {'COMPLETED'})
 
@@ -1631,7 +1807,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
     def _money(self, amount):
         return {'amount': amount, 'currency': self.currency}
 
-    def _run_priced_checkout(self, tour, line_amounts, check_order, *, expected_state='paid'):
+    def _run_priced_checkout(self, tour, line_amounts, check_order, *, expected_state='paid', device_tip_minor=None):
         fields = ('total_money', 'total_tax_money', 'total_discount_money')
         gross = sum(amounts[0] for amounts in line_amounts)
         totals = {field: self._money(sum(amounts)) for field, amounts in zip(fields, zip(*line_amounts))}
@@ -1660,6 +1836,9 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 checkout.update(kwargs['json']['checkout'])
                 self.assertEqual(checkout['order_id'], 'SQUAREORDER')
                 self.assertEqual(checkout['amount_money'], self._money(gross))
+                self.assertEqual(
+                    checkout['device_options']['tip_settings']['allow_tipping'], device_tip_minor is not None,
+                )
                 checkout.update(id='SQUARECHECKOUT', location_id='SQUARELOC', status='PENDING')
                 return self._square_response({'checkout': checkout})
             if (method, path) == ('GET', '/v2/terminals/checkouts/SQUARECHECKOUT'):
@@ -1670,7 +1849,8 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                     'id': 'SQUAREPAYMENT', 'order_id': 'SQUAREORDER',
                     'location_id': 'SQUARELOC', 'reference_id': checkout['reference_id'],
                     'status': 'COMPLETED', 'amount_money': self._money(gross),
-                    'total_money': self._money(gross), 'source_type': 'CARD',
+                    'total_money': self._money(gross + (device_tip_minor or 0)), 'source_type': 'CARD',
+                    **({'tip_money': self._money(device_tip_minor)} if device_tip_minor is not None else {}),
                 }})
             self.fail(f'Unexpected Square request: {method} {path}')
 
@@ -1733,10 +1913,10 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertEqual(order.state, 'draft')
         self.assertEqual(payment.payment_status, 'waiting')
 
-    def _draft_provider_order(self, order, total):
+    def _draft_provider_order(self, order, total, *, line_total=1234):
         line, = order['line_items']
         return {
-            **order, 'total_money': self._money(total), 'line_items': [{**line, 'total_money': self._money(1234)}],
+            **order, 'total_money': self._money(total), 'line_items': [{**line, 'total_money': self._money(line_total)}],
         }
 
     def test_preview_discrepancy_stops_terminal_request(self):

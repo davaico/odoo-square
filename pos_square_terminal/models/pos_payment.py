@@ -95,11 +95,11 @@ class PosPayment(models.Model):
                 order._square_check_new_share(payment, order._square_current_attempts())
         return True
 
-    def _square_set_verified(self, payment_id, *, cash=False):
+    def _square_set_verified(self, payment_id, amount=None, *, cash=False):
         self.ensure_one()
         values = {'transaction_id': payment_id}
         if not cash:
-            values['payment_status'] = 'done'
+            values.update(payment_status='done', amount=amount)
         super(PosPayment, self.sudo()).write(values)
         self.invalidate_recordset(['square_attempt_state', 'square_attempt_reference', 'square_cash_reserved'])
 

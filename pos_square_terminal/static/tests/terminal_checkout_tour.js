@@ -143,7 +143,19 @@ registry.category("web_tour.tours").add("SquareTerminalCardsThenCash", {
         ...PaymentScreen.clickPaymentline("Checkout Cash", "2.00"),
         ...PaymentScreen.clickNumpad("3"),
         ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "3.00"),
-        ...PaymentScreen.clickValidate(),
+        {
+            trigger: ".payment-screen .validation-button.highlight",
+            async run() {
+                const order = window.posmodel.get_order();
+                const card = order.payment_ids.find((line) => line.square_attempt_state === "authorized");
+                const cash = order.payment_ids.find((line) => line.payment_method_id.name === "Checkout Cash");
+                const status = await window.posmodel.data.call("pos.order", "square_check_payment", [order.uuid, card.uuid]);
+                if (status.state !== "authorized" || status.cash_tenders[cash.uuid]) {
+                    throw new Error("The new cash line must remain local until the cashier validates");
+                }
+                this.anchor.click();
+            },
+        },
         ...PaymentScreen.clickPaymentline("Square Counter", "4.00"),
         { trigger: ".payment-screen .electronic_status:contains('Check the original cash recording')" },
         {
@@ -151,10 +163,11 @@ registry.category("web_tour.tours").add("SquareTerminalCardsThenCash", {
         },
         { trigger: ".payment-screen .square-check-status:contains('Check status')", run: "click" },
         ...ReceiptScreen.receiptIsThere(),
-        ...ReceiptScreen.receiptAmountTotalIs("12.00"),
+        ...ReceiptScreen.receiptAmountTotalIs("12.75"),
         { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash'):contains('3.00')" },
-        { trigger: ".pos-receipt .paymentlines:contains('Square Counter'):contains('5.00')" },
-        { trigger: ".pos-receipt .paymentlines:contains('Square Counter'):contains('4.00')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Square Counter'):contains('5.50')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Square Counter'):contains('4.25')" },
+        { trigger: ".pos-receipt .orderline:contains('Terminal Gratuity'):contains('0.75')" },
     ].flat(),
 });
 
@@ -370,6 +383,108 @@ registry.category("web_tour.tours").add("SquareTerminalSplitRecovery", {
         { trigger: ".pos-receipt .paymentlines:contains('5.00')" },
         { trigger: ".pos-receipt .paymentlines:contains('7.34')" },
     ].flat(),
+});
+
+registry.category("web_tour.tours").add("SquareTerminalSplitDeviceTips", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        PaymentScreen.enterPaymentLineAmount("Square Counter", "40"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "40.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
+        { trigger: ".payment-screen button:disabled:contains('Tip')" },
+        { trigger: ".payment-screen .payment-status-remaining .amount:contains('60.00')" },
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "60.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        {
+            trigger: ".payment-screen .electronic_status:contains('Check the original Square settlement')",
+            run() {
+                const order = window.posmodel.get_order();
+                sessionStorage.setItem("squareTippedOrder", order.uuid);
+                sessionStorage.setItem("squareTippedTenders", order.payment_ids.map((line) => line.uuid).sort().join());
+            },
+        },
+        refresh(),
+        { trigger: "body:not(:has(.pos-loader))" },
+        Chrome.clickMenuOption("Orders"),
+        {
+            trigger: ".ticket-screen .order-row",
+            async run(helpers) {
+                await helpers.dblclick(this.anchor);
+            },
+        },
+        {
+            trigger: ".payment-screen .square-check-status:contains('Check status')",
+            run() {
+                const order = window.posmodel.get_order();
+                if (order.uuid !== sessionStorage.getItem("squareTippedOrder") ||
+                    order.payment_ids.map((line) => line.uuid).sort().join() !==
+                        sessionStorage.getItem("squareTippedTenders")) {
+                    throw new Error("Reload must preserve the original sale and both tender identities");
+                }
+                this.anchor.click();
+            },
+        },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("105.00"),
+        { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
+        { trigger: ".pos-receipt .orderline:contains('Terminal Gratuity'):contains('5.00')" },
+        { trigger: ".pos-receipt .paymentlines:contains('43.00')" },
+        { trigger: ".pos-receipt .paymentlines:contains('62.00')" },
+        {
+            trigger: ".pos-receipt",
+            async run() {
+                const pos = window.posmodel;
+                const order = pos.get_order();
+                const [payment] = order.payment_ids;
+                await pos.data.call("pos.order", "square_check_payment", [order.uuid, payment.uuid]);
+                if (order.lines.filter((line) => line.product_id.display_name === "Terminal Gratuity").length !== 1) {
+                    throw new Error("The native receipt must only contain one gratuity line");
+                }
+            },
+        },
+    ].flat(),
+});
+
+function startDeviceTipCheckout() {
+    return [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+    ];
+}
+
+registry.category("web_tour.tours").add("SquareTerminalDeviceTipMissingProduct", {
+    steps: () => [
+        ...startDeviceTipCheckout(),
+        { trigger: ".modal:contains('Configure an active, tax-free Odoo tip service product') .btn-primary", run: "click" },
+        { trigger: ".payment-screen .send_payment_request" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalDeviceTipZero", {
+    steps: () => [
+        ...startDeviceTipCheckout(),
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("12.34"),
+        { trigger: ".pos-receipt:not(:has(.orderline:contains('Terminal Gratuity'))) .orderline:contains('Desk Pad')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalSingleDeviceTip", {
+    steps: () => [
+        ...startDeviceTipCheckout(),
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("15.64"),
+        { trigger: ".pos-receipt .orderline:contains('Terminal Gratuity'):contains('3.30')" },
+        { trigger: ".pos-receipt .paymentlines:contains('15.64')" },
+    ],
 });
 
 registry.category("web_tour.tours").add("SquareTerminalAbandonSplit", {
