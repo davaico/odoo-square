@@ -1,3 +1,4 @@
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from . import square_connection, square_credential, square_location, square_terminal, pos_payment_method
 from . import pos_config
 from . import square_order, square_payment_attempt, pos_order, pos_order_line, pos_payment

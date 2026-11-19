@@ -1,3 +1,4 @@
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from uuid import uuid4
 
 from odoo import _, api, models

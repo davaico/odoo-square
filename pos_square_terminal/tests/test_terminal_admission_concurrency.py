@@ -1,3 +1,4 @@
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 """Run with an installed, disposable database in an ordinary Odoo shell.
 
     from odoo.addons.pos_square_terminal.tests.test_terminal_admission_concurrency import run

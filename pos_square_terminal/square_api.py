@@ -1,3 +1,4 @@
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from requests import RequestException, request
 
 from .const import SQUARE_API_VERSION, SQUARE_BASE_URLS

@@ -1,3 +1,4 @@
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote

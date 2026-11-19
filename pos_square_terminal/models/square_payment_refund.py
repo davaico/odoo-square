@@ -1,3 +1,4 @@
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from urllib.parse import quote
 
 from psycopg2.errors import UniqueViolation

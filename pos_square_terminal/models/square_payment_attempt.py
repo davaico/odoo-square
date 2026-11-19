@@ -1,3 +1,4 @@
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import json
 from copy import deepcopy
 from datetime import timedelta, timezone

@@ -1,3 +1,4 @@
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 {
     "name": "Square Terminal for Point of Sale",
     "summary": "Take Odoo Point of Sale payments on Square Terminal",

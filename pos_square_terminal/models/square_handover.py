@@ -1,3 +1,4 @@
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from datetime import timedelta
 from urllib.parse import quote
 from uuid import NAMESPACE_URL, uuid5

@@ -1,3 +1,4 @@
+# License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 from decimal import Decimal
 from math import isclose, isfinite
 from uuid import uuid4
