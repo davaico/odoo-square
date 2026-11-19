@@ -75,8 +75,6 @@ class SquareOrder(models.Model):
         order = self.connection_id._request('POST', '/v2/orders/calculate', payload=payload).get('order')
         if not self._matches_order_totals(order):
             self.pricing_issue = 'preview_discrepancy'
-            return False
-        return True
 
     def _create_square_order(self):
         self.ensure_one()

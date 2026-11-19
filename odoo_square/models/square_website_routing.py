@@ -71,13 +71,13 @@ class SquareWebsiteRouting(models.Model):
         if self._terminal_matches_import_resource(kind, resource, config, merchant_id=merchant_id):
             return {"status": "ignored", "message": "Odoo POS Square Terminal operation"}
 
-    def _order_ownership(self, order, config, *, website, terminal):
+    def _resource_ownership(self, kind, resource, config, *, website, terminal):
         if terminal:
-            routing = self._terminal_resource_routing("order", order, config)
+            routing = self._terminal_resource_routing(kind, resource, config)
             if routing:
                 return routing
         if website:
-            return self._website_routing_result(self._website_resource_matches("order", order, config))
+            return self._website_routing_result(self._website_resource_matches(kind, resource, config))
 
     def _route_terminal_payment(self, notice, config):
         if (
@@ -108,7 +108,7 @@ class SquareWebsiteRouting(models.Model):
         if not order or order.get("id") != order_id or not order.get("location_id"):
             return retry_result, order
 
-        ownership = self._order_ownership(order, config, website=website, terminal=terminal)
+        ownership = self._resource_ownership("order", order, config, website=website, terminal=terminal)
         if ownership and ownership["status"] == "ignored":
             return ownership, order
         retry = ownership
@@ -123,7 +123,7 @@ class SquareWebsiteRouting(models.Model):
             if not source or source.get("id") != source_id or not source.get("location_id"):
                 retry = retry or retry_result
                 continue
-            ownership = self._order_ownership(source, config, website=website, terminal=terminal)
+            ownership = self._resource_ownership("order", source, config, website=website, terminal=terminal)
             if ownership and ownership["status"] == "ignored":
                 return ownership, order
             retry = retry or ownership
@@ -167,12 +167,7 @@ class SquareWebsiteRouting(models.Model):
         payment = self._read_routing_resource("payments", "payment", payment_id, config)
         if not payment or not payment.get("location_id"):
             return retry_result
-        if terminal:
-            routing = self._terminal_resource_routing("payment", payment, config)
-            if routing:
-                return routing
-        if website:
-            return self._website_routing_result(self._website_resource_matches("payment", payment, config))
+        return self._resource_ownership("payment", payment, config, website=website, terminal=terminal)
 
     def _website_routing_result(self, ownership):
         if ownership is None:

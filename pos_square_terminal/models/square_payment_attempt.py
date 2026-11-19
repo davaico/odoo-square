@@ -157,7 +157,8 @@ class SquarePaymentAttempt(models.Model):
             self._check_provider_scope()
             if self.state in ('authorized', 'verified') and self.square_payment_id:
                 # Terminal checkouts expire. An authenticated payment ID remains a durable reference.
-                status = self._verify_payment(self.square_payment_id, final=True)
+                payment = self._read_payment(self.square_payment_id)
+                status = self._observe_payment(payment, final=True)
                 self._record_successful_check()
                 link = self.square_order_link_id
                 if self.state != 'verified' and link.settlement_request and status == 'COMPLETED':
@@ -449,9 +450,6 @@ class SquarePaymentAttempt(models.Model):
         self.ensure_one()
         return self.verified_tip_minor if self.state == 'verified' and self.square_order_link_id.device_tip_product_id else 0
 
-    def _verify_payment(self, payment_id, *, final):
-        return self._observe_payment(self._read_payment(payment_id), final=final)
-
     def _observe_payment(self, payment, *, final):
         self.ensure_one()
         payment_id = payment['id']
@@ -514,13 +512,13 @@ class SquarePaymentAttempt(models.Model):
     def _cashier_status(self):
         self.ensure_one()
         status = self._cashier_tender_status()
-        tip_line = self.square_order_link_id.device_tip_line_id
+        link = self.square_order_link_id
+        tip_line = link.device_tip_line_id
         if tip_line:
             status['device_tip_line'] = tip_line.read(
                 tip_line._load_pos_data_fields(self.order_id.config_id.id), load=False,
             )[0]
-        if self.square_order_link_id.split:
-            link = self.square_order_link_id
+        if link.split:
             status['cash_tenders'] = {
                 tender['native_uuid']: {
                     'reserved': not link.cancelled,
@@ -528,16 +526,11 @@ class SquarePaymentAttempt(models.Model):
                 }
                 for tender in link.cash_tenders or []
             }
-            status['tenders'] = {
-                attempt.payment_uuid: attempt._cashier_tender_status()
-                for attempt in self.order_id._square_current_attempts()
-            }
-            if self.square_order_link_id.cancelled:
-                status['tenders'] = {
-                    attempt.payment_uuid: attempt._cashier_tender_status()
-                    for attempt in self.order_id._square_attempts()
-                    if attempt.square_order_link_id == self.square_order_link_id
-                }
+            if link.cancelled:
+                attempts = self.order_id._square_attempts().filtered(lambda attempt: attempt.square_order_link_id == link)
+            else:
+                attempts = self.order_id._square_current_attempts()
+            status['tenders'] = {attempt.payment_uuid: attempt._cashier_tender_status() for attempt in attempts}
         return status
 
     def _cashier_tender_status(self):

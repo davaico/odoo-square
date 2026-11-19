@@ -33,6 +33,16 @@ function isNativeCashMethod(method) {
     return method?.type === "cash" && method.payment_method_type === "none" && !method.use_payment_terminal;
 }
 
+function isAuthorizedOrCash(line) {
+    return line.square_attempt_state === "authorized" || isNativeCashMethod(line.payment_method_id);
+}
+
+async function syncDraftPayment(pos, order, paymentUuid) {
+    const synced = await pos.syncAllOrders({ orders: [order], throw: true });
+    const draft = synced?.find((record) => record.uuid === order.uuid && record.state === "draft");
+    return draft?.payment_ids.find((line) => line.uuid === paymentUuid);
+}
+
 function isReservedSquareTender(line) {
     return isReservedSquarePayment(line) || Boolean(line?.square_cash_reserved);
 }
@@ -144,9 +154,7 @@ class SquarePayment extends PaymentInterface {
             } else if (EXPLICIT_SEND_STATES.includes(originalState)) {
                 status = await this.call(line, "square_check_payment");
             } else {
-                const synced = await this.pos.syncAllOrders({ orders: [order], throw: true });
-                const savedOrder = synced?.find((record) => record.uuid === order.uuid && record.state === "draft");
-                const savedLine = savedOrder?.payment_ids.find((line) => line.uuid === uuid);
+                const savedLine = await syncDraftPayment(this.pos, order, uuid);
                 if (!savedLine || typeof savedLine.id !== "number") {
                     line.set_payment_status("pending");
                     showSquareMessage(this.env.services.dialog, _t("Save the sale before sending it to Square Terminal."));
@@ -223,15 +231,11 @@ patch(PosPayment.prototype, {
 patch(PosOrder.prototype, {
     squareCanAddShare(method) {
         return (method?.use_payment_terminal === "square_terminal" || isNativeCashMethod(method)) &&
-            this.payment_ids.every((line) =>
-                line.square_attempt_state === "authorized" || isNativeCashMethod(line.payment_method_id)
-            ) && this.get_due() > 0;
+            this.payment_ids.every(isAuthorizedOrCash) && this.get_due() > 0;
     },
     squareCanSettleWithCash() {
-        return Boolean(this.squareAuthorizedAmount) &&
-            this.payment_ids.every((line) =>
-                line.square_attempt_state === "authorized" || isNativeCashMethod(line.payment_method_id)
-            ) && this.payment_ids.some((line) => isNativeCashMethod(line.payment_method_id)) && this.get_due() === 0;
+        return Boolean(this.squareAuthorizedAmount) && this.payment_ids.every(isAuthorizedOrCash) &&
+            this.payment_ids.some((line) => isNativeCashMethod(line.payment_method_id)) && this.get_due() === 0;
     },
     canBeValidated() {
         return super.canBeValidated(...arguments) || this.squareCanSettleWithCash();
@@ -362,9 +366,7 @@ patch(PaymentScreen.prototype, {
             const order = this.currentOrder;
             const card = order.payment_ids.find((line) => line.square_attempt_state === "authorized");
             try {
-                const synced = await this.pos.syncAllOrders({ orders: [order], throw: true });
-                const saved = synced?.find((record) => record.uuid === order.uuid && record.state === "draft");
-                const savedCard = saved?.payment_ids.find((line) => line.uuid === card.uuid);
+                const savedCard = await syncDraftPayment(this.pos, order, card.uuid);
                 if (!savedCard) {
                     showSquareMessage(this.dialog, _t("Save the original sale before settling with cash."));
                     return;
