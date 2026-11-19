@@ -75,7 +75,7 @@ class TestSquareModuleContracts(TransactionCase):
         self.assertEqual(saved.square_webhook_signature_key, "square-signature")
         self.assertEqual(saved.payment_journal_id, journal)
         self.assertEqual(saved.default_sales_team_id, default_team)
-        self.assertEqual(saved.module_version_display, "1.4.2")
+        self.assertEqual(saved.module_version_display, "1.4.3")
         self.assertEqual(len(saved.location_mapping_ids), 1)
         mapping = config.location_mapping_ids
         self.assertEqual(mapping.square_location_id, "DOWNTOWN")
