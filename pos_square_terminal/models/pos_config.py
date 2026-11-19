@@ -9,9 +9,6 @@ class PosConfig(models.Model):
         help='Prompt each cardholder for a tip on the Square Terminal.',
     )
 
-    def _get_special_products(self):
-        return super()._get_special_products() | self.filtered('square_terminal_tipping').tip_product_id
-
 
 class ResConfigSettings(models.TransientModel):
     _inherit = 'res.config.settings'
