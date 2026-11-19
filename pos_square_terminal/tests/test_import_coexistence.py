@@ -487,6 +487,12 @@ class TestSquareTerminalImport(TestPointOfSaleHttpCommon):
                 'verified': True,
                 'next_retry_time': fields.Datetime.now(),
             } for order_id in ('TERMINAL-ORDER', 'REGISTER-ORDER')])
+            old_environment = terminal_update.copy({
+                'webhook_event_id': 'old-environment-update', 'environment': 'sandbox', 'verified': True,
+            })
+            old_merchant = terminal_update.copy({
+                'webhook_event_id': 'old-merchant-update', 'merchant_id': 'OTHER-MERCHANT', 'verified': True,
+            })
             location = self.resources['/v2/locations/SHOP']
             self.resources['/v2/locations/SHOP'] = Timeout('Square location lookup unavailable')
             queue.process_pending_events()
@@ -495,9 +501,11 @@ class TestSquareTerminalImport(TestPointOfSaleHttpCommon):
             self.assertEqual(register_update.state, 'completed')
 
             self.resources['/v2/locations/SHOP'] = location
-            terminal_update.next_retry_time = fields.Datetime.now()
+            (terminal_update | old_environment | old_merchant).next_retry_time = fields.Datetime.now()
             queue.process_pending_events()
             queue.process_pending_events()
             self.assertEqual(terminal_update.state, 'completed')
+            self.assertEqual(old_environment.state, 'pending')
+            self.assertEqual(old_merchant.state, 'pending')
 
         self._assert_independent_sales(odoo_order)

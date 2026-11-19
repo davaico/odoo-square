@@ -221,8 +221,10 @@ class SquareWebhookQueue(models.Model):
                 )
 
                 if not order_exists:
-                    config = processor._square_terminal_import_config()
-                    routing = processor._square_terminal_order_result(self.square_order_id, config)
+                    config = processor._square_terminal_import_config(environment=self.environment)
+                    routing = processor._square_terminal_order_result(
+                        self.square_order_id, config, merchant_id=self.merchant_id,
+                    )
 
                 if not order_exists and not routing:
                     # Order still doesn't exist, schedule next retry with exponential backoff
