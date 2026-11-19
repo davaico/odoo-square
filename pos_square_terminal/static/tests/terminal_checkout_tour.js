@@ -666,8 +666,8 @@ registry.category("web_tour.tours").add("SquareTerminalSingleDeviceTip", {
     ],
 });
 
-registry.category("web_tour.tours").add("SquareTerminalAbandonSplit", {
-    steps: () => [
+function abandonSplit({ fullyAuthorized = false, captured = false } = {}) {
+    return [
         ...Chrome.startPoS(),
         ...ProductScreen.addOrderline("Desk Pad"),
         ...ProductScreen.clickPayButton(),
@@ -677,24 +677,42 @@ registry.category("web_tour.tours").add("SquareTerminalAbandonSplit", {
         { trigger: ".payment-screen .send_payment_request", run: "click" },
         { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
-        ...PaymentScreen.clickNumpad("4"),
-        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "4.00"),
+        ...(fullyAuthorized ? [] : PaymentScreen.clickNumpad("4")),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", fullyAuthorized ? "9.34" : "4.00"),
         { trigger: ".payment-screen .send_payment_request", run: "click" },
-        { trigger: ".payment-screen .electronic_payment .electronic_status:contains('Authorized by Square')" },
-        { trigger: ".payment-screen .payment-status-amount .amount:contains('5.34')" },
+        ...(fullyAuthorized ? [
+            { trigger: ".payment-screen .electronic_status:contains('Check the original Square settlement')" },
+        ] : [
+            { trigger: ".payment-screen .electronic_payment .electronic_status:contains('Authorized by Square')" },
+            { trigger: ".payment-screen .payment-status-amount .amount:contains('5.34')" },
+        ]),
         { trigger: ".payment-screen .square-cancel-payment:contains('Abandon split')", run: "click" },
-        { trigger: ".payment-screen .electronic_status:contains('Waiting for Square to confirm cancellation')" },
-        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
-        { trigger: ".modal:contains('The balance is reserved by the original Square payment.') .btn-primary", run: "click" },
-        { trigger: ".payment-screen .square-cancel-payment:contains('Continue cancellation')", run: "click" },
-        { trigger: ".payment-screen .back-button:not(:disabled)" },
-        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
-        ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "12.34"),
-        ...PaymentScreen.clickValidate(),
+        ...(captured ? [] : [
+            { trigger: ".payment-screen .electronic_status:contains('Waiting for Square to confirm cancellation')" },
+            ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+            { trigger: ".modal:contains('The balance is reserved by the original Square payment.') .btn-primary", run: "click" },
+            { trigger: ".payment-screen .square-cancel-payment:contains('Continue cancellation')", run: "click" },
+            { trigger: ".payment-screen .back-button:not(:disabled)" },
+            ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+            ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "12.34"),
+            ...PaymentScreen.clickValidate(),
+        ]),
         ...ReceiptScreen.receiptIsThere(),
         ...ReceiptScreen.receiptAmountTotalIs("12.34"),
-        { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash')" },
-    ],
+        { trigger: `.pos-receipt .paymentlines:contains('${captured ? "Square Counter" : "Checkout Cash"}')` },
+    ];
+}
+
+registry.category("web_tour.tours").add("SquareTerminalAbandonSplit", {
+    steps: () => abandonSplit(),
+});
+
+registry.category("web_tour.tours").add("SquareTerminalAbandonInterruptedSplit", {
+    steps: () => abandonSplit({ fullyAuthorized: true }),
+});
+
+registry.category("web_tour.tours").add("SquareTerminalCaptureDuringSplitAbandonment", {
+    steps: () => abandonSplit({ fullyAuthorized: true, captured: true }),
 });
 
 registry.category("web_tour.tours").add("SquareTerminalCloseWithUncertainPayment", {

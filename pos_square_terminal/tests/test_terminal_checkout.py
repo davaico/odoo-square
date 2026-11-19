@@ -1369,12 +1369,22 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         return tip_product
 
     def test_abandon_split_releases_each_approval_before_replacement_cash(self):
+        self._assert_abandon_split('SquareTerminalAbandonSplit', 400)
+
+    def test_abandon_fully_authorized_split_after_interrupted_settlement(self):
+        self._assert_abandon_split('SquareTerminalAbandonInterruptedSplit', 934)
+
+    def test_capture_racing_abandonment_stays_on_original_split(self):
+        self._assert_abandon_split('SquareTerminalCaptureDuringSplitAbandonment', 934, captured=True)
+
+    def _assert_abandon_split(self, tour, second_amount, *, captured=False):
         provider_order = {}
         checkouts = {}
         payments = {}
         mutations = []
         release_checks = []
         lose_release_read = False
+        fully_authorized = second_amount == 934
 
         def square_response(method, url, **kwargs):
             nonlocal lose_release_read
@@ -1391,7 +1401,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 number = len(checkouts) + 1
                 request = kwargs['json']['checkout']
                 self.assertEqual(request['order_id'], 'SPLITORDER')
-                self.assertEqual(request['amount_money'], self._money(300 if number == 1 else 400))
+                self.assertEqual(request['amount_money'], self._money(300 if number == 1 else second_amount))
                 self.assertFalse(request['payment_options']['autocomplete'])
                 checkout = {
                     **request, 'id': f'CHECKOUT-{number}', 'location_id': 'SQUARELOC',
@@ -1419,6 +1429,15 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             elif method == 'POST' and path.endswith('/cancel') and path.startswith('/v2/payments/'):
                 payment_id = path.split('/')[-2]
                 self.assertEqual(payments[payment_id]['status'], 'APPROVED')
+                if captured:
+                    self.assertEqual(payment_id, 'TENDER-1')
+                    for payment in payments.values():
+                        payment['status'] = 'COMPLETED'
+                    provider_order.update(state='COMPLETED', version=2, tenders=[
+                        {'type': 'CARD', 'payment_id': payment['id'], 'amount_money': payment['total_money']}
+                        for payment in payments.values()
+                    ])
+                    raise ConnectionError('The original settlement completed before Square could release the card')
                 payments[payment_id]['status'] = 'CANCELED'
                 if payment_id == 'TENDER-2':
                     lose_release_read = True
@@ -1426,6 +1445,10 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 payload = {'payment': payments[payment_id]}
             elif (method, path) == ('GET', '/v2/orders/SPLITORDER'):
                 payload = {'order': provider_order}
+            elif (method, path) == ('POST', '/v2/orders/SPLITORDER/pay'):
+                self.assertTrue(fully_authorized)
+                self.assertEqual(kwargs['json']['payment_ids'], ['TENDER-1', 'TENDER-2'])
+                raise ConnectionError('The register lost contact before Square could apply the settlement')
             elif (method, path) == ('PUT', '/v2/orders/SPLITORDER'):
                 self.assertEqual(set(release_checks), {'TENDER-1', 'TENDER-2'})
                 self.assertEqual(kwargs['json']['order']['state'], 'CANCELED')
@@ -1436,19 +1459,28 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             return self._square_response(payload)
 
         with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
-            self.start_pos_tour('SquareTerminalAbandonSplit')
+            self.start_pos_tour(tour)
 
-        self.assertEqual(mutations, [
-            '/v2/orders/calculate', '/v2/orders', '/v2/terminals/checkouts', '/v2/terminals/checkouts',
-            '/v2/payments/TENDER-1/cancel', '/v2/payments/TENDER-2/cancel', '/v2/orders/SPLITORDER',
-        ])
+        expected = ['/v2/orders/calculate', '/v2/orders', '/v2/terminals/checkouts', '/v2/terminals/checkouts']
+        if fully_authorized:
+            expected.append('/v2/orders/SPLITORDER/pay')
+        expected.append('/v2/payments/TENDER-1/cancel')
+        if not captured:
+            expected.extend(['/v2/payments/TENDER-2/cancel', '/v2/orders/SPLITORDER'])
+        self.assertEqual(mutations, expected)
         self.env.invalidate_all()
         order = self.pos_session.order_ids
         self.assertEqual(len(order), 1)
         self.assertEqual(order.state, 'paid')
-        self.assertEqual(order.payment_ids.payment_method_id, self.cash_method)
-        self.assertEqual(order.payment_ids.amount, 12.34)
-        self.assertFalse(order.payment_ids.transaction_id)
+        if captured:
+            self.assertEqual(order.payment_ids.payment_method_id, self.method)
+            self.assertEqual({(line.transaction_id, line.amount) for line in order.payment_ids}, {
+                ('TENDER-1', 3), ('TENDER-2', 9.34),
+            })
+        else:
+            self.assertEqual(order.payment_ids.payment_method_id, self.cash_method)
+            self.assertEqual(order.payment_ids.amount, 12.34)
+            self.assertFalse(order.payment_ids.transaction_id)
 
     def test_expired_split_settlement_keeps_original_intent_and_can_be_abandoned(self):
         order = self._cashier_draft()

@@ -19,7 +19,7 @@
                         t-on-click="() => this.props.sendPaymentRequest(line)"
                         t-esc="this.squareActionLabel(line)"/>
                 <button type="button" class="button btn btn-outline-secondary square-cancel-payment"
-                        t-if="line.square_attempt_reference and line.square_attempt_state != 'settling'"
+                        t-if="line.square_attempt_reference"
                         t-on-click="() => this.props.sendPaymentCancel(line)"
                         t-esc="this.squareCancelLabel(line)"/>
             </t>

@@ -474,7 +474,7 @@ patch(PaymentScreenPaymentLines.prototype, {
         if (line.square_attempt_state === "canceling") {
             return _t("Continue cancellation");
         }
-        return line.square_attempt_state === "settlement_blocked" || line.pos_order_id.squareAuthorizedAmount
+        return ["settling", "settlement_blocked"].includes(line.square_attempt_state) || line.pos_order_id.squareAuthorizedAmount
             ? _t("Abandon split")
             : _t("Cancel payment");
     },

@@ -398,7 +398,7 @@ class PosOrder(models.Model):
             link = attempt.square_order_link_id
             if link.settlement_request and not link.cancel_requested:
                 outcome = link._settle(order._square_current_attempts(), allow_square_capture=False)
-                if outcome != 'released_tender_confirmed':
+                if outcome not in ('authorizations_only', 'released_tender_confirmed'):
                     return attempt._cashier_status()
             link.cancel_requested = True
             order._square_finish_cancellation(attempt, request=True)

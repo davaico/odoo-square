@@ -379,12 +379,14 @@ class SquareOrder(models.Model):
         try:
             self.order_id._square_check_reserved_amounts(attempts)
             order, payments = self._read_settlement(path, attempts)
-            if (
-                allow_square_capture and not self.cancel_requested
-                and order['state'] == 'OPEN' and order.get('version') == request['order_version']
+            all_approved = (
+                order['state'] == 'OPEN' and order.get('version') == request['order_version']
                 and self._matches_settlement_tenders(order, attempts, complete=False)
                 and all(payment['status'] == 'APPROVED' for payment in payments)
-            ):
+            )
+            if all_approved and not allow_square_capture:
+                return 'authorizations_only'
+            if all_approved and not self.cancel_requested:
                 try:
                     self.connection_id._request('POST', path + '/pay', payload=deepcopy(request))
                 except (SquareAPIError, UserError):
