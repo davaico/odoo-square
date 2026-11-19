@@ -41,9 +41,12 @@ For a split, enter exact shares using Odoo cash and one or more Square cards. Fo
 | --- | --- |
 | Waiting, timed out, uncertain, or a lost response | Keep the original order. After a reload, find it under **Orders**, reopen **Payment**, and select **Check status** on the original line. Keep that share reserved until Square confirms the outcome. |
 | Device busy and Odoo says no payment was sent | Remove the unsent line to choose another ready method, or use **Send** again when the terminal is free. |
+| Ready to send after reconnecting | Choose **Send** on the original line to use the existing reservation, or cancel the unsent payment. |
 | Card declined while the original checkout is still active | Follow the original Terminal prompt or request cancellation in Odoo. Use **Retry** when Odoo confirms that Square collected nothing and offers that action. |
 | A card is authorized and another card declines | Keep the authorized share and recover or replace only the unpaid share. |
 | The customer changes their mind | Use **Cancel payment** or **Abandon split** and wait for confirmation. Use **Continue cancellation** if offered. Once Square verifies cancellation and release, correct the basket or switch to cash. If a card succeeded during cancellation, Odoo keeps that payment and shows the actual balance. |
+
+When a Terminal checkout has expired, Odoo can recover a matching payment from the Square Payments API or the original Square order’s tender references. If the outcome is still unresolved, have a manager check the original Square order and payment. Wait for a verified payment or confirmed cancellation before collecting the share again. [Square Terminal checkout retention](https://developer.squareup.com/docs/terminal-api/overview)
 
 ## Reconcile payments and handover
 

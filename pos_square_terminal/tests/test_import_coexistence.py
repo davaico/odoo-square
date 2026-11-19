@@ -199,7 +199,9 @@ class TestSquareTerminalImport(TestPointOfSaleHttpCommon):
         self.assertEqual(prepared['state'], 'ready')
         reference = prepared['reference']
         self.assertEqual(order.square_mark_dispatching(order.uuid, payment.uuid, reference)['state'], 'dispatching')
+        self.env.flush_all()
         self.assertEqual(order.square_dispatch_payment(order.uuid, payment.uuid, reference)['state'], 'pending')
+        self.env.invalidate_all()
         if before_terminal_confirmation:
             before_terminal_confirmation()
         self.assertEqual(order.square_check_payment(order.uuid, payment.uuid)['state'], 'verified')

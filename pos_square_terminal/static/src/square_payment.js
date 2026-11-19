@@ -158,11 +158,7 @@ class SquarePayment extends PaymentInterface {
                 status = await this.call(line, "square_prepare_linked_order");
             }
             if (status.state === "ready") {
-                const reference = status.reference;
-                status = await this.call(line, "square_mark_dispatching", reference);
-                if (status.state === "dispatching" && status.reference === reference) {
-                    status = await this.call(line, "square_dispatch_payment", reference);
-                }
+                status = await this.call(line, "square_dispatch_payment", status.reference);
             }
             const deadline = Date.now() + 90_000;
             while (

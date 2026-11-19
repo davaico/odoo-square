@@ -357,17 +357,17 @@ class SquareOrder(models.Model):
         except (SquareAPIError, UserError, ValueError):
             return
 
-    def _settle(self, attempts, *, read_only=False):
+    def _settle(self, attempts, *, allow_square_capture=True):
         self.ensure_one()
         request = self.settlement_request
         if not request or request['payment_ids'] != self._settlement_payment_ids(attempts):
-            return
+            return 'unresolved'
         path = '/v2/orders/' + quote(self.square_order_id, safe='')
         try:
             self.order_id._square_check_reserved_amounts(attempts)
             order, payments = self._read_settlement(path, attempts)
             if (
-                not read_only and not self.cancel_requested
+                allow_square_capture and not self.cancel_requested
                 and order['state'] == 'OPEN' and order.get('version') == request['order_version']
                 and self._matches_settlement_tenders(order, attempts, complete=False)
                 and all(payment['status'] == 'APPROVED' for payment in payments)
@@ -379,7 +379,7 @@ class SquareOrder(models.Model):
                     pass
                 order, payments = self._read_settlement(path, attempts)
         except (SquareAPIError, UserError, ValueError):
-            return
+            return 'unresolved'
         statuses = {payment['status'] for payment in payments}
         if (
             order['state'] == 'COMPLETED' and statuses == {'COMPLETED'}
@@ -393,13 +393,15 @@ class SquareOrder(models.Model):
                 for tender in self.cash_tenders or []:
                     native_cash[tender['native_id']]._square_set_verified(tender['payment_id'], cash=True)
                 self.order_id._square_project_device_tip(self)
+            self.settlement_blocked = False
+            return 'verified'
         released = {'CANCELED', 'FAILED'}
         self.settlement_blocked = (
             order['state'] in ('OPEN', 'CANCELED')
             and bool(statuses & released) and statuses <= released | {'APPROVED'}
             and self._matches_settlement_tenders(order, attempts, complete=False)
         )
-        return self.settlement_blocked
+        return 'released_tender_confirmed' if self.settlement_blocked else 'unresolved'
 
     def _read_settlement(self, path, attempts):
         for attempt in attempts:

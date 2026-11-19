@@ -62,7 +62,7 @@ class SquarePaymentAttempt(models.Model):
         if discrepancy:
             values['reconciliation_discrepancy'] = issue
         # A failed read cannot release an authorization or change previously verified evidence.
-        if self.state not in ('dispatching', 'failed', 'authorized', 'verified'):
+        if self.state not in ('dispatching', 'timed_out', 'failed', 'authorized', 'verified'):
             values['state'] = 'uncertain'
         self.write(values)
 

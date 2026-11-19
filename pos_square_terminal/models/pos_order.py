@@ -6,6 +6,7 @@ from psycopg2.errors import UniqueViolation
 
 from odoo import Command, _, api, models
 from odoo.exceptions import AccessError, UserError
+from odoo.service.model import retrying
 from odoo.tools.float_utils import float_compare, float_round
 
 from ..square_api import SquareAPIError
@@ -225,16 +226,43 @@ class PosOrder(models.Model):
     @api.model
     def square_mark_dispatching(self, order_uuid, payment_uuid, attempt_reference):
         attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
-        if attempt.reference == attempt_reference and attempt._cashier_state() == 'ready':
-            attempt.state = 'dispatching'
-        return attempt._cashier_status()
+        status = attempt._cashier_status()
+        if attempt.reference == attempt_reference and status['state'] == 'ready':
+            # Existing browser tabs can proceed to Send without recording a provider submission.
+            status['state'] = 'dispatching'
+        return status
 
     @api.model
     def square_dispatch_payment(self, order_uuid, payment_uuid, attempt_reference=None):
-        attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
-        if attempt.reference == attempt_reference and attempt._cashier_state() == 'dispatching':
-            attempt._dispatch()
-        return attempt._cashier_status()
+        # Persist the marker inside Send so a disconnected browser can leave the reservation ready.
+        # Own both transactions so a failure after the Square POST cannot roll back the marker.
+        with self.env.registry.cursor() as cr:
+            orders = self.with_env(self.env(cr=cr))
+            attempt = orders._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
+            if attempt.reference != attempt_reference or attempt._cashier_state() != 'ready':
+                return attempt._cashier_status()
+            attempt.state = 'dispatching'
+            cr.commit()
+
+            submission_started = False
+
+            def dispatch_reserved_checkout():
+                nonlocal submission_started
+                attempt = orders._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
+                if attempt.reference != attempt_reference or attempt.state != 'dispatching':
+                    return attempt._cashier_status()
+                if submission_started:
+                    # A database retry after the external call can only reconcile the original request.
+                    attempt._refresh()
+                elif attempt.square_order_link_id.cancel_requested:
+                    attempt.state = 'failed'
+                    attempt.order_id._square_finish_cancellation(attempt, request=True)
+                else:
+                    submission_started = True
+                    attempt._dispatch()
+                return attempt._cashier_status()
+
+            return retrying(dispatch_reserved_checkout, orders.env)
 
     @api.model
     def square_retry_payment(self, order_uuid, payment_uuid, attempt_reference):
@@ -359,7 +387,7 @@ class PosOrder(models.Model):
             order._square_check_session()
             attempts = order._square_current_attempts()
             order._square_check_reserved_amounts(attempts)
-            link._settle(attempts, read_only=state == 'settlement_blocked')
+            link._settle(attempts, allow_square_capture=state != 'settlement_blocked')
         return attempt._cashier_status()
 
     @api.model
@@ -370,7 +398,8 @@ class PosOrder(models.Model):
             order._square_check_session()
             link = attempt.square_order_link_id
             if link.settlement_request and not link.cancel_requested:
-                if not link._settle(order._square_current_attempts(), read_only=True):
+                outcome = link._settle(order._square_current_attempts(), allow_square_capture=False)
+                if outcome != 'released_tender_confirmed':
                     return attempt._cashier_status()
             link.cancel_requested = True
             order._square_finish_cancellation(attempt, request=True)

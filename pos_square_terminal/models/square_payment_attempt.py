@@ -140,16 +140,26 @@ class SquarePaymentAttempt(models.Model):
                 self._record_successful_check()
                 link = self.square_order_link_id
                 if self.state != 'verified' and link.settlement_request and status == 'COMPLETED':
-                    link._settle(self.order_id._square_current_attempts(), read_only=True)
+                    link._settle(self.order_id._square_current_attempts(), allow_square_capture=False)
                 return status
+            checkout = None
             if self.square_checkout_id:
                 path = '/v2/terminals/checkouts/' + quote(self.square_checkout_id, safe='')
-                checkout = self.connection_id._request('GET', path).get('checkout')
-                return self._observe_checkout(checkout, authoritative=True)
-            if self.square_order_link_id.square_order_id:
+                try:
+                    checkout = self.connection_id._request('GET', path).get('checkout')
+                    if checkout is None:
+                        raise ValueError('Missing Square Terminal checkout')
+                except SquareAPIError as error:
+                    if error.status != 404:
+                        raise
+            elif self.square_order_link_id.square_order_id:
                 checkout = self._find_original_checkout()
-                if checkout is not None:
-                    return self._observe_checkout(checkout, authoritative=True)
+            if checkout is not None:
+                status = self._observe_checkout(checkout, authoritative=True)
+                if self.state != 'timed_out':
+                    return status
+            if self.square_order_link_id.square_order_id:
+                return self._recover_original_payment()
         except SquareAPIError as error:
             issue = (
                 _("Reconnect %s, the original Square connection.", self.connection_id.display_name)
@@ -168,6 +178,52 @@ class SquarePaymentAttempt(models.Model):
                 discrepancy=True,
             )
         return False
+
+    def _recover_original_payment(self):
+        self.ensure_one()
+        link = self.square_order_link_id
+        payment = self._read_payment(self.square_payment_id) if self.square_payment_id else None
+        if payment and payment['status'] not in ('FAILED', 'CANCELED'):
+            status = self._observe_payment(payment, final=False)
+            self._record_successful_check()
+            return status
+
+        path = '/v2/orders/' + quote(link.square_order_id, safe='')
+        order = self.connection_id._request('GET', path).get('order')
+        if not (
+            isinstance(order, dict) and order.get('id') == link.square_order_id
+            and order.get('reference_id') == link.reference and order.get('location_id') == self.square_location_id
+            and order.get('state') in ('OPEN', 'COMPLETED', 'CANCELED')
+        ):
+            raise ValueError('Square order does not match the reserved checkout')
+        tenders = order.get('tenders', [])
+        if not isinstance(tenders, list):
+            raise ValueError('Invalid Square order tenders')
+        tender_ids = set()
+        matching_payments = []
+        for tender in tenders:
+            payment_id = (tender.get('payment_id') or tender.get('id')) if isinstance(tender, dict) else None
+            if not isinstance(payment_id, str) or not payment_id or payment_id in tender_ids:
+                raise ValueError('Invalid Square order tender payment ID')
+            tender_ids.add(payment_id)
+            if payment or tender.get('type') == 'CASH':
+                continue
+            candidate = self._read_payment(payment_id, from_order=True)
+            if candidate:
+                matching_payments.append(candidate)
+        if len(matching_payments) > 1:
+            raise ValueError('Multiple Square payments match the reserved checkout')
+        if matching_payments:
+            payment = matching_payments[0]
+        status = self._observe_payment(payment, final=False) if payment else None
+
+        # A missing checkout or empty tender list can still precede a late capture.
+        # A canceled order is a terminal, unpaid provider state.
+        if order['state'] == 'CANCELED' and (status in ('FAILED', 'CANCELED') or not tender_ids and not payment):
+            self.state = 'failed'
+            link.cancel_requested = True
+        self._record_successful_check()
+        return status or True
 
     def _cancel_checkout(self):
         self.ensure_one()
@@ -283,17 +339,23 @@ class SquarePaymentAttempt(models.Model):
     def _requested_tip_minor(self):
         return self.checkout_request['checkout'].get('tip_money', {}).get('amount', 0)
 
-    def _read_payment(self, payment_id):
+    def _read_payment(self, payment_id, *, from_order=False):
         self.ensure_one()
         path = '/v2/payments/' + quote(payment_id, safe='')
         payment = self.connection_id._request('GET', path).get('payment')
         if not (
             isinstance(payment, dict) and payment.get('id') == payment_id
-            and (not self.square_payment_id or self.square_payment_id == payment_id)
             and payment.get('order_id') == self.square_order_link_id.square_order_id
-            and payment.get('reference_id') == self.reference
-            and payment.get('terminal_checkout_id', self.square_checkout_id) == self.square_checkout_id
             and payment.get('location_id') == self.square_location_id
+        ):
+            raise ValueError('Square payment does not match the reserved order')
+        if from_order and payment.get('reference_id') != self.reference:
+            return
+        if not (
+            (not self.square_payment_id or self.square_payment_id == payment_id)
+            and payment.get('reference_id') == self.reference
+            and (not self.square_checkout_id
+                 or payment.get('terminal_checkout_id', self.square_checkout_id) == self.square_checkout_id)
             and payment.get('source_type') == 'CARD'
         ):
             raise ValueError('Square payment does not match the reserved tender')
@@ -329,8 +391,11 @@ class SquarePaymentAttempt(models.Model):
         return self.verified_tip_minor if self.state == 'verified' and self.square_order_link_id.device_tip_product_id else 0
 
     def _verify_payment(self, payment_id, *, final):
+        return self._observe_payment(self._read_payment(payment_id), final=final)
+
+    def _observe_payment(self, payment, *, final):
         self.ensure_one()
-        payment = self._read_payment(payment_id)
+        payment_id = payment['id']
         status = payment['status']
         if self.state == 'verified':
             if status != 'COMPLETED':
@@ -359,6 +424,8 @@ class SquarePaymentAttempt(models.Model):
                 self.write({'square_payment_id': payment_id, 'state': 'failed'})
             elif self.provider_status in ('PENDING', 'IN_PROGRESS'):
                 self.state = 'declined'
+            elif self.state == 'timed_out':
+                self.square_payment_id = payment_id
         return status
 
     def _mark_verified(self, payment):
