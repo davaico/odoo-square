@@ -707,6 +707,190 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertEqual(order.payment_ids, payment)
         self.assertEqual(payment.transaction_id, 'CAPTURED-TAP')
 
+    def test_split_cards_preserve_first_approval_and_recover_lost_settlement_after_reload(self):
+        provider_order = {}
+        checkouts = []
+        payments = {}
+        mutations = []
+        settlement = []
+        lose_readback = False
+        decline_reads = 0
+
+        def square_response(method, url, **kwargs):
+            nonlocal lose_readback, decline_reads
+            path = urlsplit(url).path
+            if method != 'GET':
+                mutations.append(path)
+            if (method, path) == ('POST', '/v2/orders/calculate'):
+                payload = {'order': self._draft_provider_order(kwargs['json']['order'], 1234)}
+            elif (method, path) == ('POST', '/v2/orders'):
+                provider_order.update(self._draft_provider_order(kwargs['json']['order'], 1234),
+                                      id='SPLITORDER', version=1)
+                payload = {'order': provider_order}
+            elif (method, path) == ('POST', '/v2/terminals/checkouts'):
+                request = kwargs['json']
+                number = len(checkouts) + 1
+                expected_amount = 500 if number == 1 else 734
+                checkout = {
+                    **request['checkout'], 'id': f'CHECKOUT-{number}', 'location_id': 'SQUARELOC',
+                    'status': 'PENDING',
+                }
+                self.assertEqual(checkout['order_id'], 'SPLITORDER')
+                self.assertEqual(checkout['payment_options'], {'autocomplete': False})
+                self.assertEqual(checkout['amount_money'], self._money(expected_amount))
+                self.assertNotIn(request['idempotency_key'], [key for key, _checkout in checkouts])
+                if number > 1:
+                    self.assertEqual(payments['TENDER-1']['status'], 'APPROVED')
+                checkouts.append((request['idempotency_key'], checkout))
+                payments[f'TENDER-{number}'] = {
+                    'id': f'TENDER-{number}', 'order_id': 'SPLITORDER', 'location_id': 'SQUARELOC',
+                    'reference_id': checkout['reference_id'], 'status': 'FAILED' if number == 2 else 'APPROVED',
+                    'amount_money': self._money(expected_amount), 'total_money': self._money(expected_amount),
+                    'source_type': 'CARD',
+                }
+                payload = {'checkout': checkout}
+            elif method == 'GET' and path.startswith('/v2/terminals/checkouts/CHECKOUT-'):
+                number = int(path.rsplit('-', 1)[1])
+                checkout = {**checkouts[number - 1][1], 'status': 'COMPLETED', 'payment_ids': [f'TENDER-{number}']}
+                if number == 2:
+                    decline_reads += 1
+                    if decline_reads == 1:
+                        checkout['status'] = 'IN_PROGRESS'
+                    else:
+                        checkout.update(status='CANCELED', cancel_reason='BUYER_CANCELED')
+                payload = {'checkout': checkout}
+            elif method == 'GET' and path.startswith('/v2/payments/'):
+                payload = {'payment': payments[path.rsplit('/', 1)[1]]}
+            elif (method, path) == ('GET', '/v2/orders/SPLITORDER'):
+                if lose_readback:
+                    lose_readback = False
+                    raise ConnectionError('Square is temporarily unavailable after settlement')
+                payload = {'order': provider_order}
+            elif (method, path) == ('POST', '/v2/orders/SPLITORDER/pay'):
+                request = kwargs['json']
+                self.assertEqual(request['payment_ids'], ['TENDER-1', 'TENDER-3'])
+                self.assertEqual(request['order_version'], 1)
+                self.assertTrue(request['idempotency_key'])
+                native_sale = self.pos_session.order_ids
+                self.assertEqual(native_sale.state, 'draft')
+                self.assertFalse(native_sale.payment_ids.filtered('transaction_id'))
+                self.assertFalse(settlement)
+                settlement.append(request)
+                tenders = []
+                for payment_id in request['payment_ids']:
+                    payment = payments[payment_id]
+                    payment['status'] = 'COMPLETED'
+                    tenders.append({
+                        'payment_id': payment_id, 'location_id': 'SQUARELOC', 'type': 'CARD',
+                        'amount_money': payment['total_money'],
+                    })
+                provider_order.update(state='COMPLETED', version=2, tenders=tenders)
+                lose_readback = True
+                raise ConnectionError('Square settled the order before the response was lost')
+            else:
+                self.fail(f'Unexpected Square request: {method} {path}')
+            return self._square_response(payload)
+
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
+            self.start_pos_tour('SquareTerminalSplitRecovery')
+
+        self.assertEqual(mutations, [
+            '/v2/orders/calculate', '/v2/orders', '/v2/terminals/checkouts',
+            '/v2/terminals/checkouts', '/v2/terminals/checkouts', '/v2/orders/SPLITORDER/pay',
+        ])
+        self.assertEqual(payments['TENDER-2']['status'], 'FAILED')
+        self.env.invalidate_all()
+        order = self.pos_session.order_ids
+        self.assertEqual(len(order), 1)
+        self.assertEqual(order.state, 'paid')
+        self.assertEqual(order.lines.product_id, self.desk_pad)
+        self.assertEqual(order.amount_total, 12.34)
+        self.assertEqual({(line.amount, line.payment_status, line.transaction_id) for line in order.payment_ids}, {
+            (5.00, 'done', 'TENDER-1'), (7.34, 'done', 'TENDER-3'),
+        })
+
+    def test_abandon_split_releases_each_approval_before_replacement_cash(self):
+        provider_order = {}
+        checkouts = {}
+        payments = {}
+        mutations = []
+        release_checks = []
+        lose_release_read = False
+
+        def square_response(method, url, **kwargs):
+            nonlocal lose_release_read
+            path = urlsplit(url).path
+            if method != 'GET':
+                mutations.append(path)
+            if (method, path) == ('POST', '/v2/orders/calculate'):
+                payload = {'order': self._draft_provider_order(kwargs['json']['order'], 1234)}
+            elif (method, path) == ('POST', '/v2/orders'):
+                provider_order.update(self._draft_provider_order(kwargs['json']['order'], 1234),
+                                      id='SPLITORDER', version=1)
+                payload = {'order': provider_order}
+            elif (method, path) == ('POST', '/v2/terminals/checkouts'):
+                number = len(checkouts) + 1
+                request = kwargs['json']['checkout']
+                self.assertEqual(request['order_id'], 'SPLITORDER')
+                self.assertEqual(request['amount_money'], self._money(300 if number == 1 else 400))
+                self.assertFalse(request['payment_options']['autocomplete'])
+                checkout = {
+                    **request, 'id': f'CHECKOUT-{number}', 'location_id': 'SQUARELOC',
+                    'status': 'COMPLETED', 'payment_ids': [f'TENDER-{number}'],
+                }
+                checkouts[checkout['id']] = checkout
+                payments[f'TENDER-{number}'] = {
+                    'id': f'TENDER-{number}', 'order_id': 'SPLITORDER', 'location_id': 'SQUARELOC',
+                    'reference_id': checkout['reference_id'], 'status': 'APPROVED',
+                    'amount_money': request['amount_money'], 'total_money': request['amount_money'],
+                    'source_type': 'CARD',
+                }
+                payload = {'checkout': checkout}
+            elif method == 'GET' and path.startswith('/v2/terminals/checkouts/'):
+                payload = {'checkout': checkouts[path.rsplit('/', 1)[1]]}
+            elif method == 'GET' and path.startswith('/v2/payments/'):
+                payment_id = path.rsplit('/', 1)[1]
+                if payment_id == 'TENDER-2' and lose_release_read:
+                    lose_release_read = False
+                    raise ConnectionError('Square accepted the release but the first readback was lost')
+                payment = payments[payment_id]
+                if payment['status'] == 'CANCELED':
+                    release_checks.append(payment_id)
+                payload = {'payment': payment}
+            elif method == 'POST' and path.endswith('/cancel') and path.startswith('/v2/payments/'):
+                payment_id = path.split('/')[-2]
+                self.assertEqual(payments[payment_id]['status'], 'APPROVED')
+                payments[payment_id]['status'] = 'CANCELED'
+                if payment_id == 'TENDER-2':
+                    lose_release_read = True
+                    raise ConnectionError('Square accepted the release but the response was lost')
+                payload = {'payment': payments[payment_id]}
+            elif (method, path) == ('GET', '/v2/orders/SPLITORDER'):
+                payload = {'order': provider_order}
+            elif (method, path) == ('PUT', '/v2/orders/SPLITORDER'):
+                self.assertEqual(set(release_checks), {'TENDER-1', 'TENDER-2'})
+                self.assertEqual(kwargs['json']['order']['state'], 'CANCELED')
+                provider_order.update(state='CANCELED', version=2)
+                payload = {'order': provider_order}
+            else:
+                self.fail(f'Unexpected Square request: {method} {path}')
+            return self._square_response(payload)
+
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
+            self.start_pos_tour('SquareTerminalAbandonSplit')
+
+        self.assertEqual(mutations, [
+            '/v2/orders/calculate', '/v2/orders', '/v2/terminals/checkouts', '/v2/terminals/checkouts',
+            '/v2/payments/TENDER-1/cancel', '/v2/payments/TENDER-2/cancel', '/v2/orders/SPLITORDER',
+        ])
+        self.env.invalidate_all()
+        order = self.pos_session.order_ids
+        self.assertEqual(len(order), 1)
+        self.assertEqual(order.state, 'paid')
+        self.assertEqual(order.payment_ids.payment_method_id, self.cash_method)
+        self.assertEqual(order.payment_ids.amount, 12.34)
+        self.assertFalse(order.payment_ids.transaction_id)
+
     @staticmethod
     def _square_response(payload):
         response = Response()

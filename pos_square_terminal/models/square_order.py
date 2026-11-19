@@ -1,7 +1,7 @@
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from odoo import api, fields, models
 from odoo.exceptions import UserError
@@ -45,6 +45,8 @@ class SquareOrder(models.Model):
     pricing_snapshot = fields.Json(copy=False)
     pricing_issue = fields.Char(copy=False)
     square_order_id = fields.Char(index='btree_not_null', copy=False)
+    split = fields.Boolean(copy=False)
+    settlement_request = fields.Json(copy=False)
     cancel_requested = fields.Boolean(copy=False)
     cancelled = fields.Boolean(copy=False)
     active_order_key = fields.Char(compute='_compute_active_order_key', store=True)
@@ -84,11 +86,11 @@ class SquareOrder(models.Model):
             return False
         return True
 
-    def _matches_order_totals(self, order):
+    def _matches_order_totals(self, order, *, state='OPEN'):
         self.ensure_one()
         expected_lines = self.pricing_snapshot['lines'] if self.pricing_snapshot else {}
         if not isinstance(order, dict) or not (
-            order.get('state') == 'OPEN'
+            order.get('state') == state
             and order.get('reference_id') == self.reference
             and order.get('location_id') == self.square_location_id
             and matches_money(order.get('total_money'), self.total_minor, self.currency_code)
@@ -168,6 +170,98 @@ class SquareOrder(models.Model):
             unit['precision'] == requested['precision'] and isinstance(measurement, dict)
             and measurement.get('custom_unit') == requested['measurement_unit']['custom_unit']
         )
+
+    def _prepare_settlement(self, attempts):
+        self.ensure_one()
+        path = '/v2/orders/' + quote(self.square_order_id, safe='')
+        try:
+            for attempt in attempts:
+                attempt._check_provider_scope()
+            order = self._read_settlement_order(path)
+            version = order.get('version')
+            payment_ids = attempts.mapped('square_payment_id')
+            if (
+                order['state'] == 'OPEN' and type(version) is int and version > 0
+                and all(payment_ids) and len(set(payment_ids)) == len(attempts)
+                and self._matches_settlement_tenders(order, attempts, complete=False)
+            ):
+                # The cashier calls settlement in a separate RPC after this intent commits.
+                self.settlement_request = {
+                    'idempotency_key': str(uuid4()),
+                    'order_version': version,
+                    'payment_ids': payment_ids,
+                }
+        except (SquareAPIError, UserError, ValueError):
+            return
+
+    def _settle(self, attempts, *, read_only=False):
+        self.ensure_one()
+        request = self.settlement_request
+        if not request or request['payment_ids'] != attempts.mapped('square_payment_id'):
+            return
+        path = '/v2/orders/' + quote(self.square_order_id, safe='')
+        try:
+            self.order_id._square_check_reserved_amounts(attempts)
+            order, payments = self._read_settlement(path, attempts)
+            if (
+                not read_only and order['state'] == 'OPEN' and order.get('version') == request['order_version']
+                and self._matches_settlement_tenders(order, attempts, complete=False)
+                and all(payment['status'] == 'APPROVED' for payment in payments)
+            ):
+                try:
+                    self.connection_id._request('POST', path + '/pay', payload=deepcopy(request))
+                except (SquareAPIError, UserError):
+                    # A missed response can still mean Square captured every tender.
+                    pass
+                order, payments = self._read_settlement(path, attempts)
+        except (SquareAPIError, UserError, ValueError):
+            return
+        if (
+            order['state'] == 'COMPLETED'
+            and self._matches_settlement_tenders(order, attempts, complete=True)
+            and all(payment['status'] == 'COMPLETED' for payment in payments)
+        ):
+            for attempt, payment in zip(attempts, payments):
+                if attempt.state != 'verified':
+                    attempt._mark_verified(payment)
+
+    def _read_settlement(self, path, attempts):
+        for attempt in attempts:
+            attempt._check_provider_scope()
+        order = self._read_settlement_order(path)
+        payments = [attempt._read_payment(attempt.square_payment_id) for attempt in attempts]
+        if not all(attempt._payment_has_no_refunds(payment) for attempt, payment in zip(attempts, payments)):
+            raise ValueError('A Square split payment was refunded before settlement was verified')
+        return order, payments
+
+    def _read_settlement_order(self, path):
+        order = self.connection_id._request('GET', path).get('order')
+        if (
+            not isinstance(order, dict) or order.get('id') != self.square_order_id
+            or order.get('state') not in ('OPEN', 'COMPLETED')
+            or not self._matches_order_totals(order, state=order['state'])
+        ):
+            raise ValueError('Square order does not match the original split sale')
+        return order
+
+    def _matches_settlement_tenders(self, order, attempts, *, complete):
+        tenders = order.get('tenders', [])
+        if not isinstance(tenders, list):
+            return False
+        expected = {attempt.square_payment_id: attempt.amount_minor for attempt in attempts}
+        for tender in tenders:
+            if not isinstance(tender, dict):
+                return False
+            payment_id = tender.get('payment_id') or tender.get('id')
+            if not isinstance(payment_id, str) or payment_id not in expected:
+                return False
+            if (
+                tender.get('type') != 'CARD'
+                or tender.get('location_id', self.square_location_id) != self.square_location_id
+                or not matches_money(tender.get('amount_money'), expected.pop(payment_id), self.currency_code)
+            ):
+                return False
+        return not complete or not expected
 
     def _cancel_unpaid_order(self, released_payment_ids, *, request):
         self.ensure_one()

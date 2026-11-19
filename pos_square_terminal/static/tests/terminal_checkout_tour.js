@@ -210,3 +210,95 @@ registry.category("web_tour.tours").add("SquareTerminalLostCheckoutResponse", {
         ...ReceiptScreen.receiptAmountTotalIs("12.34"),
     ].flat(),
 });
+
+registry.category("web_tour.tours").add("SquareTerminalSplitRecovery", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        PaymentScreen.enterPaymentLineAmount("Square Counter", "5"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "5.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
+        { trigger: ".payment-screen .payment-status-remaining .amount:contains('7.34')" },
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "7.34"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Card declined')" },
+        { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
+        { trigger: ".payment-screen .paymentline.selected + .electronic_payment .square-check-status:contains('Check status')", run: "click" },
+        { trigger: ".payment-screen .square-check-status:contains('Retry')", run: "click" },
+        {
+            trigger: ".payment-screen:has(.paymentmethod:not(.opacity-50):contains('Square Counter')) " +
+                ".electronic_status:contains('Check the original Square settlement')",
+            run() {
+                const order = window.posmodel.get_order();
+                sessionStorage.setItem("squareSplitOrder", order.uuid);
+                sessionStorage.setItem("squareSplitTenders", order.payment_ids.map((line) => line.uuid).sort().join());
+            },
+        },
+        refresh(),
+        { trigger: "body:not(:has(.pos-loader))" },
+        Chrome.clickMenuOption("Orders"),
+        {
+            trigger: ".ticket-screen .order-row",
+            async run(helpers) {
+                const uuid = sessionStorage.getItem("squareSplitOrder");
+                const order = window.posmodel.models["pos.order"].getBy("uuid", uuid);
+                const rows = [...document.querySelectorAll(".ticket-screen .order-row")].filter((row) =>
+                    [...row.querySelectorAll(".col")].some((column) => column.textContent.trim() === order?.pos_reference));
+                if (rows.length !== 1) {
+                    throw new Error("Original Square split is missing from the native Orders screen");
+                }
+                await helpers.dblclick(rows[0]);
+            },
+        },
+        {
+            trigger: ".payment-screen .square-check-status:contains('Check status')",
+            run() {
+                const order = window.posmodel.get_order();
+                if (order.uuid !== sessionStorage.getItem("squareSplitOrder") ||
+                    order.payment_ids.map((line) => line.uuid).sort().join() !== sessionStorage.getItem("squareSplitTenders")) {
+                    throw new Error("The register must recover the original Square split and both tenders");
+                }
+                this.anchor.click();
+            },
+        },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("12.34"),
+        { trigger: ".pos-receipt .paymentlines:contains('5.00')" },
+        { trigger: ".pos-receipt .paymentlines:contains('7.34')" },
+    ].flat(),
+});
+
+registry.category("web_tour.tours").add("SquareTerminalAbandonSplit", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.clickNumpad("3"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "3.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.clickNumpad("4"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "4.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_payment .electronic_status:contains('Authorized by Square')" },
+        { trigger: ".payment-screen .payment-status-remaining .amount:contains('5.34')" },
+        { trigger: ".payment-screen .square-cancel-payment:contains('Abandon split')", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Waiting for Square to confirm cancellation')" },
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        { trigger: ".modal:contains('The balance is reserved by the original Square payment.') .btn-primary", run: "click" },
+        { trigger: ".payment-screen .square-cancel-payment:contains('Continue cancellation')", run: "click" },
+        { trigger: ".payment-screen .back-button:not(:disabled)" },
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "12.34"),
+        ...PaymentScreen.clickValidate(),
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("12.34"),
+        { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash')" },
+    ],
+});

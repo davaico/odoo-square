@@ -52,7 +52,7 @@ class SquarePaymentAttempt(models.Model):
 
     @api.model
     def _square_reconcilable_states(self):
-        return ('dispatching', 'pending', 'declined', 'uncertain', 'timed_out', 'verified')
+        return ('dispatching', 'pending', 'declined', 'uncertain', 'timed_out', 'authorized', 'verified')
 
     def _record_successful_check(self):
         self.write({'last_checked_at': fields.Datetime.now(), 'reconciliation_error': False})
@@ -61,8 +61,8 @@ class SquarePaymentAttempt(models.Model):
         values = {'reconciliation_error': issue}
         if discrepancy:
             values['reconciliation_discrepancy'] = issue
-        # Never withdraw a verified payment when Square is unreachable or returns inconsistent data.
-        if self.state not in ('dispatching', 'failed', 'verified'):
+        # A failed read cannot release an authorization or change previously verified evidence.
+        if self.state not in ('dispatching', 'failed', 'authorized', 'verified'):
             values['state'] = 'uncertain'
         self.write(values)
 
