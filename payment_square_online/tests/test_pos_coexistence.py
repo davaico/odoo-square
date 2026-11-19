@@ -350,33 +350,30 @@ class TestSquareOnlinePosCoexistence(SquareOnlineCheckoutCase):
         terminal_return = self._square_order("TERMINAL-RETURN", source_order_id=terminal["id"])
         return_path = "/v2/orders/" + terminal_return["id"]
         original_path = "/v2/orders/" + terminal["id"]
-        pos_api.reset_mock()
-        self.pos_objects[return_path] = {}
-        response = self._order_notification(terminal_return["id"], event_id="return-retry")
-        self.assertEqual(response.status_code, 503, response.text)
-        self.assertEqual([urlsplit(call.args[0]).path for call in pos_api.call_args_list], [return_path])
 
-        self.pos_objects[return_path] = {"order": terminal_return}
-        self.pos_objects[original_path] = {}
-        pos_api.reset_mock()
-        response = self._order_notification(terminal_return["id"], event_id="return-retry")
-        self.assertEqual(response.status_code, 503, response.text)
-        self.assertEqual([urlsplit(call.args[0]).path for call in pos_api.call_args_list], [return_path, original_path])
+        def retry_return():
+            pos_api.reset_mock()
+            response = self._order_notification(terminal_return["id"], event_id="return-retry")
+            return response, [urlsplit(call.args[0]).path for call in pos_api.call_args_list]
 
-        self.pos_objects[original_path] = {"order": terminal}
-        pos_api.reset_mock()
-        response = self._order_notification(terminal_return["id"], event_id="return-retry")
-        self.assertEqual(response.json(), {
-            "status": "ignored", "message": "Odoo POS Square Terminal operation",
-        }, response.text)
-        reads = [urlsplit(call.args[0]).path for call in pos_api.call_args_list]
+        for missing_path, order, expected_reads in (
+            (return_path, terminal_return, [return_path]),
+            (original_path, terminal, [return_path, original_path]),
+        ):
+            self.pos_objects[missing_path] = {}
+            response, reads = retry_return()
+            self.assertEqual(response.status_code, 503, response.text)
+            self.assertEqual(reads, expected_reads)
+            self.pos_objects[missing_path] = {"order": order}
+
+        response, reads = retry_return()
+        ignored_terminal = {"status": "ignored", "message": "Odoo POS Square Terminal operation"}
+        self.assertEqual(response.json(), ignored_terminal, response.text)
         self.assertEqual(reads.count(return_path), 1)
         self.assertEqual(reads.count(original_path), 1)
 
         response = self._notify("order.created", terminal, event_id="terminal-order")
-        self.assertEqual(response.json(), {
-            "status": "ignored", "message": "Odoo POS Square Terminal operation",
-        }, response.text)
+        self.assertEqual(response.json(), ignored_terminal, response.text)
         response = self._notify("order.created", register, event_id="register-order")
         self.assertEqual(response.json()["status"], "success", response.text)
         self.assertFalse(transaction.provider_reference)
