@@ -88,7 +88,7 @@
         <field name="name">Square Terminal Payments</field>
         <field name="res_model">pos.square.payment.attempt</field>
         <field name="view_mode">list,form</field>
-        <field name="groups_id" eval="[(4, ref('point_of_sale.group_pos_manager'))]"/>
+        <field name="group_ids" eval="[(4, ref('point_of_sale.group_pos_manager'))]"/>
     </record>
     <menuitem id="menu_square_reconciliation" name="Square Terminal Payments" parent="point_of_sale.menu_point_of_sale"
               action="action_square_reconciliation" groups="point_of_sale.group_pos_manager" sequence="3"/>
