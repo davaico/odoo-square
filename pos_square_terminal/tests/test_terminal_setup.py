@@ -8,8 +8,8 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from cryptography.fernet import Fernet
 from requests import Response
 
-from odoo import Command
-from odoo.exceptions import AccessError
+from odoo import Command, fields
+from odoo.exceptions import AccessError, UserError
 from odoo.tests import Form, HttpCase, tagged
 
 
@@ -126,6 +126,103 @@ class TestSquareTerminalSetup(HttpCase):
         with self.assertRaises(AccessError):
             credential.search_read([], ['access_token'])
 
+    def test_expired_grant_renews_for_the_original_location_request(self):
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=self._square_response) as square:
+            connection = self._authorize_connection()
+            credential = connection._credential()
+            credential.expires_at = fields.Datetime.subtract(fields.Datetime.now(), minutes=1)
+            saved_grant = (credential.access_token, credential.refresh_token)
+
+            square.reset_mock()
+            square.side_effect = [self._http_response({'errors': [{'code': 'SERVICE_UNAVAILABLE'}]}, 503)]
+            with self.assertRaisesRegex(UserError, 'could not renew'):
+                connection.action_refresh_locations()
+            self.assertEqual(square.call_count, 1)
+            self.assertEqual((credential.access_token, credential.refresh_token), saved_grant)
+            self.assertFalse(credential.reauthorization_required)
+
+            square.reset_mock()
+            square.side_effect = [self._http_response(self._renewed_tokens()), self._http_response({'locations': []})]
+            self._button(connection, 'action_refresh_locations')
+            renewal, locations = square.call_args_list
+            self._assert_refresh_request(renewal, connection)
+            self.assertEqual(locations.args, ('GET', 'https://connect.squareup.com/v2/locations'))
+            self.assertEqual(locations.kwargs['headers']['Authorization'], 'Bearer renewed-square-access')
+            self.assertEqual(connection.merchant_id, 'SQUAREMERCHANT')
+            self.assertEqual(connection.authorization_result, 'connected')
+            self.assertEqual(credential._unseal(credential.refresh_token), 'rotated-square-refresh')
+            self.assertGreater(credential.refresh_after, fields.Datetime.now())
+
+    def test_scheduled_renewal_retries_transient_failure_and_rotates_grant(self):
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=self._square_response) as square:
+            connection = self._authorize_connection()
+            credential = connection._credential()
+            saved_grant = (credential.access_token, credential.refresh_token)
+            cron = self.env.ref('pos_square_terminal.ir_cron_square_terminal_renew_authorizations')
+            now = fields.Datetime.now()
+            credential.refresh_after = fields.Datetime.subtract(now, minutes=1)
+            square.reset_mock()
+            square.side_effect = [self._http_response({'errors': [{'code': 'SERVICE_UNAVAILABLE'}]}, 503)]
+            cron.method_direct_trigger()
+            self.env.invalidate_all()
+            self._assert_refresh_request(square.call_args, connection)
+            self.assertEqual((credential.access_token, credential.refresh_token), saved_grant)
+            self.assertEqual(connection.authorization_result, 'connected')
+            self.assertFalse(credential.reauthorization_required)
+            self.assertGreaterEqual(credential.refresh_after, fields.Datetime.add(now, hours=1))
+            cron.method_direct_trigger()
+            self.assertEqual(square.call_count, 1)
+
+            credential.refresh_after = now
+            square.side_effect = [self._http_response(self._renewed_tokens())]
+            cron.method_direct_trigger()
+            self.env.invalidate_all()
+            self.assertEqual(square.call_count, 2)
+            self._assert_refresh_request(square.call_args, connection)
+            self.assertEqual(credential._unseal(credential.access_token), 'renewed-square-access')
+            self.assertEqual(credential._unseal(credential.refresh_token), 'rotated-square-refresh')
+            self.assertNotEqual(credential.refresh_token, 'rotated-square-refresh')
+            self.assertGreater(credential.refresh_after, fields.Datetime.add(now, days=5))
+
+    def test_scheduled_renewal_rejects_bad_grant_and_different_merchant(self):
+        cron = self.env.ref('pos_square_terminal.ir_cron_square_terminal_renew_authorizations')
+        for response in (
+            self._http_response({'error': 'invalid_grant'}, 400),
+            self._http_response(self._renewed_tokens(merchant_id='DIFFERENT-MERCHANT')),
+        ):
+            with self.subTest(status=response.status_code), patch(
+                'odoo.addons.pos_square_terminal.square_api.request', side_effect=self._square_response,
+            ) as square:
+                connection = self._authorize_connection()
+                credential = connection._credential()
+                saved_grant = (credential.access_token, credential.refresh_token)
+                credential.refresh_after = fields.Datetime.subtract(fields.Datetime.now(), minutes=1)
+                square.reset_mock()
+                square.side_effect = [response]
+                cron.method_direct_trigger()
+                self.env.invalidate_all()
+                self._assert_refresh_request(square.call_args, connection)
+                self.assertTrue(credential.reauthorization_required)
+                self.assertEqual(connection.authorization_result, 'revoked')
+                self.assertEqual(connection.merchant_id, 'SQUAREMERCHANT')
+                self.assertEqual((credential.access_token, credential.refresh_token), saved_grant)
+                cron.method_direct_trigger()
+                self.assertEqual(square.call_count, 1)
+
+    def _assert_refresh_request(self, request, connection):
+        self.assertEqual(request.args, ('POST', 'https://connect.squareup.com/oauth2/token'))
+        self.assertEqual(request.kwargs['json'], {
+            'grant_type': 'refresh_token', 'client_id': connection.application_id,
+            'client_secret': 'square-application-secret', 'refresh_token': 'square-refresh-token',
+        })
+
+    @staticmethod
+    def _renewed_tokens(merchant_id='SQUAREMERCHANT'):
+        return {
+            'access_token': 'renewed-square-access', 'refresh_token': 'rotated-square-refresh',
+            'merchant_id': merchant_id, 'token_type': 'bearer', 'expires_at': '2099-04-17T10:00:00Z',
+        }
+
     def _register_payment_methods(self, config):
         return {
             record['id']: record
@@ -227,7 +324,11 @@ class TestSquareTerminalSetup(HttpCase):
                 }}
             else:
                 self.fail(f'Unexpected Square request: {method} {url}')
+        return self._http_response(payload)
+
+    @staticmethod
+    def _http_response(payload, status=200):
         response = Response()
-        response.status_code = 200
+        response.status_code = status
         response._content = json.dumps(payload).encode()
         return response
