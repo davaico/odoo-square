@@ -40,8 +40,8 @@ class SquareOrder(models.Model):
     reference = fields.Char(required=True, index=True)
     currency_code = fields.Char(required=True)
     currency_digits = fields.Integer(required=True)
-    total_minor = fields.Integer(required=True)
-    tip_minor = fields.Integer()
+    total_minor = fields.Integer(required=True)  # Goods after tax and discounts.
+    tip_minor = fields.Integer()  # Tip already on the Odoo order.
     device_tip_product_id = fields.Many2one('product.product', copy=False, ondelete='restrict')
     device_tip_line_id = fields.Many2one('pos.order.line', copy=False, ondelete='restrict')
     create_request = fields.Json(required=True)
@@ -199,13 +199,30 @@ class SquareOrder(models.Model):
     def _settlement_payment_ids(self, attempts):
         return attempts.mapped('square_payment_id') + self._cash_square_payment_ids()
 
-    def _reserve_cash_tenders(self, payments):
+    def _tender_amounts(self, gross_minor, covered_minor):
+        self.ensure_one()
+        tip_minor = 0
+        if self.tip_minor:
+            total = self.total_minor + self.tip_minor
+            # Round at each cumulative boundary in minor units. The final boundary equals the original tip.
+            prior_tip = (covered_minor * self.tip_minor + total // 2) // total
+            new_tip = ((covered_minor + gross_minor) * self.tip_minor + total // 2) // total
+            tip_minor = new_tip - prior_tip
+        amounts = {'amount_money': {'amount': gross_minor - tip_minor, 'currency': self.currency_code}}
+        if tip_minor:
+            amounts['tip_money'] = {'amount': tip_minor, 'currency': self.currency_code}
+        return amounts
+
+    def _reserve_cash_tenders(self, payments, *, card_total):
         self.ensure_one()
         if not payments:
             return
         tenders = list(self.cash_tenders or [])
-        for payment in payments:
-            amount = {'amount': minor_units(payment.amount, self.currency_digits), 'currency': self.currency_code}
+        covered = card_total + self._cash_total_minor()
+        for payment in payments.sorted('id'):
+            gross = minor_units(payment.amount, self.currency_digits)
+            amounts = self._tender_amounts(gross, covered)
+            covered += gross
             tenders.append({
                 'native_id': payment.id,
                 'native_uuid': payment.uuid,
@@ -216,8 +233,8 @@ class SquareOrder(models.Model):
                     'autocomplete': False,
                     'location_id': self.square_location_id,
                     'reference_id': 'odoo-' + uuid4().hex,
-                    'amount_money': amount,
-                    'cash_details': {'buyer_supplied_money': amount},
+                    **amounts,
+                    'cash_details': {'buyer_supplied_money': {'amount': gross, 'currency': self.currency_code}},
                 },
             })
         self.cash_tenders = tenders
@@ -415,7 +432,9 @@ class SquareOrder(models.Model):
         if not isinstance(tenders, list):
             return False
         expected = {
-            attempt.square_payment_id: ('CARD', attempt.amount_minor + attempt.authorized_tip_minor, attempt.authorized_tip_minor)
+            attempt.square_payment_id: (
+                'CARD', attempt._requested_base_minor() + attempt.authorized_tip_minor, attempt.authorized_tip_minor,
+            )
             for attempt in attempts
         }
         expected.update({

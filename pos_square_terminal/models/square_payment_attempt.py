@@ -34,7 +34,7 @@ class SquarePaymentAttempt(models.Model):
     square_device_id = fields.Char(required=True)
     application_id = fields.Char(required=True)
     reference = fields.Char(required=True, index=True)
-    amount_minor = fields.Integer(required=True)
+    amount_minor = fields.Integer(required=True)  # Original Odoo tender, including any tip entered in Odoo.
     authorized_tip_minor = fields.Integer(copy=False)
     checkout_request = fields.Json(required=True, groups='base.group_system')
     state = fields.Selection([
@@ -237,7 +237,9 @@ class SquarePaymentAttempt(models.Model):
             and checkout.get('location_id') == self.square_location_id
             and checkout.get('app_id', self.application_id) == self.application_id
             and isinstance(options, dict) and options.get('device_id') == self.square_device_id
-            and matches_money(checkout.get('amount_money'), self.amount_minor, self.currency_code)
+            and matches_money(checkout.get('amount_money'), self._requested_base_minor(), self.currency_code)
+            and ('tip_money' not in checkout or not order.tip_minor
+                 or matches_money(checkout['tip_money'], self._requested_tip_minor(), self.currency_code))
         ):
             raise ValueError('Square Terminal checkout does not match the reserved tender')
 
@@ -275,6 +277,12 @@ class SquarePaymentAttempt(models.Model):
         self._record_successful_check()
         return payment_status or True
 
+    def _requested_base_minor(self):
+        return self.checkout_request['checkout']['amount_money']['amount']
+
+    def _requested_tip_minor(self):
+        return self.checkout_request['checkout'].get('tip_money', {}).get('amount', 0)
+
     def _read_payment(self, payment_id):
         self.ensure_one()
         path = '/v2/payments/' + quote(payment_id, safe='')
@@ -290,11 +298,12 @@ class SquarePaymentAttempt(models.Model):
         ):
             raise ValueError('Square payment does not match the reserved tender')
         amount = payment.get('amount_money')
-        if not matches_money(amount, self.amount_minor, self.currency_code):
+        base = self._requested_base_minor()
+        if not matches_money(amount, base, self.currency_code):
             if isinstance(amount, dict) and type(amount.get('amount')) is int and amount.get('currency') == self.currency_code:
                 raise SquarePaymentDiscrepancy(_(
                     "Square reported %(observed)s %(currency)s minor units for the payment base. Odoo requested %(requested)s.",
-                    observed=amount['amount'], currency=self.currency_code, requested=self.amount_minor,
+                    observed=amount['amount'], currency=self.currency_code, requested=base,
                 ))
             raise SquarePaymentDiscrepancy(_("The Square payment base has an invalid amount or currency."))
         status = payment.get('status')
@@ -304,10 +313,10 @@ class SquarePaymentAttempt(models.Model):
         tip = tip_money.get('amount') if isinstance(tip_money, dict) else None
         allow_tipping = self.checkout_request['checkout']['device_options']['tip_settings']['allow_tipping']
         if not (
-            type(tip) is int and 0 <= tip <= 2_147_483_647 - self.amount_minor
+            type(tip) is int and 0 <= tip <= 2_147_483_647 - base
             and matches_money(tip_money, tip, self.currency_code)
-            and (allow_tipping or not tip)
-            and matches_money(payment.get('total_money'), self.amount_minor + tip, self.currency_code)
+            and (allow_tipping or tip == self._requested_tip_minor() or (not tip and status in ('FAILED', 'CANCELED')))
+            and matches_money(payment.get('total_money'), base + tip, self.currency_code)
             and (not self.has_verified_amounts or tip == self.verified_tip_minor)
             and (self.state != 'authorized' or status not in ('APPROVED', 'COMPLETED')
                  or tip == self.authorized_tip_minor)

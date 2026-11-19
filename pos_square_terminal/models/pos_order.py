@@ -100,9 +100,11 @@ class PosOrder(models.Model):
                 attempt._check_provider_scope()
         else:
             total_minor, line_items, tip_minor = order._square_priced_basket(digits)
-            if tip_minor:
-                raise UserError(_("Square Terminal cannot send an Odoo-entered tip with this payment."))
-            if total_minor > 2_147_483_647 or not 0 < amount_minor <= total_minor - cash_minor or payment.is_change:
+            gross_minor = total_minor + tip_minor
+            if (
+                not 0 < total_minor <= gross_minor <= 2_147_483_647
+                or not 0 < amount_minor <= gross_minor - cash_minor or payment.is_change
+            ):
                 raise UserError(_("Enter a Square card share within the unpaid Odoo order total."))
 
         try:
@@ -110,13 +112,17 @@ class PosOrder(models.Model):
                 if not link:
                     link = order._square_prepare_order(
                         terminal.location_id, digits, total_minor, line_items, tip_minor,
-                        split=amount_minor < total_minor,
+                        split=amount_minor < gross_minor,
                     )
-                link._reserve_cash_tenders(cash)
+                card_total = sum(attempts.mapped('amount_minor'))
+                link._reserve_cash_tenders(cash, card_total=card_total)
+                money = link._tender_amounts(amount_minor, card_total + link._cash_total_minor())
+                if money['amount_money']['amount'] <= 0:
+                    raise UserError(_("Enter a larger Square card share to include some of the goods total."))
                 attempt_reference = 'odoo-' + uuid4().hex
                 checkout = {
                     'reference_id': attempt_reference,
-                    'amount_money': {'amount': amount_minor, 'currency': currency},
+                    **money,
                     'payment_options': {'autocomplete': not link.split},
                     'device_options': {
                         'device_id': terminal.device_id,
@@ -316,11 +322,12 @@ class PosOrder(models.Model):
                 if any(line.payment_method_id.use_payment_terminal == 'square_terminal' for line in pending):
                     return attempt._cashier_status()
                 cash = order._square_cash_tenders(pending, link.currency_digits)
-                covered = link._cash_total_minor() + sum(attempts.mapped('amount_minor'))
+                card_total = sum(attempts.mapped('amount_minor'))
+                covered = link._cash_total_minor() + card_total
                 added_cash = sum(minor_units(line.amount, link.currency_digits) for line in cash)
                 if covered + added_cash == link.total_minor + link.tip_minor:
                     order._square_check_session()
-                    link._reserve_cash_tenders(cash)
+                    link._reserve_cash_tenders(cash, card_total=card_total)
                     order._square_check_reserved_amounts(attempts)
                     if link.cash_tenders:
                         # Commit the recording intent before issuing any Cash CreatePayment.

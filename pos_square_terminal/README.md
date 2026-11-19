@@ -33,7 +33,7 @@ For a split, enter exact shares using Odoo cash and one or more Square cards. Fo
 ### Tips
 
 - **On the terminal.** In **Point of Sale → Configuration → Settings**, select the register, enable **Square Terminal Tips**, and select an active, tax-free service product as the **Tip Product** under **Tips**. Leave the Odoo tip empty for that sale. Each cardholder can tip on their own share. Odoo includes each verified tip in its card total and prints one receipt tip for the combined amount.
-- **On the register.** Enable **Tips** for the register and select the same kind of **Tip Product**. On the payment screen, choose **Tip**, enter the amount in **Add Tip**, and confirm it before entering the tender shares or sending a card request. Enter each share including its share of the tip. For €60 of goods and a €6 tip, enter €22 cash and send €44 by card. Odoo allocates €2 of tip to cash and €4 to card, puts any rounding remainder on the final tender, and prints one €6 tip. The Terminal takes €44 and skips its tip prompt.
+- **On the register.** Enable **Tips** for the register and select the same kind of **Tip Product**. Mark a custom tip product used only for Odoo tips as **Available in POS**. On the payment screen, choose **Tip**, enter the amount in **Add Tip**, and confirm it before entering the tender shares or sending a card request. Enter each share including its share of the tip. For €60 of goods and a €6 tip, enter €22 cash and send €44 by card. Odoo allocates €2 of tip to cash and €4 to card, puts any rounding remainder on the final tender, and prints one €6 tip. The Terminal takes €44 and skips its tip prompt.
 
 ### Recover a payment on the original sale
 

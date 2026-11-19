@@ -1,5 +1,6 @@
 import { registry } from "@web/core/registry";
 import * as Chrome from "@point_of_sale/../tests/tours/utils/chrome_util";
+import * as NumberPopup from "@point_of_sale/../tests/tours/utils/number_popup_util";
 import * as PaymentScreen from "@point_of_sale/../tests/tours/utils/payment_screen_util";
 import * as PartnerList from "@point_of_sale/../tests/tours/utils/partner_list_util";
 import * as ProductScreen from "@point_of_sale/../tests/tours/utils/product_screen_util";
@@ -168,6 +169,115 @@ registry.category("web_tour.tours").add("SquareTerminalCardsThenCash", {
         { trigger: ".pos-receipt .paymentlines:contains('Square Counter'):contains('5.50')" },
         { trigger: ".pos-receipt .paymentlines:contains('Square Counter'):contains('4.25')" },
         { trigger: ".pos-receipt .orderline:contains('Terminal Gratuity'):contains('0.75')" },
+    ].flat(),
+});
+
+function enterOdooTip(keys) {
+    return [
+        { trigger: ".payment-screen button:has(.fa-heart):contains('Tip')", run: "click" },
+        ...NumberPopup.enterValue(keys),
+        { trigger: ".modal:contains('Add Tip') .btn-primary", run: "click" },
+    ];
+}
+
+registry.category("web_tour.tours").add("SquareTerminalOdooTipRecovery", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...enterOdooTip("6"),
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        PaymentScreen.enterPaymentLineAmount("Checkout Cash", "22"),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "44.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        {
+            trigger: ".payment-screen:has(button:disabled:contains('Tip')) " +
+                ".electronic_status:contains('Check the original Square settlement')",
+            run() {
+                const order = window.posmodel.get_order();
+                sessionStorage.setItem("squareOdooTipTenders", order.payment_ids.map((line) => line.uuid).sort().join());
+            },
+        },
+        refresh(),
+        { trigger: "body:not(:has(.pos-loader))" },
+        Chrome.clickMenuOption("Orders"),
+        { trigger: ".ticket-screen .order-row", run: "dblclick" },
+        {
+            trigger: ".payment-screen .square-check-status:contains('Check status')",
+            run() {
+                const order = window.posmodel.get_order();
+                if (order.payment_ids.map((line) => line.uuid).sort().join() !==
+                    sessionStorage.getItem("squareOdooTipTenders")) {
+                    throw new Error("Reload must preserve the original cash and card tenders");
+                }
+                this.anchor.click();
+            },
+        },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("66.00"),
+        { trigger: ".pos-receipt .orderline:contains('Terminal Gratuity'):contains('6.00')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash'):contains('22.00')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Square Counter'):contains('44.00')" },
+        {
+            trigger: ".pos-receipt",
+            async run() {
+                const pos = window.posmodel;
+                const order = pos.get_order();
+                const payment = order.payment_ids.find((line) => line.payment_method_id.name === "Square Counter");
+                await pos.data.call("pos.order", "square_check_payment", [order.uuid, payment.uuid]);
+                const tips = order.lines.filter((line) => line.product_id.display_name === "Terminal Gratuity");
+                if (tips.length !== 1 || order.get_tip() !== 6) {
+                    throw new Error("The original Odoo tip must appear once on the receipt");
+                }
+            },
+        },
+    ].flat(),
+});
+
+registry.category("web_tour.tours").add("SquareTerminalOdooTipRemainder", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...enterOdooTip("0.02"),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.clickNumpad("4"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "4.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.clickNumpad("4"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "4.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
+        { trigger: ".payment-screen .payment-status-remaining .amount:contains('4.02')" },
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "4.02"),
+        ...PaymentScreen.clickValidate(),
+        ...PaymentScreen.clickPaymentline("Square Counter", "4.00"),
+        { trigger: ".payment-screen .electronic_status:contains('Check the original cash recording')" },
+        { trigger: ".payment-screen .square-check-status:contains('Check status')", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("12.02"),
+        { trigger: ".pos-receipt .orderline:contains('Terminal Gratuity'):contains('0.02')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash'):contains('4.02')" },
+    ].flat(),
+});
+
+registry.category("web_tour.tours").add("SquareTerminalSingleOdooTip", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...enterOdooTip("2"),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "14.34"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("14.34"),
+        { trigger: ".pos-receipt .orderline:contains('Terminal Gratuity'):contains('2.00')" },
+        { trigger: ".pos-receipt .paymentlines:contains('14.34')" },
     ].flat(),
 });
 

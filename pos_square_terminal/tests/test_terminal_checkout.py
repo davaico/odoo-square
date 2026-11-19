@@ -1654,11 +1654,69 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertFalse(order.payment_ids.filtered('transaction_id'))
         self.assertFalse(self.env['pos.square.order'].sudo().search_count([('order_id', '=', order.id)]))
 
+    def test_odoo_tip_on_cash_and_card_survives_settlement_recovery(self):
+        euro = self.env.ref('base.EUR')
+        euro.active = True
+        self.main_pos_config.journal_id.currency_id = euro
+        self.method.square_terminal_id.location_id.sudo().currency_code = 'EUR'
+        self.currency = 'EUR'
+        self.desk_pad.lst_price = 60
+        tip_product = self._configure_device_tip(odoo_tipping=True)
+        original_tip_lines = set()
+
+        def check_order(order):
+            self.assertEqual([line['name'] for line in order['line_items']], [self.desk_pad.name])
+            with self.registry.cursor() as cr:
+                env = api.Environment(cr, self.env.uid, {})
+                draft = env['pos.order'].search([('session_id', '=', self.pos_session.id)])
+                tip_line = draft.lines.filtered(lambda line: line.product_id.id == tip_product.id)
+                self.assertEqual(tip_line.price_subtotal_incl, 6)
+                original_tip_lines.add(tip_line.id)
+
+        self._run_mixed_checkout(
+            'SquareTerminalOdooTipRecovery', ((6000, 0, 0),), 2200, (4000,),
+            check_order=check_order, odoo_tips=(200, 400), lose_settlement=True,
+        )
+        order = self.pos_session.order_ids
+        self.assertEqual((order.amount_total, order.amount_paid, order.tip_amount), (66, 66, 6))
+        tip_line = order.lines.filtered(lambda line: line.product_id == tip_product)
+        self.assertEqual(tip_line.price_subtotal_incl, 6)
+        self.assertEqual(original_tip_lines, {tip_line.id})
+        attempt = self.env['pos.square.payment.attempt'].sudo().search([('order_id', '=', order.id)])
+        self.assertEqual((attempt.verified_base, attempt.verified_tip), (40, 4))
+
+    def test_odoo_tip_rounding_remainder_follows_two_card_shares_onto_cash(self):
+        self.desk_pad.lst_price = 12
+        tip_product = self._configure_device_tip(odoo_tipping=True)
+        self._run_mixed_checkout(
+            'SquareTerminalOdooTipRemainder', ((1200, 0, 0),), 402, (399, 400),
+            odoo_tips=(1, 1, 0), lose_cash=True,
+        )
+        order = self.pos_session.order_ids
+        self.assertEqual((order.amount_total, order.amount_paid, order.tip_amount), (12.02, 12.02, 0.02))
+        tip_line = order.lines.filtered(lambda line: line.product_id == tip_product)
+        self.assertEqual(tip_line.price_subtotal_incl, 0.02)
+
+    def test_odoo_tip_on_one_card_preserves_the_original_gross(self):
+        tip_product = self._configure_device_tip(odoo_tipping=True)
+        tip_product.available_in_pos = True
+        self.main_pos_config.square_terminal_tipping = False
+        self._run_priced_checkout(
+            'SquareTerminalSingleOdooTip', ((1234, 0, 0),), lambda order: None, odoo_tip_minor=200,
+        )
+        order = self.pos_session.order_ids
+        self.assertEqual((order.amount_total, order.amount_paid, order.tip_amount), (14.34, 14.34, 2))
+        tip_line = order.lines.filtered(lambda line: line.product_id == tip_product)
+        self.assertEqual(tip_line.price_subtotal_incl, 2)
+        self.assertEqual(order.payment_ids.amount, 14.34)
+
     def _run_mixed_checkout(self, tour, line_amounts, cash, cards, *, check_order=lambda order: None,
-                            card_tips=(), lose_settlement=False, lose_cash=False):
+                            card_tips=(), odoo_tips=(), lose_settlement=False, lose_cash=False):
         fields = ('total_money', 'total_tax_money', 'total_discount_money')
         totals = {field: self._money(sum(amounts)) for field, amounts in zip(fields, zip(*line_amounts))}
-        tips = card_tips or (0,) * len(cards)
+        cash_tip = odoo_tips[0] if odoo_tips else 0
+        tips = card_tips or odoo_tips[1:] or (0,) * len(cards)
+        total_tip = cash_tip + sum(tips)
         provider_order = {}
         checkouts = {}
         payments = {}
@@ -1693,6 +1751,8 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 self.assertEqual(checkout['payment_options'], {'autocomplete': False})
                 self.assertEqual(checkout['amount_money'], self._money(cards[number - 1]))
                 self.assertEqual(checkout['device_options']['tip_settings']['allow_tipping'], bool(card_tips))
+                self.assertEqual(checkout.get('tip_money', self._money(0)),
+                                 self._money(tips[number - 1] if odoo_tips else 0))
                 self.assertTrue(all(payment['status'] == 'APPROVED' for payment in payments.values()))
                 checkout_id = f'CHECKOUT-{number}'
                 payment_id = f'CARD-{number}'
@@ -1715,7 +1775,8 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 self.assertFalse(request['autocomplete'])
                 self.assertEqual(request['order_id'], 'MIXEDORDER')
                 self.assertEqual(request['location_id'], 'SQUARELOC')
-                self.assertEqual(request['amount_money'], self._money(cash))
+                self.assertEqual(request['amount_money'], self._money(cash - cash_tip))
+                self.assertEqual(request.get('tip_money', self._money(0)), self._money(cash_tip))
                 self.assertEqual(request['cash_details'], {'buyer_supplied_money': self._money(cash)})
                 self.assertTrue(request['idempotency_key'])
                 self.assertEqual(len(checkouts), len(cards))
@@ -1732,10 +1793,16 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                     payments['CASH-1'] = {
                         'id': 'CASH-1', 'order_id': 'MIXEDORDER', 'location_id': 'SQUARELOC',
                         'reference_id': request['reference_id'], 'source_type': 'CASH', 'status': 'APPROVED',
-                        'amount_money': self._money(cash), 'total_money': self._money(cash),
+                        'amount_money': self._money(cash - cash_tip), 'total_money': self._money(cash),
+                        'tip_money': self._money(cash_tip),
                         'cash_details': {'buyer_supplied_money': self._money(cash), 'change_back_money': self._money(0)},
                     }
                     if lose_cash:
+                        if odoo_tips:
+                            provider_order.update(
+                                total_tip_money=self._money(total_tip),
+                                total_money=self._money(totals['total_money']['amount'] + total_tip),
+                            )
                         raise ConnectionError('Square recorded the cash before the response was lost')
                 return self._square_response({'payment': payments['CASH-1']})
             if method == 'GET' and path.startswith('/v2/payments/'):
@@ -1766,8 +1833,8 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                         'amount_money': payment['total_money'], 'tip_money': payment.get('tip_money', self._money(0)),
                     })
                 provider_order.update(
-                    state='COMPLETED', version=2, tenders=tenders, total_tip_money=self._money(sum(tips)),
-                    total_money=self._money(totals['total_money']['amount'] + sum(tips)),
+                    state='COMPLETED', version=2, tenders=tenders, total_tip_money=self._money(total_tip),
+                    total_money=self._money(totals['total_money']['amount'] + total_tip),
                 )
                 if lose_settlement:
                     lose_readback = True
@@ -1807,7 +1874,8 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
     def _money(self, amount):
         return {'amount': amount, 'currency': self.currency}
 
-    def _run_priced_checkout(self, tour, line_amounts, check_order, *, expected_state='paid', device_tip_minor=None):
+    def _run_priced_checkout(self, tour, line_amounts, check_order, *,
+                             expected_state='paid', device_tip_minor=None, odoo_tip_minor=0):
         fields = ('total_money', 'total_tax_money', 'total_discount_money')
         gross = sum(amounts[0] for amounts in line_amounts)
         totals = {field: self._money(sum(amounts)) for field, amounts in zip(fields, zip(*line_amounts))}
@@ -1817,6 +1885,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
 
         def square_response(method, url, **kwargs):
             path = urlsplit(url).path
+            self.assertEqual(kwargs['headers']['Authorization'], 'Bearer square-access-token')
             calls.append((method, path))
             if path in ('/v2/orders/calculate', '/v2/orders') and method == 'POST':
                 order = kwargs['json']['order']
@@ -1836,6 +1905,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 checkout.update(kwargs['json']['checkout'])
                 self.assertEqual(checkout['order_id'], 'SQUAREORDER')
                 self.assertEqual(checkout['amount_money'], self._money(gross))
+                self.assertEqual(checkout.get('tip_money', self._money(0)), self._money(odoo_tip_minor))
                 self.assertEqual(
                     checkout['device_options']['tip_settings']['allow_tipping'], device_tip_minor is not None,
                 )
@@ -1845,12 +1915,13 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 checkout.update(status='COMPLETED', payment_ids=['SQUAREPAYMENT'])
                 return self._square_response({'checkout': checkout})
             if (method, path) == ('GET', '/v2/payments/SQUAREPAYMENT'):
+                tip = odoo_tip_minor or device_tip_minor
                 return self._square_response({'payment': {
                     'id': 'SQUAREPAYMENT', 'order_id': 'SQUAREORDER',
                     'location_id': 'SQUARELOC', 'reference_id': checkout['reference_id'],
                     'status': 'COMPLETED', 'amount_money': self._money(gross),
-                    'total_money': self._money(gross + (device_tip_minor or 0)), 'source_type': 'CARD',
-                    **({'tip_money': self._money(device_tip_minor)} if device_tip_minor is not None else {}),
+                    'total_money': self._money(gross + (tip or 0)), 'source_type': 'CARD',
+                    **({'tip_money': self._money(tip)} if tip is not None else {}),
                 }})
             self.fail(f'Unexpected Square request: {method} {path}')
 
