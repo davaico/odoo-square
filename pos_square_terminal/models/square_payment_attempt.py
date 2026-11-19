@@ -35,6 +35,7 @@ class SquarePaymentAttempt(models.Model):
     application_id = fields.Char(required=True)
     reference = fields.Char(required=True, index=True)
     amount_minor = fields.Integer(required=True)
+    authorized_tip_minor = fields.Integer(copy=False)
     checkout_request = fields.Json(required=True, groups='base.group_system')
     state = fields.Selection([
         ('prepared', 'Reserved'),
@@ -296,16 +297,27 @@ class SquarePaymentAttempt(models.Model):
                     observed=amount['amount'], currency=self.currency_code, requested=self.amount_minor,
                 ))
             raise SquarePaymentDiscrepancy(_("The Square payment base has an invalid amount or currency."))
-        if not (
-            matches_money(payment.get('total_money'), self.amount_minor, self.currency_code)
-            and ('tip_money' not in payment or matches_money(payment['tip_money'], 0, self.currency_code))
-        ):
-            raise SquarePaymentDiscrepancy(_("The Square payment total or tip differs from the original payment."))
-
         status = payment.get('status')
         if status not in ('COMPLETED', 'APPROVED', 'PENDING', 'FAILED', 'CANCELED'):
             raise ValueError('Unknown Square payment status')
+        tip_money = payment.get('tip_money', {'amount': 0, 'currency': self.currency_code})
+        tip = tip_money.get('amount') if isinstance(tip_money, dict) else None
+        allow_tipping = self.checkout_request['checkout']['device_options']['tip_settings']['allow_tipping']
+        if not (
+            type(tip) is int and 0 <= tip <= 2_147_483_647 - self.amount_minor
+            and matches_money(tip_money, tip, self.currency_code)
+            and (allow_tipping or not tip)
+            and matches_money(payment.get('total_money'), self.amount_minor + tip, self.currency_code)
+            and (not self.has_verified_amounts or tip == self.verified_tip_minor)
+            and (self.state != 'authorized' or status not in ('APPROVED', 'COMPLETED')
+                 or tip == self.authorized_tip_minor)
+        ):
+            raise SquarePaymentDiscrepancy(_("The Square payment total or tip differs from the original payment."))
         return payment
+
+    def _device_tip_minor(self):
+        self.ensure_one()
+        return self.verified_tip_minor if self.state == 'verified' and self.square_order_link_id.device_tip_product_id else 0
 
     def _verify_payment(self, payment_id, *, final):
         self.ensure_one()
@@ -324,7 +336,11 @@ class SquarePaymentAttempt(models.Model):
                     'state': 'authorized' if self.square_order_link_id.settlement_request else 'uncertain',
                 })
         elif status == 'APPROVED' and final and self.square_order_link_id.split:
-            self.write({'square_payment_id': payment_id, 'state': 'authorized'})
+            self.write({
+                'square_payment_id': payment_id,
+                'state': 'authorized',
+                'authorized_tip_minor': payment.get('tip_money', {}).get('amount', 0),
+            })
         elif status in ('APPROVED', 'PENDING'):
             if self.state == 'authorized':
                 raise ValueError('Square no longer reports the payment as approved')
@@ -339,8 +355,12 @@ class SquarePaymentAttempt(models.Model):
     def _mark_verified(self, payment):
         self.ensure_one()
         self.write({'square_payment_id': payment['id'], 'state': 'verified'})
-        self.payment_id._square_set_verified(payment['id'])
         self._observe_verified_payment(payment)
+        link = self.square_order_link_id
+        amount = (self.amount_minor + self._device_tip_minor()) / (10 ** link.currency_digits)
+        self.payment_id._square_set_verified(payment['id'], amount)
+        if not link.split:
+            self.order_id._square_project_device_tip(link)
         self._record_successful_check()
 
     def _cashier_state(self):
@@ -359,6 +379,11 @@ class SquarePaymentAttempt(models.Model):
     def _cashier_status(self):
         self.ensure_one()
         status = self._cashier_tender_status()
+        tip_line = self.square_order_link_id.device_tip_line_id
+        if tip_line:
+            status['device_tip_line'] = tip_line.read(
+                tip_line._load_pos_data_fields(self.order_id.config_id.id), load=False,
+            )[0]
         if self.square_order_link_id.split:
             status['tenders'] = {
                 attempt.payment_uuid: attempt._cashier_tender_status()
@@ -378,4 +403,5 @@ class SquarePaymentAttempt(models.Model):
             'state': self._cashier_state(),
             'reference': self.reference,
             'payment_id': self.square_payment_id if self.state == 'verified' else False,
+            'amount': self.payment_id.amount if self.state == 'verified' else None,
         }

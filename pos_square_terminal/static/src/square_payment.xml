@@ -37,4 +37,9 @@
             <attribute name="t-att-disabled">this.squarePaymentReserved</attribute>
         </xpath>
     </t>
+    <t t-name="pos_square_terminal.SquarePaymentTip" t-inherit="point_of_sale.PaymentScreenButtons" t-inherit-mode="extension">
+        <xpath expr="//button[@t-on-click='addTip']" position="attributes">
+            <attribute name="t-att-disabled">this.squarePaymentReserved</attribute>
+        </xpath>
+    </t>
 </templates>

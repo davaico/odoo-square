@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from odoo import _, api, models
 from odoo.exceptions import UserError
 
@@ -22,6 +24,20 @@ class PosOrderLine(models.Model):
         if orders._square_reserved_attempts():
             raise UserError(_("The original goods are reserved by a Square payment."))
         return super().create(vals_list)
+
+    def _square_create_device_tip(self, order, product, amount):
+        return super(PosOrderLine, self.sudo()).create({
+            'order_id': order.id,
+            'product_id': product.id,
+            'qty': 1,
+            'price_unit': amount,
+            'price_subtotal': amount,
+            'price_subtotal_incl': amount,
+            'price_type': 'manual',
+            'full_product_name': product.display_name,
+            'skip_change': True,
+            'uuid': str(uuid4()),
+        })
 
     def write(self, vals):
         changes = self._square_frozen_fields.intersection(vals)

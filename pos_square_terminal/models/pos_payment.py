@@ -92,9 +92,11 @@ class PosPayment(models.Model):
                 order._square_check_new_share(payment, order._square_current_attempts())
         return True
 
-    def _square_set_verified(self, payment_id):
+    def _square_set_verified(self, payment_id, amount):
         self.ensure_one()
-        super(PosPayment, self.sudo()).write({'payment_status': 'done', 'transaction_id': payment_id})
+        super(PosPayment, self.sudo()).write({
+            'payment_status': 'done', 'transaction_id': payment_id, 'amount': amount,
+        })
         self.invalidate_recordset(['square_attempt_state', 'square_attempt_reference'])
 
     def unlink(self):

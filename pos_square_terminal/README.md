@@ -26,7 +26,11 @@ For a replacement device, add a new terminal record and switch the payment metho
 2. Ask the customer to pay on the selected Square Terminal. Keep the original sale open while Odoo verifies the payment. If Square's result is uncertain, keep the original sale available for investigation before taking another payment.
 3. Issue the itemized Odoo receipt when the sale completes. If the register requires manual validation, select **Validate** after the payment shows as successful.
 
-This checkout supports a single card tender for ordinary untaxed items at their configured prices. Odoo uses the configured priced basket and sends the payment amount automatically. Cash-only sales can be completed using the existing cash method.
+Odoo uses the configured basket prices and sends the selected card amount automatically. For two Square cards, enter the first card’s share before selecting **Send**. After Square authorizes it, select Square again for the remaining balance. Cash-only sales use the existing cash method.
+
+## Enable tips on the terminal
+
+In **Point of Sale → Configuration → Settings**, select the register and enable **Square Terminal Tips**. Under **Tips**, select an active, tax-free service product for the receipt. Choose this product for each register that prompts for tips. For a split card payment, each cardholder can tip on their own share. The Odoo receipt shows one line for the combined tip and each card payment shows what that cardholder paid.
 
 ## Recover and review payments
 

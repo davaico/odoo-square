@@ -118,7 +118,7 @@ class PosOrder(models.Model):
                         'device_id': terminal.device_id,
                         'show_itemized_cart': True,
                         'allow_auto_card_surcharge': False,
-                        'tip_settings': {'allow_tipping': False},
+                        'tip_settings': {'allow_tipping': bool(link.device_tip_product_id)},
                     },
                 }
                 if link.square_order_id:
@@ -145,6 +145,9 @@ class PosOrder(models.Model):
 
     def _square_prepare_order(self, location, digits, total_minor, line_items, tip_minor, *, split):
         self.ensure_one()
+        device_tip_product = self.env['product.product']
+        if self.config_id.square_terminal_tipping and not self.is_tipped:
+            device_tip_product = self._square_check_device_tip_product()
         connection = location.connection_id
         reference = 'odoo-' + uuid4().hex
         try:
@@ -165,6 +168,7 @@ class PosOrder(models.Model):
             'currency_digits': digits,
             'total_minor': total_minor,
             'tip_minor': tip_minor,
+            'device_tip_product_id': device_tip_product.id,
             'create_request': create_request,
             'pricing_snapshot': pricing_snapshot,
             'split': split,
@@ -174,6 +178,32 @@ class PosOrder(models.Model):
         except SquareAPIError:
             raise UserError(_("Square could not check the order pricing. Try again before sending the payment.")) from None
         return link
+
+    def _square_check_device_tip_product(self):
+        self.ensure_one()
+        product = self.config_id.tip_product_id
+        if (
+            not product or not product.active or not product.sale_ok or product.type != 'service'
+            or (product.company_id and product.company_id != self.company_id)
+            or product.taxes_id._filter_taxes_by_company(self.company_id)
+        ):
+            raise UserError(_("Configure an active, tax-free Odoo tip service product for this Square register."))
+        return product
+
+    def _square_project_device_tip(self, link):
+        self.ensure_one()
+        tip_minor = link._device_tip_minor(self._square_current_attempts())
+        if not tip_minor or link.device_tip_line_id:
+            return
+        divisor = 10 ** link.currency_digits
+        tip = tip_minor / divisor
+        link.device_tip_line_id = self.lines._square_create_device_tip(self, link.device_tip_product_id, tip)
+        super(PosOrder, self).write({
+            'is_tipped': True,
+            'tip_amount': tip,
+            'amount_total': (link.total_minor + link.tip_minor + tip_minor) / divisor,
+            'amount_paid': self.currency_id.round(sum(self.payment_ids.mapped('amount'))),
+        })
 
     @api.model
     def square_prepare_linked_order(self, order_uuid, payment_uuid):
@@ -712,13 +742,14 @@ class PosOrder(models.Model):
         if (
             set(self.payment_ids.ids) != set(attempts.payment_id.ids)
             or self.uuid != link.order_uuid or self.currency_id.name != link.currency_code
-            or self.amount_return or minor_units(self.amount_total, digits) != link.total_minor + link.tip_minor
+            or self.amount_return
+            or minor_units(self.amount_total, digits) != link.total_minor + link.tip_minor + link._device_tip_minor(attempts)
             or (link.split and not 0 < total <= link.total_minor + link.tip_minor)
             or (not link.split and (len(attempts) != 1 or total != link.total_minor + link.tip_minor))
             or any(
                 attempt.payment_id.payment_method_id.id != attempt.payment_method_id.id
                 or attempt.payment_id.uuid != attempt.payment_uuid or attempt.payment_id.is_change
-                or minor_units(attempt.payment_id.amount, digits) != attempt.amount_minor
+                or minor_units(attempt.payment_id.amount, digits) != attempt.amount_minor + attempt._device_tip_minor()
                 for attempt in attempts
             )
         ):
@@ -740,7 +771,8 @@ class PosOrder(models.Model):
                 raise UserError(_("Square has not verified payment for this sale."))
             order._square_check_reserved_amounts(attempts)
             if (
-                minor_units(order.currency_id.round(order.amount_paid), link.currency_digits) != link.total_minor + link.tip_minor
+                minor_units(order.currency_id.round(order.amount_paid), link.currency_digits)
+                != link.total_minor + link.tip_minor + link._device_tip_minor(attempts)
                 or any(
                     attempt.payment_id.payment_status != 'done'
                     or attempt.payment_id.transaction_id != attempt.square_payment_id

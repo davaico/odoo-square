@@ -41,6 +41,8 @@ class SquareOrder(models.Model):
     currency_digits = fields.Integer(required=True)
     total_minor = fields.Integer(required=True)
     tip_minor = fields.Integer()
+    device_tip_product_id = fields.Many2one('product.product', copy=False, ondelete='restrict')
+    device_tip_line_id = fields.Many2one('pos.order.line', copy=False, ondelete='restrict')
     create_request = fields.Json(required=True)
     pricing_snapshot = fields.Json(copy=False)
     pricing_issue = fields.Char(copy=False)
@@ -87,15 +89,15 @@ class SquareOrder(models.Model):
             return False
         return True
 
-    def _matches_order_totals(self, order, *, state='OPEN'):
+    def _matches_order_totals(self, order, *, state='OPEN', tip_minor=0):
         self.ensure_one()
         expected_lines = self.pricing_snapshot['lines'] if self.pricing_snapshot else {}
         if not isinstance(order, dict) or not (
             order.get('state') == state
             and order.get('reference_id') == self.reference
             and order.get('location_id') == self.square_location_id
-            and matches_money(order.get('total_money'), self.total_minor, self.currency_code)
-            and self._matches_optional_money(order, 'total_tip_money', 0)
+            and matches_money(order.get('total_money'), self.total_minor + tip_minor, self.currency_code)
+            and self._matches_optional_money(order, 'total_tip_money', tip_minor)
             and self._matches_optional_money(order, 'total_service_charge_money', 0)
             and self._matches_optional_money(order, 'total_tax_money', sum(
                 line.get('total_tax_money', 0) for line in expected_lines.values()
@@ -172,13 +174,16 @@ class SquareOrder(models.Model):
             and measurement.get('custom_unit') == requested['measurement_unit']['custom_unit']
         )
 
+    def _device_tip_minor(self, attempts):
+        return sum(attempt._device_tip_minor() for attempt in attempts)
+
     def _prepare_settlement(self, attempts):
         self.ensure_one()
         path = '/v2/orders/' + quote(self.square_order_id, safe='')
         try:
             for attempt in attempts:
                 attempt._check_provider_scope()
-            order = self._read_settlement_order(path)
+            order = self._read_settlement_order(path, attempts)
             version = order.get('version')
             payment_ids = attempts.mapped('square_payment_id')
             if (
@@ -227,6 +232,7 @@ class SquareOrder(models.Model):
                 for attempt, payment in zip(attempts, payments):
                     if attempt.state != 'verified':
                         attempt._mark_verified(payment)
+                self.order_id._square_project_device_tip(self)
         released = {'CANCELED', 'FAILED'}
         self.settlement_blocked = (
             order['state'] in ('OPEN', 'CANCELED')
@@ -238,35 +244,44 @@ class SquareOrder(models.Model):
     def _read_settlement(self, path, attempts):
         for attempt in attempts:
             attempt._check_provider_scope()
-        order = self._read_settlement_order(path)
+        order = self._read_settlement_order(path, attempts)
         payments = [attempt._read_payment(attempt.square_payment_id) for attempt in attempts]
         return order, payments
 
-    def _read_settlement_order(self, path):
+    def _read_settlement_order(self, path, attempts):
         order = self.connection_id._request('GET', path).get('order')
         if (
             not isinstance(order, dict) or order.get('id') != self.square_order_id
             or order.get('state') not in ('OPEN', 'COMPLETED', 'CANCELED')
-            or not self._matches_order_totals(order, state=order['state'])
         ):
             raise ValueError('Square order does not match the original split sale')
+        expected_tip = sum(attempts.mapped('authorized_tip_minor'))
+        tip_money = order.get('total_tip_money', {})
+        order_tip = tip_money.get('amount', 0) if isinstance(tip_money, dict) else None
+        # Square may omit uncaptured tips on an open order.
+        valid_tips = (expected_tip,) if order['state'] == 'COMPLETED' else (0, expected_tip)
+        if order_tip not in valid_tips or not self._matches_order_totals(order, state=order['state'], tip_minor=order_tip):
+            raise ValueError('Square order totals do not match the original split sale')
         return order
 
     def _matches_settlement_tenders(self, order, attempts, *, complete):
         tenders = order.get('tenders', [])
         if not isinstance(tenders, list):
             return False
-        expected = {attempt.square_payment_id: attempt.amount_minor for attempt in attempts}
+        expected = {attempt.square_payment_id: attempt for attempt in attempts}
         for tender in tenders:
             if not isinstance(tender, dict):
                 return False
             payment_id = tender.get('payment_id') or tender.get('id')
             if not isinstance(payment_id, str) or payment_id not in expected:
                 return False
+            attempt = expected.pop(payment_id)
+            tip = attempt.authorized_tip_minor
             if (
                 tender.get('type') != 'CARD'
                 or tender.get('location_id', self.square_location_id) != self.square_location_id
-                or not matches_money(tender.get('amount_money'), expected.pop(payment_id), self.currency_code)
+                or not matches_money(tender.get('amount_money'), attempt.amount_minor + tip, self.currency_code)
+                or ('tip_money' in tender and not matches_money(tender['tip_money'], tip, self.currency_code))
             ):
                 return False
         return not complete or not expected

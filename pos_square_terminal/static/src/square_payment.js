@@ -43,6 +43,11 @@ class SquarePayment extends PaymentInterface {
         const status = await this.pos.data.call(
             "pos.order", method, [order.uuid, line.uuid, ...args]
         );
+        if (status.device_tip_line) {
+            const data = await this.pos.data.missingRecursive({ "pos.order.line": [status.device_tip_line] });
+            this.pos.models.loadData(data);
+            order.update({ is_tipped: true, tip_amount: status.device_tip_line.price_subtotal_incl });
+        }
         let cancelled = false;
         for (const tender of [...order.payment_ids]) {
             const result = tender.uuid === line.uuid ? status : status.tenders?.[tender.uuid];
@@ -58,7 +63,7 @@ class SquarePayment extends PaymentInterface {
             } else {
                 tender.update({ square_attempt_state: result.state, square_attempt_reference: result.reference });
                 if (result.state === "verified") {
-                    tender.update({ transaction_id: result.payment_id, payment_status: "done" });
+                    tender.update({ amount: result.amount, transaction_id: result.payment_id, payment_status: "done" });
                 }
             }
         }
@@ -289,6 +294,11 @@ patch(PaymentScreen.prototype, {
     },
     get squarePaymentReserved() {
         return this.paymentLines.some(isReservedSquarePayment);
+    },
+    async addTip() {
+        if (!this.squarePaymentReserved) {
+            return super.addTip(...arguments);
+        }
     },
     async addNewPaymentLine(method) {
         if (this.squarePaymentReserved && !this.currentOrder.squareCanAddShare(method)) {
