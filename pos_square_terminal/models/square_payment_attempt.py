@@ -215,12 +215,15 @@ class SquarePaymentAttempt(models.Model):
             raise ValueError('Multiple Square payments match the reserved checkout')
         if matching_payments:
             payment = matching_payments[0]
-        status = self._observe_payment(payment, final=False) if payment else None
-
         # A missing checkout or empty tender list can still precede a late capture.
         # A canceled order is a terminal, unpaid provider state.
-        if order['state'] == 'CANCELED' and (status in ('FAILED', 'CANCELED') or not tender_ids and not payment):
-            self.state = 'failed'
+        cancellation_confirmed = order['state'] == 'CANCELED' and (
+            payment['status'] in ('FAILED', 'CANCELED') if payment else not tender_ids
+        )
+        status = self._observe_payment(payment, final=cancellation_confirmed) if payment else None
+        if cancellation_confirmed:
+            if not payment:
+                self.state = 'failed'
             link.cancel_requested = True
         self._record_successful_check()
         return status or True
@@ -424,8 +427,6 @@ class SquarePaymentAttempt(models.Model):
                 self.write({'square_payment_id': payment_id, 'state': 'failed'})
             elif self.provider_status in ('PENDING', 'IN_PROGRESS'):
                 self.state = 'declined'
-            elif self.state == 'timed_out':
-                self.square_payment_id = payment_id
         return status
 
     def _mark_verified(self, payment):

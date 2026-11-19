@@ -735,7 +735,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 mutations.append(path)
                 checkout.update(kwargs['json']['checkout'])
                 checkout.update(id='SQUARECHECKOUT', location_id='SQUARELOC', status='CANCELED',
-                                cancel_reason='TIMED_OUT')
+                                cancel_reason='TIMED_OUT', payment_ids=['ABANDONEDTAP'])
                 raise ConnectionError('Square accepted the checkout before the response was lost')
             elif (method, path) == ('POST', '/v2/terminals/checkouts/search'):
                 searches.append(kwargs['json'])
@@ -748,6 +748,12 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 payload = {'order': provider_order}
             elif (method, path) == ('GET', '/v2/terminals/checkouts/SQUARECHECKOUT'):
                 payload = {'checkout': {**checkout, 'status': 'COMPLETED', 'payment_ids': ['SQUAREPAYMENT']}}
+            elif (method, path) == ('GET', '/v2/payments/ABANDONEDTAP'):
+                payload = {'payment': {
+                    'id': 'ABANDONEDTAP', 'order_id': 'SQUAREORDER', 'location_id': 'SQUARELOC',
+                    'reference_id': checkout['reference_id'], 'status': 'FAILED',
+                    'amount_money': money, 'total_money': money, 'source_type': 'CARD',
+                }}
             elif (method, path) == ('GET', '/v2/payments/SQUAREPAYMENT'):
                 payload = {'payment': {
                     'id': 'SQUAREPAYMENT', 'order_id': 'SQUAREORDER', 'location_id': 'SQUARELOC',
@@ -856,6 +862,13 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 return self._square_response({'checkouts': []})
             if (method, path) == ('GET', '/v2/orders/SQUAREORDER'):
                 return self._square_response({'order': provider_order})
+            if (method, path) == ('GET', '/v2/payments/RELEASED'):
+                return self._square_response({'payment': {
+                    'id': 'RELEASED', 'order_id': 'SQUAREORDER', 'location_id': 'SQUARELOC',
+                    'reference_id': checkout_requests[0]['checkout']['reference_id'], 'status': 'CANCELED',
+                    'terminal_checkout_id': 'EXPIREDCHECKOUT',
+                    'amount_money': self._money(1234), 'total_money': self._money(1234), 'source_type': 'CARD',
+                }})
             self.fail(f'Unexpected Square request: {method} {path}')
 
         with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
@@ -870,7 +883,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             original_reference = provider_order['reference_id']
             provider_order.update(state='CANCELED', reference_id='WRONGSALE')
             self.assertEqual(order.square_check_payment(order.uuid, payment.uuid)['state'], 'canceling')
-            provider_order['reference_id'] = original_reference
+            provider_order.update(reference_id=original_reference, tenders=[{'payment_id': 'RELEASED', 'type': 'CARD'}])
             self.assertEqual(order.square_check_payment(order.uuid, payment.uuid)['state'], 'cancelled')
             payment.unlink()
             order.write({'payment_ids': [Command.create({
