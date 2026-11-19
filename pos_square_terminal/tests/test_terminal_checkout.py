@@ -22,6 +22,9 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
 
     def setUp(self):
         super().setUp()
+        self.desk_pad = self.desk_pad.product_variant_id
+        self.monitor_stand = self.monitor_stand.product_variant_id
+        self.whiteboard_pen = self.whiteboard_pen.product_variant_id
         key = patch.dict(os.environ, {'ODOO_SQUARE_TERMINAL_ENCRYPTION_KEY': Fernet.generate_key().decode()})
         key.start()
         self.addCleanup(key.stop)
@@ -1717,7 +1720,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
 
     def test_manager_price_control_allows_native_manual_price(self):
         self.main_pos_config.restrict_price_control = True
-        self.pos_user.groups_id = [Command.link(self.env.ref('point_of_sale.group_pos_manager').id)]
+        self.pos_user.group_ids = [Command.link(self.env.ref('point_of_sale.group_pos_manager').id)]
 
         def check_order(order):
             line, = order['line_items']
@@ -2189,6 +2192,23 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertEqual(order.state, 'draft')
         self.assertEqual(payment.payment_status, 'waiting')
 
+    def test_browser_supplied_tax_amounts_stop_before_square(self):
+        tax = self._included_vat()
+        self.desk_pad.write({'lst_price': 12, 'taxes_id': [Command.set(tax.ids)]})
+        order = self._cashier_draft(amount=12)
+        payment = order.payment_ids
+        order.lines.write({
+            'tax_ids': [Command.set(tax.ids)],
+            'extra_tax_data': {
+                'currency_id': order.currency_id.id, 'price_unit': 12, 'discount': 0, 'quantity': 1,
+                'manual_tax_amounts': {str(tax.id): {'tax_amount_currency': 0}},
+            },
+        })
+        with patch('odoo.addons.pos_square_terminal.square_api.request') as provider:
+            with self.assertRaisesRegex(UserError, 'manual tax overrides'), self.cr.savepoint():
+                order.square_prepare_payment(order.uuid, payment.uuid)
+            provider.assert_not_called()
+
     def _draft_provider_order(self, order, total, *, line_total=1234):
         line, = order['line_items']
         return {
@@ -2276,7 +2296,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
 
     def test_verified_payment_resumes_invoice_after_selecting_the_customer(self):
         customer = self.env['res.partner'].create({'name': 'Square Invoice Customer'})
-        self.pos_user.groups_id += self.env.ref('account.group_account_invoice')
+        self.pos_user.group_ids += self.env.ref('account.group_account_invoice')
 
         def check_order(order):
             self.assertNotIn('customer_id', order)

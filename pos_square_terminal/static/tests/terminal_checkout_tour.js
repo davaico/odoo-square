@@ -1,12 +1,22 @@
 import { registry } from "@web/core/registry";
-import * as Chrome from "@point_of_sale/../tests/tours/utils/chrome_util";
-import * as Dialog from "@point_of_sale/../tests/tours/utils/dialog_util";
-import * as NumberPopup from "@point_of_sale/../tests/tours/utils/number_popup_util";
-import * as PaymentScreen from "@point_of_sale/../tests/tours/utils/payment_screen_util";
-import * as PartnerList from "@point_of_sale/../tests/tours/utils/partner_list_util";
-import * as ProductScreen from "@point_of_sale/../tests/tours/utils/product_screen_util";
-import * as ReceiptScreen from "@point_of_sale/../tests/tours/utils/receipt_screen_util";
-import { inLeftSide, refresh } from "@point_of_sale/../tests/tours/utils/common";
+import * as Chrome from "@point_of_sale/../tests/pos/tours/utils/chrome_util";
+import * as Dialog from "@point_of_sale/../tests/generic_helpers/dialog_util";
+import * as NumberPopup from "@point_of_sale/../tests/generic_helpers/number_popup_util";
+import * as PaymentScreen from "@point_of_sale/../tests/pos/tours/utils/payment_screen_util";
+import * as PartnerList from "@point_of_sale/../tests/pos/tours/utils/partner_list_util";
+import * as ProductScreen from "@point_of_sale/../tests/pos/tours/utils/product_screen_util";
+import * as ReceiptScreen from "@point_of_sale/../tests/pos/tours/utils/receipt_screen_util";
+import { inLeftSide } from "@point_of_sale/../tests/pos/tours/utils/common";
+
+function refresh() {
+    return {
+        trigger: ".payment-screen",
+        expectUnloadPage: true,
+        run() {
+            window.location.reload();
+        },
+    };
+}
 
 registry.category("web_tour.tours").add("SquareTerminalCardCheckout", {
     steps: () => [
@@ -109,20 +119,20 @@ registry.category("web_tour.tours").add("SquareTerminalMixedComboRecovery", {
         {
             trigger: ".payment-screen .electronic_status:contains('Check the original Square settlement')",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 sessionStorage.setItem("squareMixedOrder", order.uuid);
                 sessionStorage.setItem("squareMixedTenders", order.payment_ids.map((line) => line.uuid).sort().join());
             },
         },
         refresh(),
-        { trigger: "body:not(:has(.pos-loader))" },
-        Chrome.clickMenuOption("Orders"),
+        { trigger: "body:not(:has(.loader))" },
+        Chrome.clickOrders(),
         {
             trigger: ".ticket-screen .order-row",
             async run(helpers) {
                 const order = window.posmodel.models["pos.order"].getBy("uuid", sessionStorage.getItem("squareMixedOrder"));
                 const rows = [...document.querySelectorAll(".ticket-screen .order-row")].filter((row) =>
-                    [...row.querySelectorAll(".col")].some((column) => column.textContent.trim() === order?.pos_reference));
+                    [...row.querySelectorAll(".order-name .text-muted")].some((column) => column.textContent.trim() === order?.pos_reference));
                 if (rows.length !== 1) {
                     throw new Error("Original mixed sale is missing from the native Orders screen");
                 }
@@ -132,7 +142,7 @@ registry.category("web_tour.tours").add("SquareTerminalMixedComboRecovery", {
         {
             trigger: ".payment-screen .square-check-status:contains('Check status')",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 if (order.uuid !== sessionStorage.getItem("squareMixedOrder") ||
                     order.payment_ids.map((line) => line.uuid).sort().join() !== sessionStorage.getItem("squareMixedTenders")) {
                     throw new Error("The register must recover the original sale and both native tenders");
@@ -163,13 +173,13 @@ registry.category("web_tour.tours").add("SquareTerminalCardsThenCash", {
         { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
         ...PaymentScreen.clickNumpad("6"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "5.00"),
-        { trigger: ".payment-screen .payment-status-remaining .amount:contains('7.00')" },
+        { trigger: ".payment-screen .payment-status-amount .amount:contains('7.00')" },
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         ...PaymentScreen.clickNumpad("4"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "4.00"),
         { trigger: ".payment-screen .send_payment_request", run: "click" },
         { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
-        { trigger: ".payment-screen .payment-status-remaining .amount:contains('3.00')" },
+        { trigger: ".payment-screen .payment-status-amount .amount:contains('3.00')" },
         ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
         ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "3.00"),
         ...PaymentScreen.clickNumpad("2"),
@@ -181,7 +191,7 @@ registry.category("web_tour.tours").add("SquareTerminalCardsThenCash", {
         {
             trigger: ".payment-screen .validation-button.highlight",
             async run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 const card = order.payment_ids.find((line) => line.square_attempt_state === "authorized");
                 const cash = order.payment_ids.find((line) => line.payment_method_id.name === "Checkout Cash");
                 const status = await window.posmodel.data.call("pos.order", "square_check_payment", [order.uuid, card.uuid]);
@@ -229,18 +239,18 @@ registry.category("web_tour.tours").add("SquareTerminalOdooTipRecovery", {
             trigger: ".payment-screen:has(button:disabled:contains('Tip')) " +
                 ".electronic_status:contains('Check the original Square settlement')",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 sessionStorage.setItem("squareOdooTipTenders", order.payment_ids.map((line) => line.uuid).sort().join());
             },
         },
         refresh(),
-        { trigger: "body:not(:has(.pos-loader))" },
-        Chrome.clickMenuOption("Orders"),
+        { trigger: "body:not(:has(.loader))" },
+        Chrome.clickOrders(),
         { trigger: ".ticket-screen .order-row", run: "dblclick" },
         {
             trigger: ".payment-screen .square-check-status:contains('Check status')",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 if (order.payment_ids.map((line) => line.uuid).sort().join() !==
                     sessionStorage.getItem("squareOdooTipTenders")) {
                     throw new Error("Reload must preserve the original cash and card tenders");
@@ -257,11 +267,11 @@ registry.category("web_tour.tours").add("SquareTerminalOdooTipRecovery", {
             trigger: ".pos-receipt",
             async run() {
                 const pos = window.posmodel;
-                const order = pos.get_order();
+                const order = pos.getOrder();
                 const payment = order.payment_ids.find((line) => line.payment_method_id.name === "Square Counter");
                 await pos.data.call("pos.order", "square_check_payment", [order.uuid, payment.uuid]);
                 const tips = order.lines.filter((line) => line.product_id.display_name === "Terminal Gratuity");
-                if (tips.length !== 1 || order.get_tip() !== 6) {
+                if (tips.length !== 1 || order.getTip() !== 6) {
                     throw new Error("The original Odoo tip must appear once on the receipt");
                 }
             },
@@ -310,7 +320,7 @@ registry.category("web_tour.tours").add("SquareTerminalOdooTipRemainder", {
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "4.00"),
         { trigger: ".payment-screen .send_payment_request", run: "click" },
         { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
-        { trigger: ".payment-screen .payment-status-remaining .amount:contains('4.02')" },
+        { trigger: ".payment-screen .payment-status-amount .amount:contains('4.02')" },
         ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
         ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "4.02"),
         ...PaymentScreen.clickValidate(),
@@ -389,7 +399,7 @@ registry.category("web_tour.tours").add("SquareTerminalCancelRacesPayment", {
             },
         },
         { trigger: ".payment-screen .electronic_status:contains('Payment Successful')" },
-        { trigger: ".payment-screen .payment-status-remaining .amount:contains('0.00')" },
+        { trigger: ".payment-screen .payment-status-amount .amount:contains('0.00')" },
         ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
         { trigger: ".modal:contains('The balance is reserved by the original Square payment.') .btn-primary", run: "click" },
         ...PaymentScreen.clickValidate(),
@@ -435,7 +445,7 @@ registry.category("web_tour.tours").add("SquareTerminalLostCheckoutResponse", {
         {
             trigger: ".payment-screen .send_payment_request",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 sessionStorage.setItem("squareRecoveryOrder", order.uuid);
                 sessionStorage.setItem("squareRecoveryTender", order.payment_ids[0].uuid);
                 this.anchor.click();
@@ -444,15 +454,15 @@ registry.category("web_tour.tours").add("SquareTerminalLostCheckoutResponse", {
         },
         { trigger: ".payment-screen .electronic_status:contains('Square payment outcome needs verification')" },
         refresh(),
-        { trigger: "body:not(:has(.pos-loader))" },
-        Chrome.clickMenuOption("Orders"),
+        { trigger: "body:not(:has(.loader))" },
+        Chrome.clickOrders(),
         {
             trigger: ".ticket-screen .order-row",
             async run(helpers) {
                 const uuid = sessionStorage.getItem("squareRecoveryOrder");
                 const order = window.posmodel.models["pos.order"].getBy("uuid", uuid);
                 const rows = [...document.querySelectorAll(".ticket-screen .order-row")].filter((row) =>
-                    [...row.querySelectorAll(".col")].some((column) => column.textContent.trim() === order?.pos_reference));
+                    [...row.querySelectorAll(".order-name .text-muted")].some((column) => column.textContent.trim() === order?.pos_reference));
                 if (rows.length !== 1) {
                     throw new Error("Original Square order is missing from the native Orders screen");
                 }
@@ -470,7 +480,7 @@ registry.category("web_tour.tours").add("SquareTerminalLostCheckoutResponse", {
         {
             trigger: ".payment-screen",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 if (order.uuid !== sessionStorage.getItem("squareRecoveryOrder") ||
                     order.payment_ids[0]?.uuid !== sessionStorage.getItem("squareRecoveryTender")) {
                     throw new Error("Restore the original Square order and tender from the register");
@@ -503,7 +513,7 @@ registry.category("web_tour.tours").add("SquareTerminalSplitRecovery", {
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "5.00"),
         { trigger: ".payment-screen .send_payment_request", run: "click" },
         { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
-        { trigger: ".payment-screen .payment-status-remaining .amount:contains('7.34')" },
+        { trigger: ".payment-screen .payment-status-amount .amount:contains('7.34')" },
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "7.34"),
         { trigger: ".payment-screen .send_payment_request", run: "click" },
@@ -515,21 +525,21 @@ registry.category("web_tour.tours").add("SquareTerminalSplitRecovery", {
             trigger: ".payment-screen:has(.paymentmethod:not(.opacity-50):contains('Square Counter')) " +
                 ".electronic_status:contains('Check the original Square settlement')",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 sessionStorage.setItem("squareSplitOrder", order.uuid);
                 sessionStorage.setItem("squareSplitTenders", order.payment_ids.map((line) => line.uuid).sort().join());
             },
         },
         refresh(),
-        { trigger: "body:not(:has(.pos-loader))" },
-        Chrome.clickMenuOption("Orders"),
+        { trigger: "body:not(:has(.loader))" },
+        Chrome.clickOrders(),
         {
             trigger: ".ticket-screen .order-row",
             async run(helpers) {
                 const uuid = sessionStorage.getItem("squareSplitOrder");
                 const order = window.posmodel.models["pos.order"].getBy("uuid", uuid);
                 const rows = [...document.querySelectorAll(".ticket-screen .order-row")].filter((row) =>
-                    [...row.querySelectorAll(".col")].some((column) => column.textContent.trim() === order?.pos_reference));
+                    [...row.querySelectorAll(".order-name .text-muted")].some((column) => column.textContent.trim() === order?.pos_reference));
                 if (rows.length !== 1) {
                     throw new Error("Original Square split is missing from the native Orders screen");
                 }
@@ -539,7 +549,7 @@ registry.category("web_tour.tours").add("SquareTerminalSplitRecovery", {
         {
             trigger: ".payment-screen .square-check-status:contains('Check status')",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 if (order.uuid !== sessionStorage.getItem("squareSplitOrder") ||
                     order.payment_ids.map((line) => line.uuid).sort().join() !== sessionStorage.getItem("squareSplitTenders")) {
                     throw new Error("The register must recover the original Square split and both tenders");
@@ -565,21 +575,21 @@ registry.category("web_tour.tours").add("SquareTerminalSplitDeviceTips", {
         { trigger: ".payment-screen .send_payment_request", run: "click" },
         { trigger: ".payment-screen .electronic_status:contains('Authorized by Square')" },
         { trigger: ".payment-screen button:disabled:contains('Tip')" },
-        { trigger: ".payment-screen .payment-status-remaining .amount:contains('60.00')" },
+        { trigger: ".payment-screen .payment-status-amount .amount:contains('60.00')" },
         ...PaymentScreen.clickPaymentMethod("Square Counter"),
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "60.00"),
         { trigger: ".payment-screen .send_payment_request", run: "click" },
         {
             trigger: ".payment-screen .electronic_status:contains('Check the original Square settlement')",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 sessionStorage.setItem("squareTippedOrder", order.uuid);
                 sessionStorage.setItem("squareTippedTenders", order.payment_ids.map((line) => line.uuid).sort().join());
             },
         },
         refresh(),
-        { trigger: "body:not(:has(.pos-loader))" },
-        Chrome.clickMenuOption("Orders"),
+        { trigger: "body:not(:has(.loader))" },
+        Chrome.clickOrders(),
         {
             trigger: ".ticket-screen .order-row",
             async run(helpers) {
@@ -589,7 +599,7 @@ registry.category("web_tour.tours").add("SquareTerminalSplitDeviceTips", {
         {
             trigger: ".payment-screen .square-check-status:contains('Check status')",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 if (order.uuid !== sessionStorage.getItem("squareTippedOrder") ||
                     order.payment_ids.map((line) => line.uuid).sort().join() !==
                         sessionStorage.getItem("squareTippedTenders")) {
@@ -608,7 +618,7 @@ registry.category("web_tour.tours").add("SquareTerminalSplitDeviceTips", {
             trigger: ".pos-receipt",
             async run() {
                 const pos = window.posmodel;
-                const order = pos.get_order();
+                const order = pos.getOrder();
                 const [payment] = order.payment_ids;
                 await pos.data.call("pos.order", "square_check_payment", [order.uuid, payment.uuid]);
                 if (order.lines.filter((line) => line.product_id.display_name === "Terminal Gratuity").length !== 1) {
@@ -671,7 +681,7 @@ registry.category("web_tour.tours").add("SquareTerminalAbandonSplit", {
         ...PaymentScreen.selectedPaymentlineHas("Square Counter", "4.00"),
         { trigger: ".payment-screen .send_payment_request", run: "click" },
         { trigger: ".payment-screen .electronic_payment .electronic_status:contains('Authorized by Square')" },
-        { trigger: ".payment-screen .payment-status-remaining .amount:contains('5.34')" },
+        { trigger: ".payment-screen .payment-status-amount .amount:contains('5.34')" },
         { trigger: ".payment-screen .square-cancel-payment:contains('Abandon split')", run: "click" },
         { trigger: ".payment-screen .electronic_status:contains('Waiting for Square to confirm cancellation')" },
         ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
@@ -700,13 +710,13 @@ registry.category("web_tour.tours").add("SquareTerminalCloseWithUncertainPayment
         {
             trigger: ".modal-body:contains('Square payment'):contains('12.34'):contains('PENDING')",
             run() {
-                if (!this.anchor.textContent.includes(window.posmodel.get_order().pos_reference)) {
+                if (!this.anchor.textContent.includes(window.posmodel.getOrder().pos_reference)) {
                     throw new Error("Register close must identify the original order");
                 }
             },
         },
         { trigger: ".modal:not(.o_inactive_modal) .modal-footer .btn-primary", run: "click" },
-        { trigger: ".pos-topheader .list-plus-btn", run: "click" },
+        Chrome.createFloatingOrder(),
         ...ProductScreen.addOrderline("Monitor Stand"),
         ...ProductScreen.clickPayButton(),
         ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
@@ -726,7 +736,7 @@ registry.category("web_tour.tours").add("SquareTerminalInvoiceCustomer", {
         {
             trigger: ".payment-screen .send_payment_request",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 sessionStorage.setItem("squareInvoiceOrder", order.uuid);
                 sessionStorage.setItem("squareInvoiceTender", order.payment_ids[0].uuid);
                 this.anchor.click();
@@ -738,17 +748,17 @@ registry.category("web_tour.tours").add("SquareTerminalInvoiceCustomer", {
         },
         { trigger: ".payment-screen .electronic_status:contains('Payment Successful')" },
         refresh(),
-        { trigger: "body:not(:has(.pos-loader))" },
+        { trigger: "body:not(:has(.loader))" },
         {
             trigger: ".modal:contains('Please select the Customer') .modal-footer .btn-primary",
             run() {
-                const order = window.posmodel.get_order();
+                const order = window.posmodel.getOrder();
                 const [tender] = order.payment_ids;
                 if (
                     order.uuid !== sessionStorage.getItem("squareInvoiceOrder") ||
                     tender.uuid !== sessionStorage.getItem("squareInvoiceTender") ||
                     tender.transaction_id !== "SQUAREPAYMENT" ||
-                    order.get_partner()
+                    order.getPartner()
                 ) {
                     throw new Error("The native prompt must finish the original verified invoice payment");
                 }

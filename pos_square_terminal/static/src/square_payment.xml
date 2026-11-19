@@ -41,5 +41,8 @@
         <xpath expr="//button[@t-on-click='addTip']" position="attributes">
             <attribute name="t-att-disabled">this.squarePaymentReserved</attribute>
         </xpath>
+        <xpath expr="//button[@t-on-click='toggleShippingDatePicker']" position="attributes">
+            <attribute name="t-att-disabled">this.squarePaymentReserved</attribute>
+        </xpath>
     </t>
 </templates>

@@ -13,6 +13,7 @@ class PosOrderLine(models.Model):
         'order_id', 'uuid', 'product_id', 'qty', 'price_unit', 'price_subtotal', 'price_subtotal_incl',
         'discount', 'tax_ids', 'price_extra', 'price_type', 'refunded_orderline_id', 'combo_parent_id',
         'combo_item_id', 'combo_line_ids', 'attribute_value_ids', 'custom_attribute_value_ids', 'pack_lot_ids',
+        'extra_tax_data',
     }
 
     @api.model_create_multi
@@ -35,7 +36,6 @@ class PosOrderLine(models.Model):
             'price_subtotal_incl': amount,
             'price_type': 'manual',
             'full_product_name': product.display_name,
-            'skip_change': True,
             'uuid': str(uuid4()),
         })
 

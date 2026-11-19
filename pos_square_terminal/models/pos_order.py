@@ -494,7 +494,7 @@ class PosOrder(models.Model):
         account_tax = self.env['account.tax']
         price_digits = self.env['decimal.precision'].precision_get('Product Price')
         pricelist = pricelist.with_company(self.company_id)
-        can_edit_price = not config.restrict_price_control or config.group_pos_manager_id in self.env.user.groups_id
+        can_edit_price = not config.restrict_price_control or config.group_pos_manager_id in self.env.user.all_group_ids
         discount_lines = self.env['pos.order.line']
         if 'discount_product_id' in config._fields and config.module_pos_discount and config.discount_product_id:
             discount_lines = self.lines.filtered(lambda line: line.product_id == config.discount_product_id)
@@ -510,10 +510,16 @@ class PosOrder(models.Model):
                 raise UserError(_("The Odoo tip differs from the recorded tip line."))
         combo_prices = self._square_combo_prices(pricelist, digits)
         unit_prices = {}
+        manual_tax_fields = {'manual_tax_amounts', 'manual_total_excluded', 'manual_total_excluded_currency'}
         for line in self.lines:
             product = line.product_id
             taxes = product.taxes_id._filter_taxes_by_company(self.company_id)
             global_discount = line in discount_lines
+            if line.extra_tax_data and (
+                not isinstance(line.extra_tax_data, dict)
+                or manual_tax_fields.intersection(line.extra_tax_data)
+            ):
+                raise UserError(_("Square Terminal cannot verify a basket with manual tax overrides."))
             if (
                 not all(isfinite(value) for value in (line.qty, line.price_unit, line.discount))
                 or line.qty <= 0 or (line.price_unit < 0 and not global_discount) or not 0 <= line.discount <= 100
