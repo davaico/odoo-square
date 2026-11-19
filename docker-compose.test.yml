@@ -36,6 +36,7 @@ services:
       - ./config/odoo.conf:/etc/odoo/odoo.conf:ro
       - ./odoo_square:/mnt/extra-addons/odoo_square:ro
       - ./payment_square_online:/mnt/extra-addons/payment_square_online:ro
+      - ./pos_square_terminal:/mnt/extra-addons/pos_square_terminal:ro
     command:
       - odoo
       - --database=${DB_NAME:-odoo_square_v18_test}
