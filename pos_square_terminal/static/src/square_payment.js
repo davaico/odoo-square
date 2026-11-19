@@ -1,16 +1,15 @@
 import { useEffect } from "@odoo/owl";
 import { AlertDialog } from "@web/core/confirmation_dialog/confirmation_dialog";
 import { _t } from "@web/core/l10n/translation";
-import { RPCError } from "@web/core/network/rpc";
-import { roundPrecision } from "@web/core/utils/numbers";
+import { ConnectionLostError, RPCError } from "@web/core/network/rpc";
 import { patch } from "@web/core/utils/patch";
-import { PaymentInterface } from "@point_of_sale/app/payment/payment_interface";
+import { PaymentInterface } from "@point_of_sale/app/utils/payment/payment_interface";
 import { PosOrder } from "@point_of_sale/app/models/pos_order";
 import { PosPayment } from "@point_of_sale/app/models/pos_payment";
 import { PaymentScreen } from "@point_of_sale/app/screens/payment_screen/payment_screen";
 import { PaymentScreenPaymentLines } from "@point_of_sale/app/screens/payment_screen/payment_lines/payment_lines";
-import { PaymentScreenStatus } from "@point_of_sale/app/screens/payment_screen/payment_status/payment_status";
-import { PosStore, register_payment_method } from "@point_of_sale/app/store/pos_store";
+import { PosStore, register_payment_method } from "@point_of_sale/app/services/pos_store";
+import OrderPaymentValidation from "@point_of_sale/app/utils/order_payment_validation";
 
 const PAID_STATES = ["paid", "done", "invoiced"];
 const squareRequestsInProgress = new Set();
@@ -25,7 +24,7 @@ function isSquarePayment(line) {
 
 function isReservedSquarePayment(line) {
     return isSquarePayment(line) && line.square_attempt_state !== "cancelled" && (
-        Boolean(line.square_attempt_state) || ["waiting", "done"].includes(line.get_payment_status())
+        Boolean(line.square_attempt_state) || ["waiting", "done"].includes(line.getPaymentStatus())
     );
 }
 
@@ -42,7 +41,7 @@ function showSquareMessage(dialog, body) {
 }
 
 class SquarePayment extends PaymentInterface {
-    get fast_payments() {
+    get fastPayments() {
         return false;
     }
 
@@ -53,8 +52,9 @@ class SquarePayment extends PaymentInterface {
         );
         if (status.device_tip_line) {
             const data = await this.pos.data.missingRecursive({ "pos.order.line": [status.device_tip_line] });
-            this.pos.models.loadData(data);
+            this.pos.models.connectNewData(data);
             order.update({ is_tipped: true, tip_amount: status.device_tip_line.price_subtotal_incl });
+            order.triggerRecomputeAllPrices();
         }
         let cancelled = false;
         for (const tender of [...order.payment_ids]) {
@@ -71,7 +71,7 @@ class SquarePayment extends PaymentInterface {
             }
             if (result.state === "cancelled") {
                 tender.update({ square_attempt_state: "cancelled" });
-                order.remove_paymentline(tender);
+                order.removePaymentline(tender);
                 cancelled = true;
             } else if (result.state === "busy" || result.state === "unstarted") {
                 tender.update({ square_attempt_state: false, square_attempt_reference: false, payment_status: "pending" });
@@ -130,8 +130,8 @@ class SquarePayment extends PaymentInterface {
         }
     }
 
-    async send_payment_request(uuid) {
-        const order = this.pos.get_order();
+    async sendPaymentRequest(uuid) {
+        const order = this.pos.getOrder();
         let line = order.payment_ids.find((line) => line.uuid === uuid);
         const originalState = line.square_attempt_state;
         let preparing = !originalState;
@@ -146,7 +146,7 @@ class SquarePayment extends PaymentInterface {
                 const savedOrder = synced?.find((record) => record.uuid === order.uuid && record.state === "draft");
                 const savedLine = savedOrder?.payment_ids.find((line) => line.uuid === uuid);
                 if (!savedLine || typeof savedLine.id !== "number") {
-                    line.set_payment_status("pending");
+                    line.setPaymentStatus("pending");
                     showSquareMessage(this.env.services.dialog, _t("Save the sale before sending it to Square Terminal."));
                     return false;
                 }
@@ -183,7 +183,7 @@ class SquarePayment extends PaymentInterface {
         } catch (error) {
             if (error instanceof RPCError) {
                 if (preparing && !line.square_attempt_state) {
-                    line.set_payment_status("pending");
+                    line.setPaymentStatus("pending");
                 }
                 showSquareMessage(this.env.services.dialog, error.data?.message || error.message);
             } else if (!["verified", "cancelled", "authorized", "recording_cash", "settling"].includes(line.square_attempt_state)) {
@@ -197,10 +197,13 @@ class SquarePayment extends PaymentInterface {
 register_payment_method("square_terminal", SquarePayment);
 
 patch(PosPayment.prototype, {
-    set_amount() {
+    setAmount() {
         if (!isReservedSquareTender(this)) {
-            return super.set_amount(...arguments);
+            return super.setAmount(...arguments);
         }
+    },
+    isForceDoneAllowed() {
+        return !isSquarePayment(this) && super.isForceDoneAllowed(...arguments);
     },
     async pay() {
         if (!isSquarePayment(this)) {
@@ -209,8 +212,8 @@ patch(PosPayment.prototype, {
         if (isReservedSquarePayment(this) && !EXPLICIT_SEND_STATES.includes(this.square_attempt_state)) {
             return this.payment_method_id.payment_terminal.checkPayment(this);
         }
-        this.set_payment_status("waiting");
-        return this.payment_method_id.payment_terminal.send_payment_request(this.uuid);
+        this.setPaymentStatus("waiting");
+        return this.payment_method_id.payment_terminal.sendPaymentRequest(this.uuid);
     },
 });
 
@@ -219,13 +222,13 @@ patch(PosOrder.prototype, {
         return (method?.use_payment_terminal === "square_terminal" || isNativeCashMethod(method)) &&
             this.payment_ids.every((line) =>
                 line.square_attempt_state === "authorized" || isNativeCashMethod(line.payment_method_id)
-            ) && this.get_due() > 0;
+            ) && this.remainingDue > 0;
     },
     squareCanSettleWithCash() {
         return Boolean(this.squareAuthorizedAmount) &&
             this.payment_ids.every((line) =>
                 line.square_attempt_state === "authorized" || isNativeCashMethod(line.payment_method_id)
-            ) && this.payment_ids.some((line) => isNativeCashMethod(line.payment_method_id)) && this.get_due() === 0;
+            ) && this.payment_ids.some((line) => isNativeCashMethod(line.payment_method_id)) && this.remainingDue === 0;
     },
     canBeValidated() {
         return super.canBeValidated(...arguments) || this.squareCanSettleWithCash();
@@ -235,54 +238,55 @@ patch(PosOrder.prototype, {
             (total, line) => total + (line.square_attempt_state === "authorized" ? line.amount : 0), 0
         );
     },
-    get_due() {
-        const due = super.get_due(...arguments);
-        const authorized = this.squareAuthorizedAmount;
-        return authorized ? roundPrecision(due - authorized, this.currency.rounding) : due;
+    get remainingDue() {
+        const due = super.remainingDue;
+        return this.squareAuthorizedAmount
+            ? Math.max(this.currency.round(due - this.squareAuthorizedAmount), 0)
+            : due;
     },
-    recomputeOrderData() {
-        super.recomputeOrderData(...arguments);
-        if (this.payment_ids.some(isReservedSquarePayment)) {
-            this.amount_return = Math.max(this.amount_return, 0);
-        }
+    isPaid() {
+        // An authorization reduces the remaining share without validating the sale.
+        return this.squareAuthorizedAmount ? this.currency.isZero(super.remainingDue) : super.isPaid();
     },
-    getDefaultAmountDueToPayIn() {
-        return super.getDefaultAmountDueToPayIn(...arguments) - this.squareAuthorizedAmount;
-    },
-    electronic_payment_in_progress() {
+    electronicPaymentInProgress() {
         if (!this.squareAuthorizedAmount) {
-            return super.electronic_payment_in_progress(...arguments);
+            return super.electronicPaymentInProgress(...arguments);
         }
         return this.payment_ids.some((line) =>
             line.square_attempt_state !== "authorized" &&
             line.payment_status && !["done", "reversed"].includes(line.payment_status)
         );
     },
-    add_paymentline(method) {
+    addPaymentline(method) {
         if (this.payment_ids.some(isReservedSquarePayment) && !this.squareCanAddShare(method)) {
-            return false;
+            return { status: false, data: _t("The balance is reserved by the original Square payment.") };
         }
-        return super.add_paymentline(...arguments);
+        return super.addPaymentline(...arguments);
     },
-    remove_paymentline(line) {
+    removePaymentline(line) {
         if (!isReservedSquareTender(line)) {
-            return super.remove_paymentline(...arguments);
+            return super.removePaymentline(...arguments);
         }
     },
-    stop_electronic_payment() {
+    setPartner(partner) {
         if (!this.payment_ids.some(isReservedSquarePayment)) {
-            return super.stop_electronic_payment(...arguments);
+            return super.setPartner(...arguments);
+        }
+        this.assertEditable();
+        this.partner_id = partner;
+        if (partner?.is_company) {
+            this.setToInvoice(true);
         }
     },
 });
 
 patch(PosStore.prototype, {
-    showScreen(name, props) {
-        const order = this.get_order();
+    navigate(name, params = {}) {
+        const order = params.orderUuid && this.models["pos.order"].getBy("uuid", params.orderUuid);
         if (name === "ProductScreen" && order?.state === "draft" && order.payment_ids.some(isReservedSquarePayment)) {
-            return super.showScreen("PaymentScreen", { orderUuid: order.uuid });
+            return super.navigate("PaymentScreen", { orderUuid: order.uuid });
         }
-        return super.showScreen(name, props);
+        return super.navigate(...arguments);
     },
 });
 
@@ -294,19 +298,19 @@ patch(PaymentScreen.prototype, {
                 const order = this.currentOrder;
                 if (
                     this.pos.config.auto_validate_terminal_payment &&
-                    this.pos.get_order()?.uuid === order?.uuid &&
-                    order?.state === "draft" && order.is_paid() &&
+                    this.pos.getOrder()?.uuid === order?.uuid &&
+                    order?.state === "draft" && order.isPaid() &&
                     order.payment_ids.some((line) => line.square_attempt_state === "verified")
                 ) {
                     this.validateOrder(false);
                 }
             },
-            () => [this.currentOrder?.uuid, this.currentOrder?.get_partner()?.id, this.currentOrder?.to_invoice]
+            () => [this.currentOrder?.uuid, this.currentOrder?.getPartner()?.id, this.currentOrder?.to_invoice]
         );
     },
     onMounted() {
         for (const line of this.paymentLines.filter((line) => line.square_attempt_state === "cancelled")) {
-            this.currentOrder.remove_paymentline(line);
+            this.currentOrder.removePaymentline(line);
         }
         super.onMounted(...arguments);
         if (!this.selectedPaymentLine) {
@@ -343,8 +347,8 @@ patch(PaymentScreen.prototype, {
     },
     async validateOrder() {
         if (this.squarePaymentReserved && (
-            this.pos.get_order()?.uuid !== this.currentOrder.uuid ||
-            this.pos.mainScreen.component !== this.constructor
+            this.pos.getOrder()?.uuid !== this.currentOrder.uuid ||
+            this.pos.router.state.current !== "PaymentScreen"
         )) {
             return;
         }
@@ -378,22 +382,6 @@ patch(PaymentScreen.prototype, {
         }
         return super.validateOrder(...arguments);
     },
-    async _finalizeValidation() {
-        const order = this.currentOrder;
-        const hasSquare = this.squarePaymentReserved;
-        const result = await super._finalizeValidation(...arguments);
-        if (hasSquare && order.state === "paid" && !PAID_STATES.includes(order.raw.state)) {
-            order.state = "draft";
-            showSquareMessage(this.dialog, _t("Square verified payment. Validate the original sale once the register is online."));
-        }
-        return result;
-    },
-    async afterOrderValidation(synced) {
-        if (this.squarePaymentReserved && (!synced || !PAID_STATES.includes(this.currentOrder.raw.state))) {
-            return;
-        }
-        return super.afterOrderValidation(...arguments);
-    },
     async sendPaymentRequest(line) {
         if (!isSquarePayment(line)) {
             return super.sendPaymentRequest(...arguments);
@@ -425,8 +413,8 @@ patch(PaymentScreen.prototype, {
             const status = await line.payment_method_id.payment_terminal.cancelPayment(line);
             if (
                 status?.state === "verified" &&
-                this.pos.get_order()?.uuid === line.pos_order_id.uuid &&
-                this.currentOrder.is_paid() &&
+                this.pos.getOrder()?.uuid === line.pos_order_id.uuid &&
+                this.currentOrder.isPaid() &&
                 this.pos.config.auto_validate_terminal_payment
             ) {
                 this.validateOrder(false);
@@ -442,12 +430,40 @@ patch(PaymentScreen.prototype, {
     },
 });
 
-patch(PaymentScreenStatus.prototype, {
-    get remainingText() {
-        if (this.props.order.squareAuthorizedAmount) {
-            return this.env.utils.formatCurrency(this.props.order.get_due());
+patch(OrderPaymentValidation.prototype, {
+    async shouldHideValidationBehindFeedbackScreen() {
+        if (!this.order.payment_ids.some(isReservedSquarePayment)) {
+            return super.shouldHideValidationBehindFeedbackScreen(...arguments);
         }
-        return super.remainingText;
+        const nextPage = this.nextPage;
+        const ui = this.pos.env.services.ui;
+        try {
+            ui.block();
+            await this.finalizeValidation();
+            if (!PAID_STATES.includes(this.order.raw.state)) {
+                this.order.state = "draft";
+                this.pos.data.localUnsyncedPaidOrderUuids.delete(this.order.uuid);
+                return false;
+            }
+        } finally {
+            ui.unblock();
+        }
+        this.pos.navigate(nextPage.page, nextPage.params);
+    },
+    handleValidationError(error) {
+        if (error instanceof ConnectionLostError && this.order.payment_ids.some(isReservedSquarePayment)) {
+            this.order.state = "draft";
+            this.pos.data.localUnsyncedPaidOrderUuids.delete(this.order.uuid);
+            showSquareMessage(this.pos.dialog, _t("Square verified payment. Validate the original sale once the register is online."));
+            return error;
+        }
+        return super.handleValidationError(...arguments);
+    },
+    async afterOrderValidation() {
+        if (this.order.payment_ids.some(isReservedSquarePayment) && !PAID_STATES.includes(this.order.raw.state)) {
+            return;
+        }
+        return super.afterOrderValidation(...arguments);
     },
 });
 
