@@ -94,6 +94,10 @@ class SquareOrderProcessor(models.Model):
         # 1. Extract event and order IDs
         # Event ID comes from the webhook root level, passed as parameter
         order_id = order_data.get("order_id") if order_data else None
+        receipts = self.env["square.event.receipt"].sudo()
+        operation = f"order.{event_type}"
+        if receipts._was_applied(operation, order_id, event_id):
+            return {"status": "already_processed", "event_id": event_id}
 
         # A manual resync supplies the full order it retrieved with this configuration.
         if order_id:
@@ -106,10 +110,6 @@ class SquareOrderProcessor(models.Model):
                 return result
 
         order_state = order_data.get("state") if order_data else None
-        receipts = self.env["square.event.receipt"].sudo()
-        operation = f"order.{event_type}"
-        if receipts._was_applied(operation, order_id, event_id):
-            return {"status": "already_processed", "event_id": event_id}
 
         # 3. Process the order based on event type with transaction isolation
         bot_user = None
@@ -980,6 +980,10 @@ class SquareOrderProcessor(models.Model):
                     "message": f"Payment status {payment_status} not processed",
                 }
 
+            receipts = self.env["square.event.receipt"].sudo()
+            if receipts._was_applied("payment.updated", payment_id, webhook_event_id):
+                return {"status": "already_processed", "payment_id": payment_id}
+
             routing = self._square_online_event_result(
                 order_id=order_id, payment_id=payment_id, location_id=payment_data.get("location_id"),
                 merchant_id=merchant_id, environment=environment,
@@ -990,10 +994,6 @@ class SquareOrderProcessor(models.Model):
             terminal_payment = self._square_terminal_payment_result(payment_data, config)
             if terminal_payment and terminal_payment["status"] == "ignored":
                 return terminal_payment
-
-            receipts = self.env["square.event.receipt"].sudo()
-            if receipts._was_applied("payment.updated", payment_id, webhook_event_id):
-                return {"status": "already_processed", "payment_id": payment_id}
 
             # Fetch full order details from Square API to check for exchanges
             api_client = self.env["square.api.client"].sudo()

@@ -422,6 +422,61 @@ class TestSquareTerminalImport(TestPointOfSaleHttpCommon):
         self.assertEqual(self.env['square.refund'].search_count([]), refund_count)
         self.assertFalse(self.env['sale.order'].search_count([('square_order_id', '=', return_order['id'])]))
 
+    def test_signed_register_events_acknowledge_applied_replays_during_square_outage(self):
+        odoo_order = self._cashier_order()
+        terminal_order = self._register_square_sale('TERMINAL-ORDER')
+        square_order = self._register_square_sale('REGISTER-ORDER')
+        payment_id = 'REGISTER-ORDER-PAYMENT'
+        payment = self.resources[f'/v2/payments/{payment_id}']['payment']
+        refund = {
+            'id': 'REGISTER-REFUND', 'status': 'PENDING', 'amount_money': self.money(1000),
+            'order_id': square_order['id'], 'payment_id': payment_id, 'location_id': 'SHOP',
+        }
+        self.resources['/v2/refunds/REGISTER-REFUND'] = {'refund': refund}
+        tenders = square_order.pop('tenders')
+        order_notice = square_order.copy()
+        with self._terminal_provider(terminal_order):
+            self._cashier_checkout(odoo_order)
+
+        with patch('odoo.addons.odoo_square.models.square_api_client.requests.get', side_effect=self._import_lookup):
+            response = self._event('order.created', 'register-order', order_notice)
+            self.assertEqual(response.json()['status'], 'success', response.text)
+            sale = self.env['sale.order'].search([('square_order_id', '=', square_order['id'])])
+            self.assertEqual(sale.invoice_ids.amount_residual, 44)
+
+            square_order['tenders'] = tenders
+            response = self._event('payment.updated', 'register-payment', payment)
+            self.assertEqual(response.json()['status'], 'success', response.text)
+            self.assertEqual(sale.invoice_ids.reconciled_payment_ids.amount, 44)
+            response = self._event('refund.created', 'register-refund', refund)
+            self.assertEqual(response.json()['status'], 'success', response.text)
+            self.assertEqual(sale.square_refund_ids.refund_amount, 10)
+
+        with patch('odoo.addons.odoo_square.models.square_api_client.requests.get', side_effect=Timeout):
+            events = (
+                ('order.created', 'register-order', order_notice),
+                ('payment.updated', 'register-payment', payment),
+                ('refund.created', 'register-refund', refund),
+            )
+            for event, event_id, body in events:
+                with self.subTest(event=event):
+                    response = self._event(event, event_id, body)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json()['status'], 'already_processed', response.text)
+
+            for event, event_id, body in (
+                ('order.updated', 'register-order', order_notice),
+                ('order.created', 'register-order', {**order_notice, 'id': 'ANOTHER-ORDER'}),
+                ('payment.updated', 'new-payment-event', payment),
+                ('refund.created', 'new-event', refund),
+            ):
+                with self.subTest(event=event, event_id=event_id, body=body):
+                    response = self._event(event, event_id, body)
+                    self.assertEqual(response.status_code, 503, response.text)
+
+        self.assertEqual(len(sale.invoice_ids.reconciled_payment_ids), 1)
+        self.assertEqual(len(sale.square_refund_ids), 1)
+
     def test_manual_resync_defers_only_the_order_with_ambiguous_ownership(self):
         odoo_order = self._cashier_order()
         terminal_order = self._register_square_sale('TERMINAL-ORDER')
