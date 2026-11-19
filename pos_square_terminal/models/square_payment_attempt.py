@@ -22,7 +22,7 @@ class SquarePaymentAttempt(models.Model):
     merchant_id = fields.Char(related='square_order_link_id.merchant_id', store=True)
     square_location_id = fields.Char(related='square_order_link_id.square_location_id', store=True)
     currency_code = fields.Char(related='square_order_link_id.currency_code', store=True)
-    payment_id = fields.Many2one('pos.payment', required=True, ondelete='restrict', index=True)
+    payment_id = fields.Many2one('pos.payment', ondelete='set null', index=True)
     payment_uuid = fields.Char(required=True)
     payment_method_id = fields.Many2one('pos.payment.method', required=True, ondelete='restrict')
     terminal_id = fields.Many2one('pos.square.terminal', required=True, ondelete='restrict')
@@ -110,25 +110,57 @@ class SquarePaymentAttempt(models.Model):
         except (SquareAPIError, UserError, ValueError):
             self.state = 'uncertain'
 
-    def _refresh(self):
+    def _refresh(self, *, recheck_failed=False):
         self.ensure_one()
-        if self.state not in ('dispatching', 'pending', 'declined', 'uncertain', 'timed_out'):
+        if self.square_order_link_id.cancelled or (
+            self.state not in ('dispatching', 'pending', 'declined', 'uncertain', 'timed_out')
+            and not (recheck_failed and self.state == 'failed' and self.square_checkout_id)
+        ):
             return
         try:
             self._check_provider_scope()
             if self.square_checkout_id:
                 path = '/v2/terminals/checkouts/' + quote(self.square_checkout_id, safe='')
                 checkout = self.connection_id._request('GET', path).get('checkout')
-                self._observe_checkout(checkout, authoritative=True)
+                return self._observe_checkout(checkout, authoritative=True)
             elif self.square_order_link_id.square_order_id:
                 checkout = self._find_original_checkout()
                 if checkout is not None:
-                    self._observe_checkout(checkout, authoritative=True)
+                    return self._observe_checkout(checkout, authoritative=True)
         except (SquareAPIError, UserError, ValueError):
             # A read can race the cashier's dispatch RPC. Only that RPC can
             # mark the first submission attempt as uncertain.
-            if self.state != 'dispatching':
+            if self.state not in ('dispatching', 'failed'):
                 self.state = 'uncertain'
+
+    def _cancel_checkout(self):
+        self.ensure_one()
+        if self.state == 'prepared':
+            # Resolve an Order create whose response may have been lost with the original key.
+            self._create_square_order()
+        if self.state == 'ready':
+            self.state = 'failed'
+            return
+        payment_status = self._refresh(recheck_failed=True)
+        if (
+            self.state in ('pending', 'declined', 'uncertain')
+            and self.square_checkout_id
+            and self.provider_status in ('PENDING', 'IN_PROGRESS')
+        ):
+            path = '/v2/terminals/checkouts/' + quote(self.square_checkout_id, safe='') + '/cancel'
+            payment_status = self._request_cancellation(path)
+        if payment_status == 'APPROVED' and self.provider_status in ('COMPLETED', 'CANCELED'):
+            path = '/v2/payments/' + quote(self.square_payment_id, safe='') + '/cancel'
+            self._request_cancellation(path)
+
+    def _request_cancellation(self, path):
+        try:
+            self._check_provider_scope()
+            self.connection_id._request('POST', path)
+        except (SquareAPIError, UserError):
+            pass
+        # The cancellation acknowledgment may race a completed card payment.
+        return self._refresh()
 
     def _find_original_checkout(self):
         self.ensure_one()
@@ -201,8 +233,8 @@ class SquarePaymentAttempt(models.Model):
         final = status == 'COMPLETED' or safe_cancellation
         payment_id = ids[0] if ids else self.square_payment_id
         if payment_id:
-            self._verify_payment(payment_id, final=final)
-        elif safe_cancellation:
+            return self._verify_payment(payment_id, final=final)
+        if safe_cancellation:
             self.state = 'failed'
 
     def _verify_payment(self, payment_id, *, final):
@@ -236,11 +268,21 @@ class SquarePaymentAttempt(models.Model):
                 self.write({'square_payment_id': payment_id, 'state': 'failed'})
             elif self.provider_status in ('PENDING', 'IN_PROGRESS'):
                 self.state = 'declined'
+        return status
+
+    def _cashier_state(self):
+        self.ensure_one()
+        if self.state != 'verified':
+            if self.square_order_link_id.cancelled:
+                return 'cancelled'
+            if self.square_order_link_id.cancel_requested:
+                return 'canceling'
+        return self.state
 
     def _cashier_status(self):
         self.ensure_one()
         return {
-            'state': self.state,
+            'state': self._cashier_state(),
             'reference': self.reference,
             'payment_id': self.square_payment_id if self.state == 'verified' else False,
         }

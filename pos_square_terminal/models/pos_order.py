@@ -56,10 +56,10 @@ class PosOrder(models.Model):
     def square_prepare_payment(self, order_uuid, payment_uuid):
         order, payment = self._square_checkout_records(order_uuid, payment_uuid)
         order._square_lock_checkout(touch=True)
-        attempts = order._square_attempts()
-        attempt = attempts.filtered(lambda candidate: candidate.payment_id.id == payment.id)[-1:]
+        attempt = order._square_attempts().filtered(lambda candidate: candidate.payment_uuid == payment.uuid)[-1:]
         if attempt:
             return attempt._cashier_status()
+        attempts = order._square_reserved_attempts()
         order._square_check_session()
         if (
             order.state != 'draft' or attempts or order.payment_ids != payment
@@ -159,20 +159,21 @@ class PosOrder(models.Model):
     @api.model
     def square_prepare_linked_order(self, order_uuid, payment_uuid):
         attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
-        attempt._create_square_order()
+        if not attempt.square_order_link_id.cancel_requested:
+            attempt._create_square_order()
         return attempt._cashier_status()
 
     @api.model
     def square_mark_dispatching(self, order_uuid, payment_uuid, attempt_reference):
         attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
-        if attempt.reference == attempt_reference and attempt.state == 'ready':
+        if attempt.reference == attempt_reference and attempt._cashier_state() == 'ready':
             attempt.state = 'dispatching'
         return attempt._cashier_status()
 
     @api.model
     def square_dispatch_payment(self, order_uuid, payment_uuid, attempt_reference=None):
         attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
-        if attempt.reference == attempt_reference:
+        if attempt.reference == attempt_reference and attempt._cashier_state() == 'dispatching':
             attempt._dispatch()
         return attempt._cashier_status()
 
@@ -181,7 +182,7 @@ class PosOrder(models.Model):
         order, payment = self._square_checkout_records(order_uuid, payment_uuid)
         order._square_lock_checkout(touch=True)
         previous = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
-        if previous.reference != attempt_reference or previous.state != 'failed':
+        if previous.reference != attempt_reference or previous._cashier_state() != 'failed':
             return previous._cashier_status()
 
         order._square_check_session()
@@ -234,8 +235,40 @@ class PosOrder(models.Model):
         attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=False, allow_missing=True)
         if not attempt:
             return {'state': 'unstarted'}
-        attempt._refresh()
+        if attempt._cashier_state() == 'canceling':
+            attempt.order_id._square_finish_cancellation(attempt)
+        else:
+            attempt._refresh()
         return attempt._cashier_status()
+
+    @api.model
+    def square_cancel_payment(self, order_uuid, payment_uuid, attempt_reference):
+        attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=True)
+        if attempt.reference == attempt_reference and attempt._cashier_state() not in ('verified', 'cancelled'):
+            attempt.order_id.with_user(self.env.user)._square_check_session()
+            attempt.square_order_link_id.cancel_requested = True
+            attempt.order_id._square_finish_cancellation(attempt, request=True)
+        return attempt._cashier_status()
+
+    def _square_finish_cancellation(self, attempt, *, request=False):
+        link = attempt.square_order_link_id
+        if request:
+            attempt._cancel_checkout()
+        else:
+            attempt._refresh(recheck_failed=True)
+        related_attempts = self._square_reserved_attempts().filtered(
+            lambda candidate: candidate.square_order_link_id == link,
+        )
+        if any(candidate.state not in ('failed', 'blocked') for candidate in related_attempts):
+            return
+        try:
+            attempt._check_provider_scope()
+        except UserError:
+            return
+        released_payment_ids = related_attempts.filtered('square_payment_id').mapped('square_payment_id')
+        link._cancel_unpaid_order(released_payment_ids, request=request)
+        if link.cancelled:
+            self._square_lock_checkout(touch=True)
 
     @api.model
     def _square_checkout_records(self, order_uuid, payment_uuid):
@@ -267,7 +300,7 @@ class PosOrder(models.Model):
         self.env.cr.execute(
             'SELECT id FROM pos_square_payment_attempt WHERE id = %s FOR NO KEY UPDATE', [attempt.id],
         )
-        if must_be_open and attempt.state in ('prepared', 'ready', 'dispatching'):
+        if must_be_open and attempt._cashier_state() in ('prepared', 'ready', 'dispatching'):
             order._square_check_session()
             order._square_check_reserved_amounts(attempt)
         return attempt
@@ -575,6 +608,9 @@ class PosOrder(models.Model):
     def _square_attempts(self):
         return self.env['pos.square.payment.attempt'].sudo().search([('order_id', 'in', self.ids)], order='id')
 
+    def _square_reserved_attempts(self):
+        return self._square_attempts().filtered(lambda attempt: not attempt.square_order_link_id.cancelled)
+
     def _square_lock_checkout(self, *, touch=False):
         if not self.ids:
             return
@@ -603,7 +639,7 @@ class PosOrder(models.Model):
             raise UserError(_("The Odoo sale differs from the reserved Square payment."))
 
     def _square_require_verified(self):
-        attempts = self._square_attempts()
+        attempts = self._square_reserved_attempts()
         for order in self:
             order_attempts = attempts.filtered(lambda attempt: attempt.order_id.id == order.id)
             if not order_attempts and not any(p.payment_method_id.use_payment_terminal == 'square_terminal' for p in order.payment_ids):
@@ -621,7 +657,7 @@ class PosOrder(models.Model):
             self._square_lock_checkout()
             self._square_require_verified()
         result = super()._process_saved_order(draft)
-        if not draft and self._square_attempts() and self.state not in PAID_STATES:
+        if not draft and self._square_reserved_attempts() and self.state not in PAID_STATES:
             raise UserError(_("Odoo could not complete the verified Square sale."))
         return result
 
@@ -637,7 +673,7 @@ class PosOrder(models.Model):
         if changes or payment_change or 'lines' in vals:
             self.check_access('write')
             self._square_lock_checkout()
-            for order in self._square_attempts().order_id:
+            for order in self._square_reserved_attempts().order_id:
                 if (
                     any(not same_value(order, field, vals[field]) for field in changes)
                     or not order._square_same_children(vals, 'lines')

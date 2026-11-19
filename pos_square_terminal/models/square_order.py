@@ -1,7 +1,12 @@
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
+from urllib.parse import quote
+from uuid import NAMESPACE_URL, uuid5
 
-from odoo import fields, models
+from odoo import api, fields, models
+from odoo.exceptions import UserError
+
+from ..square_api import SquareAPIError
 
 
 def matches_money(value, amount, currency):
@@ -40,13 +45,21 @@ class SquareOrder(models.Model):
     pricing_snapshot = fields.Json(copy=False)
     pricing_issue = fields.Char(copy=False)
     square_order_id = fields.Char(index='btree_not_null', copy=False)
+    cancel_requested = fields.Boolean(copy=False)
+    cancelled = fields.Boolean(copy=False)
+    active_order_key = fields.Char(compute='_compute_active_order_key', store=True)
 
     _sql_constraints = [
-        ('order_unique', 'unique(order_id)', 'An Odoo POS order can have only one Square order.'),
+        ('order_unique', 'unique(order_id, active_order_key)', 'An Odoo POS order can have only one active Square order.'),
         ('reference_unique', 'unique(reference)', 'The Square order reference already exists.'),
         ('square_order_unique', 'unique(environment, merchant_id, square_order_id)',
          'This Square order already belongs to another Odoo sale.'),
     ]
+
+    @api.depends('cancelled')
+    def _compute_active_order_key(self):
+        for link in self:
+            link.active_order_key = False if link.cancelled else 'active'
 
     def _preview_square_order(self):
         self.ensure_one()
@@ -155,3 +168,45 @@ class SquareOrder(models.Model):
             unit['precision'] == requested['precision'] and isinstance(measurement, dict)
             and measurement.get('custom_unit') == requested['measurement_unit']['custom_unit']
         )
+
+    def _cancel_unpaid_order(self, released_payment_ids, *, request):
+        self.ensure_one()
+        if not self.square_order_id:
+            self.cancelled = True
+            return
+
+        path = '/v2/orders/' + quote(self.square_order_id, safe='')
+        try:
+            order = self._read_unpaid_order(path, released_payment_ids)
+            if request and order and order['state'] == 'OPEN':
+                version = order.get('version')
+                if type(version) is not int or version < 1:
+                    return
+                try:
+                    self.connection_id._request('PUT', path, payload={
+                        'idempotency_key': str(uuid5(NAMESPACE_URL, f'{self.reference}/cancel/{version}')),
+                        'order': {'location_id': self.square_location_id, 'version': version, 'state': 'CANCELED'},
+                    })
+                except (SquareAPIError, UserError):
+                    pass
+                order = self._read_unpaid_order(path, released_payment_ids)
+            if order and order['state'] == 'CANCELED':
+                self.cancelled = True
+        except (SquareAPIError, UserError):
+            # An ambiguous update remains reserved until a later authoritative read.
+            return
+
+    def _read_unpaid_order(self, path, released_payment_ids):
+        order = self.connection_id._request('GET', path).get('order')
+        if not (
+            isinstance(order, dict) and order.get('id') == self.square_order_id
+            and order.get('location_id') == self.square_location_id and order.get('reference_id') == self.reference
+            and order.get('state') in ('OPEN', 'CANCELED')
+        ):
+            return
+        tenders = order.get('tenders', [])
+        if isinstance(tenders, list) and all(
+            isinstance(tender, dict) and (tender.get('payment_id') or tender.get('id')) in released_payment_ids
+            for tender in tenders
+        ):
+            return order

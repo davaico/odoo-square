@@ -89,6 +89,61 @@ registry.category("web_tour.tours").add("SquareTerminalPreviewDiscrepancy", {
     ],
 });
 
+registry.category("web_tour.tours").add("SquareTerminalCancelRacesPayment", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Waiting for Square Terminal')" },
+        {
+            trigger: ".payment-screen .square-cancel-payment",
+            run() {
+                if (!document.querySelector(".payment-screen .back-button").disabled) {
+                    throw new Error("The basket must stay locked while Square owns the tender");
+                }
+                this.anchor.click();
+            },
+        },
+        { trigger: ".payment-screen .electronic_status:contains('Payment Successful')" },
+        { trigger: ".payment-screen .payment-status-remaining .amount:contains('0.00')" },
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        { trigger: ".modal:contains('The balance is reserved by the original Square payment.') .btn-primary", run: "click" },
+        ...PaymentScreen.clickValidate(),
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("12.34"),
+        { trigger: ".pos-receipt .paymentlines:contains('Square Counter')" },
+    ],
+});
+
+registry.category("web_tour.tours").add("SquareTerminalLostCancellation", {
+    steps: () => [
+        ...Chrome.startPoS(),
+        ...ProductScreen.addOrderline("Desk Pad"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Waiting for Square Terminal')" },
+        { trigger: ".payment-screen .square-cancel-payment", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Waiting for Square to confirm cancellation')" },
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        { trigger: ".modal:contains('The balance is reserved by the original Square payment.') .btn-primary", run: "click" },
+        { trigger: ".payment-screen .square-check-status:contains('Check status')", run: "click" },
+        { trigger: ".payment-screen .back-button:not(:disabled)", run: "click" },
+        ...ProductScreen.addOrderline("Monitor Stand"),
+        ...ProductScreen.clickPayButton(),
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        ...PaymentScreen.selectedPaymentlineHas("Checkout Cash", "15.53"),
+        ...PaymentScreen.clickValidate(),
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("15.53"),
+        { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
+        { trigger: ".pos-receipt .orderline:contains('Monitor Stand')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash')" },
+    ],
+});
+
 registry.category("web_tour.tours").add("SquareTerminalLostCheckoutResponse", {
     steps: () => [
         ...Chrome.startPoS(),
