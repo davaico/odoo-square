@@ -87,9 +87,9 @@ class SquareOrder(models.Model):
 
         path += '/custom-attributes/' + ATTRIBUTE_KEY
         value = 'In-store handover at ' + self.handover_at.isoformat(timespec='seconds') + 'Z'
+        self._ensure_handover_definition()
         attribute = self._read_optional_handover_resource(path, 'custom_attribute')
         if attribute is None:
-            self._ensure_handover_definition()
             attribute = self.connection_id._request('POST', path, payload={
                 'idempotency_key': str(uuid5(NAMESPACE_URL, f'odoo-square:handover:{self.reference}')),
                 'custom_attribute': {'value': value},

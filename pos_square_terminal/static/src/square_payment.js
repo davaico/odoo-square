@@ -254,7 +254,10 @@ patch(PaymentScreen.prototype, {
         }
     },
     async validateOrder() {
-        if (this.squarePaymentReserved && this.pos.get_order()?.uuid !== this.currentOrder.uuid) {
+        if (this.squarePaymentReserved && (
+            this.pos.get_order()?.uuid !== this.currentOrder.uuid ||
+            this.pos.mainScreen.component !== this.constructor
+        )) {
             return;
         }
         if (this.paymentLines.some((line) => isSquarePayment(line) && line.square_attempt_state !== "verified")) {

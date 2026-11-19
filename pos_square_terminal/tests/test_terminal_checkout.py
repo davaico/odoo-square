@@ -1346,6 +1346,8 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         other = session.order_ids - draft
         self.assertEqual(other.state, 'paid')
         self.assertEqual(other.payment_ids.payment_method_id, self.cash_method)
+        with self.assertRaisesRegex(UserError, 'Square payment'), self.cr.savepoint():
+            session.with_user(self.pos_user).update_closing_control_state_session('')
         for close in (session.action_pos_session_closing_control, session.action_pos_session_close):
             with self.assertRaisesRegex(UserError, 'Square payment'), self.cr.savepoint():
                 close()
@@ -1401,6 +1403,7 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                     'reference_id': original_reference, 'state': 'COMPLETED',
                 }})
             if (method, path) == ('GET', attribute_path):
+                self.assertTrue(definition, 'Square requires the definition before an attribute can be read')
                 return self._square_response({'custom_attribute': attribute}) if attribute else missing
             if (method, path) == ('GET', definition_path + '/odoo-pos-in-store-handover'):
                 return self._square_response({'custom_attribute_definition': definition}) if definition else missing
