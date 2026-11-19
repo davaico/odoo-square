@@ -21,7 +21,7 @@ class PosPayment(models.Model):
         attempts_by_payment = {attempt.payment_id.id: attempt for attempt in attempts}
         for payment in self:
             attempt = attempts_by_payment.get(payment.id)
-            payment.square_attempt_state = attempt.state if attempt else False
+            payment.square_attempt_state = attempt._cashier_state() if attempt else False
             payment.square_attempt_reference = attempt.reference if attempt else False
 
     @api.model_create_multi
@@ -30,7 +30,7 @@ class PosPayment(models.Model):
             vals.get('pos_order_id', self.env.context.get('default_pos_order_id')) for vals in vals_list
         } - {None, False}))
         orders._square_lock_checkout(touch=True)
-        if orders._square_attempts():
+        if orders._square_reserved_attempts():
             raise UserError(_("The original tender is reserved by a Square payment."))
         payments = super().create(vals_list)
         for payment in payments.filtered(lambda line: line.payment_method_id.use_payment_terminal == 'square_terminal'):
@@ -53,7 +53,7 @@ class PosPayment(models.Model):
         target_order = self.env['pos.order'].browse(vals.get('pos_order_id') or [])
         orders = self.pos_order_id | target_order
         orders._square_lock_checkout(touch=True)
-        reserved = set(orders._square_attempts().order_id.ids)
+        reserved = set(orders._square_reserved_attempts().order_id.ids)
         for payment in self:
             payment_vals = dict(vals)
             new_method = self.env['pos.payment.method'].browse(vals.get('payment_method_id') or [])
@@ -92,6 +92,6 @@ class PosPayment(models.Model):
         self.check_access('unlink')
         orders = self.pos_order_id
         orders._square_lock_checkout(touch=True)
-        if orders._square_attempts():
+        if orders._square_reserved_attempts():
             raise UserError(_("The original tender is reserved by a Square payment."))
         return super().unlink()

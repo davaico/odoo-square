@@ -14,6 +14,10 @@
                         t-if="line.square_attempt_state != 'blocked'"
                         t-on-click="() => this.props.sendPaymentRequest(line)"
                         t-esc="this.squareActionLabel(line)"/>
+                <button type="button" class="button btn btn-outline-secondary square-cancel-payment"
+                        t-if="line.square_attempt_reference"
+                        t-on-click="() => this.props.sendPaymentCancel(line)"
+                        t-esc="this.squareCancelLabel(line)"/>
             </t>
         </xpath>
         <xpath expr="//t[@t-if=&quot;line.payment_status == 'pending'&quot;]" position="attributes">
@@ -22,7 +26,10 @@
         </xpath>
     </t>
     <t t-name="pos_square_terminal.SquarePaymentBack" t-inherit="point_of_sale.PaymentScreenBack" t-inherit-mode="extension">
-        <xpath expr="//button[hasclass('back-button')]" position="attributes">
+        <xpath expr="//t[@t-if]/button[hasclass('back-button')]" position="attributes">
+            <attribute name="t-att-disabled">this.squarePaymentReserved</attribute>
+        </xpath>
+        <xpath expr="//t[@t-else]/button[hasclass('back-button')]" position="attributes">
             <attribute name="t-att-disabled">this.squarePaymentReserved</attribute>
         </xpath>
     </t>

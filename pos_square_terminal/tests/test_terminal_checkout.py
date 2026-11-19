@@ -713,6 +713,135 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         response._content = json.dumps(payload).encode()
         return response
 
+    def test_card_captured_during_cancel_stays_on_original_sale(self):
+        self.main_pos_config.auto_validate_terminal_payment = False
+        money = {'amount': 1234, 'currency': self.currency}
+        checkout = {}
+        mutations = []
+
+        def square_response(method, url, **kwargs):
+            path = urlsplit(url).path
+            if (method, path) == ('POST', '/v2/orders/calculate'):
+                return self._square_response({'order': self._draft_provider_order(kwargs['json']['order'], 1234)})
+            if method != 'GET':
+                mutations.append((method, path))
+            if (method, path) == ('POST', '/v2/orders'):
+                payload = {'order': {**self._draft_provider_order(kwargs['json']['order'], 1234), 'id': 'SQUAREORDER'}}
+            elif (method, path) == ('POST', '/v2/terminals/checkouts'):
+                checkout.update(kwargs['json']['checkout'], id='SQUARECHECKOUT', location_id='SQUARELOC', status='IN_PROGRESS')
+                payload = {'checkout': checkout}
+            elif (method, path) == ('POST', '/v2/terminals/checkouts/SQUARECHECKOUT/cancel'):
+                checkout.update(status='COMPLETED', payment_ids=['SQUAREPAYMENT'])
+                # The cancellation acknowledgment does not show the winning card capture.
+                payload = {'checkout': {**checkout, 'status': 'CANCEL_REQUESTED', 'payment_ids': []}}
+            elif (method, path) == ('GET', '/v2/terminals/checkouts/SQUARECHECKOUT'):
+                payload = {'checkout': checkout}
+            elif (method, path) == ('GET', '/v2/payments/SQUAREPAYMENT'):
+                payload = {'payment': {
+                    'id': 'SQUAREPAYMENT', 'order_id': 'SQUAREORDER', 'location_id': 'SQUARELOC',
+                    'terminal_checkout_id': 'SQUARECHECKOUT', 'reference_id': checkout['reference_id'],
+                    'status': 'COMPLETED', 'amount_money': money, 'total_money': money, 'source_type': 'CARD',
+                }}
+            else:
+                self.fail(f'Unexpected Square request: {method} {path}')
+            return self._square_response(payload)
+
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
+            self.start_pos_tour('SquareTerminalCancelRacesPayment')
+
+        self.assertEqual(mutations, [
+            ('POST', '/v2/orders'),
+            ('POST', '/v2/terminals/checkouts'),
+            ('POST', '/v2/terminals/checkouts/SQUARECHECKOUT/cancel'),
+        ])
+        self.env.invalidate_all()
+        order = self.pos_session.order_ids
+        self.assertEqual(order.state, 'paid')
+        self.assertEqual(order.payment_ids.payment_method_id, self.method)
+        self.assertEqual(order.payment_ids.transaction_id, 'SQUAREPAYMENT')
+        self.assertEqual(order.payment_ids.amount, 12.34)
+        self.assertEqual(order.lines.product_id, self.desk_pad)
+
+    def test_lost_cancellation_replies_keep_sale_locked_until_verified_then_finish_cash(self):
+        money = {'amount': 1234, 'currency': self.currency}
+        checkout = {}
+        square_order = {}
+        mutations = []
+        payment_status = 'APPROVED'
+        lose_order_read = False
+
+        def square_response(method, url, **kwargs):
+            nonlocal lose_order_read, payment_status
+            path = urlsplit(url).path
+            if (method, path) == ('POST', '/v2/orders/calculate'):
+                return self._square_response({'order': self._draft_provider_order(kwargs['json']['order'], 1234)})
+            if method != 'GET':
+                mutations.append((method, path))
+            if (method, path) == ('POST', '/v2/orders'):
+                square_order.update(self._draft_provider_order(kwargs['json']['order'], 1234), id='SQUAREORDER', version=1)
+                payload = {'order': square_order}
+            elif (method, path) == ('POST', '/v2/terminals/checkouts'):
+                checkout.update(kwargs['json']['checkout'], id='SQUARECHECKOUT', location_id='SQUARELOC', status='PENDING')
+                payload = {'checkout': checkout}
+            elif (method, path) == ('POST', '/v2/terminals/checkouts/SQUARECHECKOUT/cancel'):
+                checkout.update(status='CANCELED', cancel_reason='SELLER_CANCELED', payment_ids=['SQUAREAPPROVAL'])
+                square_order['tenders'] = [{'payment_id': 'SQUAREAPPROVAL'}]
+                raise ConnectionError('Lost checkout cancellation response')
+            elif (method, path) == ('GET', '/v2/terminals/checkouts/SQUARECHECKOUT'):
+                payload = {'checkout': checkout}
+            elif (method, path) == ('GET', '/v2/payments/SQUAREAPPROVAL'):
+                payload = {'payment': {
+                    'id': 'SQUAREAPPROVAL', 'order_id': 'SQUAREORDER', 'location_id': 'SQUARELOC',
+                    'terminal_checkout_id': 'SQUARECHECKOUT', 'reference_id': checkout['reference_id'],
+                    'status': payment_status, 'amount_money': money, 'total_money': money, 'source_type': 'CARD',
+                }}
+            elif (method, path) == ('POST', '/v2/payments/SQUAREAPPROVAL/cancel'):
+                payment_status = 'CANCELED'
+                raise ConnectionError('Lost authorization cancellation response')
+            elif (method, path) == ('PUT', '/v2/orders/SQUAREORDER'):
+                request = kwargs['json']
+                self.assertEqual(request['order']['version'], 1)
+                self.assertEqual(request['order']['state'], 'CANCELED')
+                self.assertTrue(request['idempotency_key'])
+                self.assertEqual(checkout['status'], 'CANCELED')
+                self.assertEqual(payment_status, 'CANCELED')
+                square_order.update(state='CANCELED', version=2)
+                lose_order_read = True
+                raise ConnectionError('Lost order cancellation response')
+            elif (method, path) == ('GET', '/v2/orders/SQUAREORDER'):
+                if lose_order_read:
+                    lose_order_read = False
+                    raise ConnectionError('Unable to read Square order after cancellation')
+                payload = {'order': square_order}
+            else:
+                self.fail(f'Unexpected Square request: {method} {path}')
+            return self._square_response(payload)
+
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
+            self.start_pos_tour('SquareTerminalLostCancellation')
+
+        self.assertEqual(mutations, [
+            ('POST', '/v2/orders'),
+            ('POST', '/v2/terminals/checkouts'),
+            ('POST', '/v2/terminals/checkouts/SQUARECHECKOUT/cancel'),
+            ('POST', '/v2/payments/SQUAREAPPROVAL/cancel'),
+            ('PUT', '/v2/orders/SQUAREORDER'),
+        ])
+        self.env.invalidate_all()
+        order = self.pos_session.order_ids
+        self.assertEqual(len(order), 1)
+        self.assertEqual(order.state, 'paid')
+        self.assertEqual(order.amount_total, 15.53)
+        self.assertEqual(order.lines.product_id, self.desk_pad | self.monitor_stand)
+        self.assertEqual(order.payment_ids.payment_method_id, self.cash_method)
+        self.assertEqual(order.payment_ids.amount, 15.53)
+        attempt = self.env['pos.square.payment.attempt'].sudo().search([('order_id', '=', order.id)])
+        self.assertEqual(attempt.square_order_link_id.square_order_id, 'SQUAREORDER')
+        self.assertEqual(attempt.square_checkout_id, 'SQUARECHECKOUT')
+        self.assertEqual(attempt.square_payment_id, 'SQUAREAPPROVAL')
+        self.assertTrue(attempt.payment_uuid)
+        self.assertNotEqual(attempt.payment_uuid, order.payment_ids.uuid)
+
     def test_cash_stays_local_with_square_configured(self):
         with patch('odoo.addons.pos_square_terminal.square_api.request') as provider:
             self.start_pos_tour('SquareTerminalCashOnly')

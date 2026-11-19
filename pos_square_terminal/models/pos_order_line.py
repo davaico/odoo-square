@@ -19,7 +19,7 @@ class PosOrderLine(models.Model):
             vals.get('order_id', self.env.context.get('default_order_id')) for vals in vals_list
         } - {None, False}))
         orders._square_lock_checkout(touch=True)
-        if orders._square_attempts():
+        if orders._square_reserved_attempts():
             raise UserError(_("The original goods are reserved by a Square payment."))
         return super().create(vals_list)
 
@@ -29,7 +29,7 @@ class PosOrderLine(models.Model):
             self.check_access('write')
             orders = self.order_id | self.env['pos.order'].browse(vals.get('order_id') or [])
             orders._square_lock_checkout(touch=True)
-            reserved = set(orders._square_attempts().order_id.ids)
+            reserved = set(orders._square_reserved_attempts().order_id.ids)
             for line in self:
                 if (
                     reserved.intersection({line.order_id.id, vals.get('order_id')})
@@ -42,6 +42,6 @@ class PosOrderLine(models.Model):
         self.check_access('unlink')
         orders = self.order_id
         orders._square_lock_checkout(touch=True)
-        if orders._square_attempts():
+        if orders._square_reserved_attempts():
             raise UserError(_("The original goods are reserved by a Square payment."))
         return super().unlink()

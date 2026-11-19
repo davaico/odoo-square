@@ -55,7 +55,7 @@ class SquarePaymentAttempt(models.Model):
         if discrepancy:
             values['reconciliation_discrepancy'] = issue
         # Never withdraw a verified payment when Square is unreachable or returns inconsistent data.
-        if self.state not in ('dispatching', 'verified'):
+        if self.state not in ('dispatching', 'failed', 'verified'):
             values['state'] = 'uncertain'
         self.write(values)
 
