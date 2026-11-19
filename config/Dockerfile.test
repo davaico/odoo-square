@@ -1,12 +1,13 @@
 FROM odoo:18.0
 
+ARG UBUNTU_SNAPSHOT
 USER root
-# Use the Azure mirror for the signed Ubuntu archive, including the security pocket.
 RUN export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive \
-    && sed -Ei 's@^URIs: http://(archive|security)\.ubuntu\.com/ubuntu/?$@URIs: https://azure.archive.ubuntu.com/ubuntu/@' \
-        /etc/apt/sources.list.d/ubuntu.sources \
-    && printf '%s\n' 'Acquire::Retries "3";' 'Acquire::https::Timeout "30";' \
+    && printf '%s\n' 'Acquire::Retries "1";' 'Acquire::http::Timeout "15";' \
         > /etc/apt/apt.conf.d/80-ci-fetch \
+    && if [ -n "$UBUNTU_SNAPSHOT" ]; then \
+        sed -i "/^Types: deb$/a Snapshot: $UBUNTU_SNAPSHOT" /etc/apt/sources.list.d/ubuntu.sources; \
+    fi \
     && install -d -m 0755 /etc/apt/keyrings \
     && curl --fail --location --silent --show-error \
         --output /etc/apt/keyrings/google-chrome.asc \
@@ -16,5 +17,8 @@ RUN export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive \
     && apt-get update -o APT::Update::Error-Mode=any \
     && apt-get upgrade --yes \
     && apt-get install --yes --no-install-recommends google-chrome-stable python3-websocket \
+    && if [ -n "$UBUNTU_SNAPSHOT" ]; then \
+        sed -i "/^Snapshot: $UBUNTU_SNAPSHOT$/d" /etc/apt/sources.list.d/ubuntu.sources; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
 USER odoo

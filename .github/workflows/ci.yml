@@ -10,8 +10,45 @@ on:
 permissions:
   contents: read
 
+env:
+  # GitHub-hosted jobs have separate Docker daemons. Use the same image tags in each.
+  COMPOSE_PROJECT_NAME: odoo-square-v18-ci-${{ github.run_id }}
+  DB_PASSWORD: ci_odoo_test
+  DB_NAME: odoo_square_v18_test
+  ODOO_TEST_DOCKERFILE: config/Dockerfile.test
+
 jobs:
+  build-test-images:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build PostgreSQL and Odoo 18 with Chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f docker-compose.test.yml)
+          "${compose[@]}" build --pull db
+          if ! "${compose[@]}" build --pull odoo; then
+            snapshot=$(date -u -d '6 hours ago' +%Y%m%dT%H%M%SZ)
+            echo "Retrying the Odoo test image with Ubuntu's official snapshot from $snapshot."
+            "${compose[@]}" build --pull --build-arg "UBUNTU_SNAPSHOT=$snapshot" odoo
+          fi
+          docker image save odoo-square-v18-test "${COMPOSE_PROJECT_NAME}-db" \
+            | gzip -1 > "$RUNNER_TEMP/odoo18-test-images.tar.gz"
+
+      - name: Share test images
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ runner.temp }}/odoo18-test-images.tar.gz
+          archive: false
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: error
+
   odoo-tests:
+    needs: build-test-images
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
@@ -46,18 +83,21 @@ jobs:
             modules: payment_square_online,sale_stock
             tags: ''
     env:
-      COMPOSE_PROJECT_NAME: odoo-square-v18-test-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
       ODOO_INIT_MODULES: ${{ matrix.modules }}
       ODOO_TEST_TAGS: ${{ matrix.tags }}
       TEST_SUITE: ${{ matrix.suite }}
-      DB_PASSWORD: ci_odoo_test
-      DB_NAME: odoo_square_v18_test
-      ODOO_TEST_DOCKERFILE: config/Dockerfile.test
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build PostgreSQL and Odoo 18 with Chrome
-        run: docker compose -f docker-compose.test.yml build --pull
+      - name: Download test images
+        uses: actions/download-artifact@v8
+        with:
+          name: odoo18-test-images.tar.gz
+          path: ${{ runner.temp }}
+
+      - name: Load test images
+        run: docker image load --input "$RUNNER_TEMP/odoo18-test-images.tar.gz"
+
       - name: Install and exercise the selected workflow
         shell: bash
         run: |
@@ -65,7 +105,7 @@ jobs:
           mkdir -p test-results
           compose=(docker compose -f docker-compose.test.yml)
           if [[ "$TEST_SUITE" == *-races ]]; then
-            "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_v18_test \
+            "${compose[@]}" run --rm -T --pull never odoo odoo --database=odoo_square_v18_test \
               --init="$ODOO_INIT_MODULES" --stop-after-init --no-http 2>&1 \
               | tee test-results/install.log
             case "$TEST_SUITE" in
@@ -79,12 +119,12 @@ jobs:
                 ;;
             esac
             printf '%s\n' "from odoo.addons.$suite_module import run" 'run(env.registry)' \
-              | "${compose[@]}" run --rm -T odoo odoo shell --database=odoo_square_v18_test --no-http 2>&1 \
+              | "${compose[@]}" run --rm -T --pull never odoo odoo shell --database=odoo_square_v18_test --no-http 2>&1 \
               | tee "test-results/$TEST_SUITE.log"
             grep -Eq "$suite_result" "test-results/$TEST_SUITE.log"
             grep -Eq '^OK$' "test-results/$TEST_SUITE.log"
           else
-            "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_v18_test \
+            "${compose[@]}" run --rm -T --pull never odoo odoo --database=odoo_square_v18_test \
               --init="$ODOO_INIT_MODULES" --test-tags="$ODOO_TEST_TAGS" \
               --workers=0 --stop-after-init --log-level=test 2>&1 | tee test-results/odoo-tests.log
             log=test-results/odoo-tests.log
