@@ -27,3 +27,9 @@ For a replacement device, add a new terminal record and switch the payment metho
 3. Issue the itemized Odoo receipt when the sale completes. If the register requires manual validation, select **Validate** after the payment shows as successful.
 
 This checkout supports a single card tender for ordinary untaxed items at their configured prices. Odoo uses the configured priced basket and sends the payment amount automatically. Cash-only sales can be completed using the existing cash method.
+
+## Recover and review payments
+
+In the [Square Developer Console](https://developer.squareup.com/apps), add a webhook subscription in the connection's environment. Copy **Webhook Endpoint** from the saved Odoo connection. Register this HTTPS URL for `terminal.checkout.created`, `terminal.checkout.updated`, `payment.created`, and `payment.updated`. Copy the exact registered URL and the subscription's signature key into **Square Notifications** on that Odoo connection. Keep the original subscription and authorization available when you replace or archive a connection. [Square webhook setup](https://developer.squareup.com/docs/webhooks/step2subscribe)
+
+Odoo continues checking unresolved payments after the register browser closes. In **Point of Sale → Orders → Square Terminal Payments**, open an attempt and choose **Check Square Payment** to read its current status from Square. You can also find the attempts under **Square Payments** on the original POS order. Use the last successful check, verified amounts, and Square references when investigating discrepancies. If authorization has expired or been revoked, open and reauthorize the original connection listed on the attempt.

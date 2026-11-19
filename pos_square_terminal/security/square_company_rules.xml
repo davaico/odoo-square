@@ -15,4 +15,9 @@
         <field name="model_id" ref="model_pos_square_terminal"/>
         <field name="domain_force">[('company_id', 'in', company_ids)]</field>
     </record>
+    <record id="square_attempt_company_rule" model="ir.rule">
+        <field name="name">Square Terminal payment company</field>
+        <field name="model_id" ref="model_pos_square_payment_attempt"/>
+        <field name="domain_force">[('company_id', 'in', company_ids)]</field>
+    </record>
 </odoo>

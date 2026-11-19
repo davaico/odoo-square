@@ -10,9 +10,14 @@ from ..square_api import SquareAPIError
 from .square_order import matches_money
 
 
+class SquarePaymentDiscrepancy(ValueError):
+    pass
+
+
 class SquarePaymentAttempt(models.Model):
     _name = 'pos.square.payment.attempt'
     _description = 'Square Terminal Payment Attempt'
+    _rec_name = 'reference'
 
     square_order_link_id = fields.Many2one('pos.square.order', required=True, ondelete='restrict', index=True)
     order_id = fields.Many2one(related='square_order_link_id.order_id', store=True, index=True)
@@ -30,7 +35,7 @@ class SquarePaymentAttempt(models.Model):
     application_id = fields.Char(required=True)
     reference = fields.Char(required=True, index=True)
     amount_minor = fields.Integer(required=True)
-    checkout_request = fields.Json(required=True)
+    checkout_request = fields.Json(required=True, groups='base.group_system')
     state = fields.Selection([
         ('prepared', 'Reserved'),
         ('ready', 'Linked order ready'),
@@ -112,23 +117,47 @@ class SquarePaymentAttempt(models.Model):
 
     def _refresh(self):
         self.ensure_one()
-        if self.state not in ('dispatching', 'pending', 'declined', 'uncertain', 'timed_out'):
-            return
+        if self.state not in self._square_reconcilable_states():
+            return True
         try:
             self._check_provider_scope()
-            if self.square_checkout_id:
+            if self.state == 'verified' and self.square_payment_id:
+                # Terminal checkouts expire. The verified payment ID remains a durable reference.
+                self._verify_payment(self.square_payment_id, final=True)
+                self._record_successful_check()
+            elif self.square_checkout_id:
                 path = '/v2/terminals/checkouts/' + quote(self.square_checkout_id, safe='')
                 checkout = self.connection_id._request('GET', path).get('checkout')
                 self._observe_checkout(checkout, authoritative=True)
             elif self.square_order_link_id.square_order_id:
                 checkout = self._find_original_checkout()
-                if checkout is not None:
-                    self._observe_checkout(checkout, authoritative=True)
-        except (SquareAPIError, UserError, ValueError):
-            # A read can race the cashier's dispatch RPC. Only that RPC can
-            # mark the first submission attempt as uncertain.
-            if self.state != 'dispatching':
-                self.state = 'uncertain'
+                if checkout is None:
+                    return False
+                self._observe_checkout(checkout, authoritative=True)
+            else:
+                return False
+        except SquareAPIError as error:
+            issue = (
+                _("Reconnect %s, the original Square connection.", self.connection_id.display_name)
+                if error.is_authorization_error else _("Square could not be reached or could not return this record.")
+            )
+            self._record_failed_check(issue)
+            return False
+        except UserError:
+            self._record_failed_check(
+                _("Check the authorization of %s, the original Square connection.", self.connection_id.display_name),
+            )
+            return False
+        except SquarePaymentDiscrepancy as error:
+            self._record_failed_check(str(error), discrepancy=True)
+            return False
+        except ValueError:
+            self._record_failed_check(
+                _("Square returned details that could not be verified against the original payment."),
+                discrepancy=True,
+            )
+            return False
+        return True
 
     def _find_original_checkout(self):
         self.ensure_one()
@@ -186,7 +215,6 @@ class SquarePaymentAttempt(models.Model):
         self.write({
             'square_checkout_id': checkout_id,
             'provider_status': status,
-            'last_checked_at': fields.Datetime.now(),
             'state': state,
         })
         ids = checkout.get('payment_ids', [])
@@ -204,6 +232,7 @@ class SquarePaymentAttempt(models.Model):
             self._verify_payment(payment_id, final=final)
         elif safe_cancellation:
             self.state = 'failed'
+        self._record_successful_check()
 
     def _verify_payment(self, payment_id, *, final):
         self.ensure_one()
@@ -217,18 +246,33 @@ class SquarePaymentAttempt(models.Model):
             and payment.get('terminal_checkout_id', self.square_checkout_id) == self.square_checkout_id
             and payment.get('location_id') == self.square_location_id
             and payment.get('source_type') == 'CARD'
-            and matches_money(payment.get('amount_money'), self.amount_minor, self.currency_code)
-            and matches_money(payment.get('total_money'), self.amount_minor, self.currency_code)
-            and ('tip_money' not in payment or matches_money(payment['tip_money'], 0, self.currency_code))
         ):
             raise ValueError('Square payment does not match the reserved tender')
+        amount = payment.get('amount_money')
+        if not matches_money(amount, self.amount_minor, self.currency_code):
+            if isinstance(amount, dict) and type(amount.get('amount')) is int and amount.get('currency') == self.currency_code:
+                raise SquarePaymentDiscrepancy(_(
+                    "Square reported %(observed)s %(currency)s minor units for the payment base. Odoo requested %(requested)s.",
+                    observed=amount['amount'], currency=self.currency_code, requested=self.amount_minor,
+                ))
+            raise SquarePaymentDiscrepancy(_("The Square payment base has an invalid amount or currency."))
+        if not (
+            matches_money(payment.get('total_money'), self.amount_minor, self.currency_code)
+            and ('tip_money' not in payment or matches_money(payment['tip_money'], 0, self.currency_code))
+        ):
+            raise SquarePaymentDiscrepancy(_("The Square payment total or tip differs from the original payment."))
 
         status = payment.get('status')
         if status == 'COMPLETED' and (
-            'refunded_money' not in payment or matches_money(payment['refunded_money'], 0, self.currency_code)
+            self.state == 'verified' or 'refunded_money' not in payment
+            or matches_money(payment['refunded_money'], 0, self.currency_code)
         ):
-            self.write({'square_payment_id': payment_id, 'state': 'verified'})
-            self.payment_id._square_set_verified(payment_id)
+            if self.state != 'verified':
+                self.write({'square_payment_id': payment_id, 'state': 'verified'})
+                self.payment_id._square_set_verified(payment_id)
+            self._observe_verified_payment(payment)
+        elif self.state == 'verified':
+            raise ValueError('Square no longer reports the verified payment as completed')
         elif status in ('APPROVED', 'PENDING'):
             self.write({'square_payment_id': payment_id, 'state': 'pending'})
         elif status in ('FAILED', 'CANCELED'):

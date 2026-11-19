@@ -10,8 +10,10 @@
         "security/ir.model.access.csv",
         "security/square_company_rules.xml",
         "data/square_credential_cron.xml",
+        "data/square_reconciliation_cron.xml",
         "views/square_terminal_views.xml",
         "views/pos_payment_method_views.xml",
+        "views/square_reconciliation_views.xml",
     ],
     "assets": {
         "web.assets_tests": [

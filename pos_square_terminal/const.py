@@ -14,3 +14,4 @@ SQUARE_LOCATION_CURRENCIES = {
     'GB': 'GBP', 'IE': 'EUR', 'JP': 'JPY', 'US': 'USD',
 }
 SQUARE_SANDBOX_DEVICE_ID = '9fa747a2-25ff-48ee-b078-04381f7c828f'
+SQUARE_TERMINAL_WEBHOOK_PATH = '/pos/square/terminal/webhook'
