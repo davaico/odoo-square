@@ -8,13 +8,15 @@ from odoo.exceptions import UserError
 class SquareOrderProcessor(models.Model):
     _inherit = "square.order.processor"
 
-    def _square_terminal_import_config(self, square_config=None):
+    def _square_terminal_import_config(self, square_config=None, *, environment=None):
         if "pos.square.order" not in self.env:
             return None
         config = square_config if square_config is not None else self.env["square.config"].sudo().search(
             [("company_id", "=", self.sudo().env.company.id)], limit=1,
         )
-        if config and self.env["pos.square.order"]._square_terminal_import_scope_exists(
+        if not config or (environment and environment.lower() != config.square_environment):
+            return None
+        if self.env["pos.square.order"]._square_terminal_import_scope_exists(
             config.company_id.id, config.square_environment,
         ):
             return config
@@ -40,7 +42,7 @@ class SquareOrderProcessor(models.Model):
     def _square_terminal_retry(self):
         return {"status": "retry", "message": _("Could not verify Odoo POS Square Terminal ownership")}
 
-    def _square_terminal_resource_result(self, kind, resource, config):
+    def _square_terminal_resource_result(self, kind, resource, config, *, expected_merchant=None):
         if not self._square_terminal_matches(kind, resource, config):
             return None
         location = self._square_read_routing_resource("locations", "location", resource["location_id"], config)
@@ -48,9 +50,11 @@ class SquareOrderProcessor(models.Model):
         if not isinstance(merchant_id, str) or not merchant_id:
             return self._square_terminal_retry()
         if self._square_terminal_matches(kind, resource, config, merchant_id=merchant_id):
+            if expected_merchant and expected_merchant != merchant_id:
+                return self._square_terminal_retry()
             return {"status": "ignored", "message": _("Odoo POS Square Terminal operation")}
 
-    def _square_terminal_order_result(self, order_id, config, *, full_order=None):
+    def _square_terminal_order_result(self, order_id, config, *, full_order=None, merchant_id=None):
         if not order_id or not config:
             return None
         order = full_order if full_order is not None else self._square_read_routing_resource(
@@ -59,7 +63,7 @@ class SquareOrderProcessor(models.Model):
         if not order or order.get("id") != order_id or not order.get("location_id"):
             return self._square_terminal_retry()
 
-        retry = self._square_terminal_resource_result("order", order, config)
+        retry = self._square_terminal_resource_result("order", order, config, expected_merchant=merchant_id)
         if retry and retry["status"] == "ignored":
             return retry
 
@@ -72,7 +76,7 @@ class SquareOrderProcessor(models.Model):
             if not source or not source.get("location_id"):
                 retry = retry or self._square_terminal_retry()
                 continue
-            result = self._square_terminal_resource_result("order", source, config)
+            result = self._square_terminal_resource_result("order", source, config, expected_merchant=merchant_id)
             if result and result["status"] == "ignored":
                 return result
             retry = retry or result
@@ -113,5 +117,7 @@ class SquareOrderProcessor(models.Model):
         )
         if website and website["status"] == "ignored":
             return website
-        config = self._square_terminal_import_config(square_config)
-        return self._square_terminal_order_result(order_id, config, full_order=full_order) or website
+        config = self._square_terminal_import_config(square_config, environment=environment)
+        return self._square_terminal_order_result(
+            order_id, config, full_order=full_order, merchant_id=merchant_id,
+        ) or website
