@@ -267,6 +267,8 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         refunds = {
             'MISSED-10': ('COMPLETED', 1000, 'SQUAREPAYMENT', 'EUR'),
             'LATER-5': ('PENDING', 500, 'SQUAREPAYMENT', 'EUR'),
+            'FAILED-2': ('FAILED', 200, 'SQUAREPAYMENT', 'EUR'),
+            'REJECTED-3': ('REJECTED', 300, 'SQUAREPAYMENT', 'EUR'),
             'WRONG-PAYMENT': ('COMPLETED', 200, 'SOME-OTHER-PAYMENT', 'EUR'),
             'WRONG-CURRENCY': ('COMPLETED', 300, 'SQUAREPAYMENT', 'USD'),
             'OVER-CAPTURE': ('COMPLETED', 3000, 'SQUAREPAYMENT', 'EUR'),
@@ -341,20 +343,33 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             }
             payment_before = payment.read(['amount', 'transaction_id', 'payment_status'])
 
-            refund_ids = ['MISSED-10', 'LATER-5', 'WRONG-PAYMENT', 'WRONG-CURRENCY']
-            refunded_minor = 1000
+            refund_ids = ['MISSED-10', 'LATER-5', 'FAILED-2', 'REJECTED-3']
+            refunded_minor = 1500
             self.env.flush_all()
             self.env.ref('pos_square_terminal.ir_cron_square_terminal_reconcile_payments').method_direct_trigger()
             self.env.invalidate_all()
+            self.assertEqual(
+                {refund.square_refund_id: refund.status for refund in attempt.square_refund_ids},
+                {'MISSED-10': 'COMPLETED', 'LATER-5': 'PENDING', 'FAILED-2': 'FAILED', 'REJECTED-3': 'REJECTED'},
+            )
             self.assertEqual(attempt.refund_ids.mapped('square_refund_id'), ['MISSED-10'])
             self.assertEqual(attempt.refunded_amount, 10)
+            self.assertFalse(attempt.refund_reconciliation_issue)
+
+            refund_ids += ['WRONG-PAYMENT', 'WRONG-CURRENCY']
+            attempt.action_check_square_payment()
+            self.assertFalse(attempt.square_refund_ids.filtered(
+                lambda refund: refund.square_refund_id in ('WRONG-PAYMENT', 'WRONG-CURRENCY')
+            ))
             self.assertTrue(attempt.refund_reconciliation_issue)
 
+            pending = attempt.square_refund_ids.filtered(lambda refund: refund.square_refund_id == 'LATER-5')
             refunds['LATER-5'] = ('COMPLETED', 500, 'SQUAREPAYMENT', 'EUR')
             refund_ids = ['LATER-5', 'LATER-5']
             refunded_minor = 1500
             attempt.action_check_square_payment()
             self.assertEqual(set(attempt.refund_ids.mapped('square_refund_id')), {'MISSED-10', 'LATER-5'})
+            self.assertEqual(pending.status, 'COMPLETED')
             self.assertEqual(attempt.refunded_amount, 15)
             self.assertFalse(attempt.refund_reconciliation_issue)
 
