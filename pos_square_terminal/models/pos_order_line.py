@@ -3,7 +3,7 @@ from uuid import uuid4
 from odoo import _, api, models
 from odoo.exceptions import UserError
 
-from .pos_order import same_value
+from .pos_order import checkout_create_parents, same_value
 
 
 class PosOrderLine(models.Model):
@@ -33,9 +33,7 @@ class PosOrderLine(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
-        orders = self.env['pos.order'].browse(list({
-            vals.get('order_id', self.env.context.get('default_order_id')) for vals in vals_list
-        } - {None, False}))
+        vals_list, orders = checkout_create_parents(self, vals_list, 'order_id')
         orders._square_lock_checkout(touch=True)
         if orders._square_reserved_attempts():
             raise UserError(_("The original goods are reserved by a Square payment."))
@@ -84,9 +82,8 @@ class PosOrderLineLot(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
-        default_line_id = self.env.context.get('default_pos_order_line_id')
-        line_ids = {values.get('pos_order_line_id', default_line_id) for values in vals_list} - {None, False}
-        orders = self.env['pos.order.line'].browse(list(line_ids)).order_id
+        vals_list, lines = checkout_create_parents(self, vals_list, 'pos_order_line_id')
+        orders = lines.order_id
         orders._square_lock_checkout(touch=True)
         if orders._square_reserved_attempts():
             raise UserError(_("The lot and serial numbers are reserved by the original Square payment."))

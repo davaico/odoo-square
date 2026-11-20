@@ -2876,6 +2876,44 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             })],
         })
 
+    def test_checkout_child_creation_requires_access_to_every_parent(self):
+        allowed = self._cashier_draft(self.cash_method)
+        restricted = self._cashier_draft(self.cash_method)
+        line_model = self.env['pos.order.line'].with_user(self.pos_user)
+        lot_model = self.env['pos.pack.operation.lot'].with_user(self.pos_user)
+        payment_model = self.env['pos.payment'].with_user(self.pos_user)
+        line_values = {
+            'product_id': self.desk_pad.id, 'qty': 1, 'price_unit': 1,
+            'price_subtotal': 1, 'price_subtotal_incl': 1,
+        }
+        payment_values = {'payment_method_id': self.cash_method.id, 'amount': 1}
+        self.env['ir.rule'].sudo().create({
+            'name': 'Test POS order write access',
+            'model_id': self.env['ir.model']._get_id('pos.order'),
+            'domain_force': repr([('id', '!=', restricted.id)]),
+            'perm_read': False, 'perm_create': False, 'perm_unlink': False,
+        })
+        self.env['ir.default'].sudo().set('pos.order.line', 'order_id', restricted.id, user_id=self.pos_user.id)
+
+        with patch.object(type(allowed), '_square_reserved_attempts') as reservations:
+            for model, values in (
+                (line_model, [{**line_values, 'order_id': allowed.id}, {**line_values, 'order_id': restricted.id}]),
+                (line_model, [line_values]),
+                (lot_model, [{'lot_name': 'Test lot', 'pos_order_line_id': restricted.lines.id}]),
+                (payment_model.with_context(default_pos_order_id=restricted.id), [payment_values]),
+            ):
+                with self.subTest(model=model._name, values=values):
+                    with self.assertRaises(AccessError), self.cr.savepoint():
+                        model.create(values)
+            reservations.assert_not_called()
+
+        line = line_model.with_context(default_order_id=allowed.id).create(line_values)
+        self.assertEqual(line.order_id, allowed)
+        lot = lot_model.with_context(default_pos_order_line_id=line.id).create({'lot_name': 'Test lot'})
+        self.assertEqual(lot.pos_order_line_id, line)
+        payment = payment_model.with_context(default_pos_order_id=allowed.id).create(payment_values)
+        self.assertEqual(payment.pos_order_id, allowed)
+
     def test_cashier_cannot_forge_or_replace_square_payment(self):
         order = self._cashier_draft()
         payment = order.payment_ids

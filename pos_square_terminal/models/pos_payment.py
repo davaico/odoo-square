@@ -1,7 +1,7 @@
 from odoo import _, api, fields, models
 from odoo.exceptions import AccessError, UserError
 
-from .pos_order import PAID_STATES, same_value
+from .pos_order import PAID_STATES, checkout_create_parents, same_value
 
 
 class PosPayment(models.Model):
@@ -29,9 +29,7 @@ class PosPayment(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
-        orders = self.env['pos.order'].browse(list({
-            vals.get('pos_order_id', self.env.context.get('default_pos_order_id')) for vals in vals_list
-        } - {None, False}))
+        vals_list, orders = checkout_create_parents(self, vals_list, 'pos_order_id')
         orders._square_lock_checkout(touch=True)
         payments = super().create(vals_list)
         for payment in payments:

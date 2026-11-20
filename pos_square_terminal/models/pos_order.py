@@ -5,7 +5,7 @@ from uuid import uuid4
 from psycopg2.errors import UniqueViolation
 
 from odoo import Command, _, api, models
-from odoo.exceptions import AccessError, UserError
+from odoo.exceptions import AccessError, UserError, ValidationError
 from odoo.service.model import retrying
 from odoo.tools.float_utils import float_compare, float_round
 
@@ -42,6 +42,23 @@ def same_value(record, field, value):
     if field_type == 'one2many':
         return not value
     return (current or False) == (value or False)
+
+
+def checkout_create_parents(model, vals_list, parent_field):
+    model.browse().check_access('create')
+    if any(parent_field not in vals for vals in vals_list):
+        # Pass the same effective parent IDs to the reservation guard and ORM create.
+        default = model.default_get([parent_field]).get(parent_field, False)
+        vals_list = [{parent_field: default, **vals} for vals in vals_list]
+    parent_ids = set()
+    for vals in vals_list:
+        parent_id = vals[parent_field]
+        if parent_id is not False and parent_id is not None and type(parent_id) is not int:
+            raise ValidationError(_("Invalid Point of Sale parent record."))
+        if parent_id:
+            parent_ids.add(parent_id)
+    parents = model.env[model._fields[parent_field].comodel_name].browse(sorted(parent_ids))
+    return vals_list, parents
 
 
 class PosOrder(models.Model):
@@ -918,6 +935,9 @@ class PosOrder(models.Model):
     def _square_lock_checkout(self, *, touch=False):
         if not self.ids:
             return
+        if touch:
+            self.check_access('read')
+            self.check_access('write')
         # A common row for admission and ORM writes to the order or any financial child.
         self.env.cr.execute(
             'SELECT id FROM pos_order WHERE id IN %s ORDER BY id FOR NO KEY UPDATE', [tuple(self.ids)],
