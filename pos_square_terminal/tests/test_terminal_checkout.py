@@ -995,9 +995,14 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
     def test_credentials_lost_between_prepare_and_dispatch_release_the_device(self):
         self._exercise_undispatched_checkout(lose_credentials=True)
 
-    def _exercise_undispatched_checkout(self, *, lose_credentials):
+    def test_french_split_rejection_releases_the_unpaid_order(self):
+        self._exercise_undispatched_checkout(lose_credentials=False, french_split=True)
+
+    def _exercise_undispatched_checkout(self, *, lose_credentials, french_split=False):
         order = self._cashier_draft()
         payment = order.payment_ids
+        if french_split:
+            payment.amount = 5
         provider_order = {}
         requests = []
 
@@ -1011,7 +1016,14 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                                       id='SQUAREORDER', version=1)
             elif (method, path) == ('POST', '/v2/terminals/checkouts'):
                 self.assertFalse(lose_credentials)
-                response = self._square_response({'errors': [{'code': 'INVALID_LOCATION'}]})
+                error = {'code': 'INVALID_LOCATION'}
+                if french_split:
+                    self.assertFalse(kwargs['json']['checkout']['payment_options']['autocomplete'])
+                    error = {
+                        'code': 'BAD_REQUEST', 'field': 'checkout.payment_options.autocomplete',
+                        'detail': 'autocomplete=false is not currently supported in: FR',
+                    }
+                response = self._square_response({'errors': [error]})
                 response.status_code = 400
                 return response
             elif (method, path) == ('PUT', '/v2/orders/SQUAREORDER'):
@@ -1032,11 +1044,13 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             credential = attempt.connection_id._credential()
             if lose_credentials:
                 credential.reauthorization_required = True
-            self.assertEqual(self._send_terminal_checkout(order, payment, reference)['state'], 'failed')
+            expected_state = 'unsupported_split' if french_split else 'failed'
+            self.assertEqual(self._send_terminal_checkout(order, payment, reference)['state'], expected_state)
             self.assertFalse(attempt.active_device_key)
             self.assertFalse(attempt.square_checkout_id)
             self.assertFalse(payment.transaction_id)
-            self.assertEqual(attempt.provider_status, 'NOT_SUBMITTED' if lose_credentials else 'INVALID_LOCATION')
+            expected_code = 'NOT_SUBMITTED' if lose_credentials else 'INVALID_LOCATION'
+            self.assertEqual(attempt.provider_status, 'PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED' if french_split else expected_code)
 
             if lose_credentials:
                 self.assertEqual(order.square_cancel_payment(order.uuid, payment.uuid, reference)['state'], 'canceling')
