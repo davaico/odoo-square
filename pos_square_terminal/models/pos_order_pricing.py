@@ -25,6 +25,8 @@ class PosOrderPricing(models.Model):
 
     def _square_priced_basket(self, digits):
         self.ensure_one()
+        # Rebuild the pricing environment from the order, including combo allocation inputs.
+        self = self.with_context({}, lang=self.env.lang).with_company(self.company_id)
         config = self.config_id
         allowed_positions = config.default_fiscal_position_id | config.fiscal_position_ids
         allowed_pricelists = config._get_available_pricelists()
@@ -42,7 +44,6 @@ class PosOrderPricing(models.Model):
         currency = self.currency_id
         account_tax = self.env['account.tax']
         price_digits = self.env['decimal.precision'].precision_get('Product Price')
-        pricelist = pricelist.with_company(self.company_id)
         can_edit_price = not config.restrict_price_control or config.group_pos_manager_id in self.env.user.all_group_ids
         discount_lines = self.env['pos.order.line']
         if 'discount_product_id' in config._fields and config.module_pos_discount and config.discount_product_id:
@@ -70,8 +71,7 @@ class PosOrderPricing(models.Model):
             taxes = product.taxes_id._filter_taxes_by_company(self.company_id)
             global_discount = line in discount_lines
             options = configured_options[line]
-            price_context = product._get_product_price_context(options)
-            option_price_extra = price_context.get('no_variant_attributes_price_extra', 0)
+            option_price_extra = product._get_no_variant_attributes_price_extra(options)
             expected_extra = 0 if line.combo_parent_id else option_price_extra
             if line.extra_tax_data and (
                 not isinstance(line.extra_tax_data, dict)
@@ -103,7 +103,7 @@ class PosOrderPricing(models.Model):
             elif line.price_type == 'manual':
                 price = line.price_unit
             else:
-                priced_product = product.with_context(**price_context)
+                priced_product = product.with_context(no_variant_attributes_price_extra=option_price_extra)
                 price = (
                     pricelist._get_product_price(priced_product, lot_quantities.get(product, line.qty)) if pricelist
                     else product.lst_price + option_price_extra
@@ -371,7 +371,7 @@ class PosOrderPricing(models.Model):
                 raise UserError(error)
 
             prices[parent] = 0
-            product = parent.product_id
+            product = parent.product_id.with_context(no_variant_attributes_price_extra=0)
             price = pricelist._get_product_price(product, 1) if pricelist else product.lst_price
             # Follow the native POS allocation: included items share the combo base price.
             # Paid extras use the group base price and receive the allocation only when every group is optional.

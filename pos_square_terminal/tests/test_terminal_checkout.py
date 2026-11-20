@@ -2270,6 +2270,50 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                 order.square_prepare_payment(order.uuid, order.payment_ids.uuid)
             provider.assert_not_called()
 
+    def test_cashier_pricing_context(self):
+        self.main_pos_config.restrict_price_control = True
+        self.desk_pad.taxes_id = [Command.clear()]
+        choice = self.env['product.combo'].create({
+            'name': 'Pad choice',
+            'combo_item_ids': [Command.create({'product_id': self.desk_pad.id})],
+        })
+        combo = self.env['product.product'].create({
+            'name': 'Pad set', 'type': 'combo', 'list_price': 12.34, 'available_in_pos': True,
+            'taxes_id': [Command.clear()], 'combo_ids': [Command.link(choice.id)],
+        })
+        pricelist = self.main_pos_config.pricelist_id
+        contexts = [
+            {'uom': self.env.ref('uom.product_uom_dozen').id},
+            {'no_variant_attributes_price_extra': 3},
+        ]
+        for use_pricelist in (True, False):
+            self.main_pos_config.use_pricelist = use_pricelist
+            for is_combo in (False, True):
+                order = self._cashier_draft()
+                order.pricelist_id = pricelist if use_pricelist else False
+                child = order.lines
+                if is_combo:
+                    parent = self.env['pos.order.line'].with_user(self.pos_user).create({
+                        'order_id': order.id, 'product_id': combo.id, 'qty': 1, 'price_unit': 0,
+                        'price_subtotal': 0, 'price_subtotal_incl': 0,
+                    })
+                    child.write({'combo_parent_id': parent.id, 'combo_item_id': choice.combo_item_ids.id})
+                self.assertEqual(child.price_type, 'original')
+                for context in contexts:
+                    with self.subTest(pricelist=use_pricelist, combo=is_combo, context=context):
+                        total, items, _tip = order.with_context(**context)._square_priced_basket(2)
+                        self.assertEqual(total, 1234)
+                        self.assertEqual(sum(item['total_minor'] for item in items), 1234)
+                child.write({'price_unit': 10, 'price_subtotal': 10, 'price_subtotal_incl': 10})
+                order.write({'amount_total': 10, 'amount_paid': 10})
+                order.payment_ids.amount = 10
+                for context in contexts:
+                    with self.subTest(pricelist=use_pricelist, combo=is_combo, context=context):
+                        with patch('odoo.addons.pos_square_terminal.square_api.request') as provider:
+                            with self.assertRaisesRegex(UserError, 'basket price changed'), self.cr.savepoint():
+                                order.with_context(**context).square_prepare_payment(order.uuid, order.payment_ids.uuid)
+                            provider.assert_not_called()
+
     def test_configured_basket_surcharge_reaches_square_as_a_summary(self):
         self.pos_user.group_ids = [Command.link(self.env.ref('product.group_product_manager').id)]
         attribute = self.env['product.attribute'].create({
