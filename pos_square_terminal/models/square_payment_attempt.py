@@ -394,6 +394,15 @@ class SquarePaymentAttempt(models.Model):
             raise SquarePaymentDiscrepancy(_("Multiple Square payments match the original checkout."))
         return next(iter(active_payments or payments), None)
 
+    def _read_settlement_payment(self):
+        original = self._read_payment(self.square_payment_id)
+        for payment_id in self._known_payment_ids():
+            if payment_id != original['id']:
+                other = self._read_payment(payment_id)
+                if other['status'] not in ('FAILED', 'CANCELED'):
+                    raise SquarePaymentDiscrepancy(_("Another Square payment matches the original checkout."))
+        return original
+
     def _requested_base_minor(self):
         return self.checkout_request['checkout']['amount_money']['amount']
 

@@ -1691,6 +1691,18 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         self.assertFalse(order.payment_ids.transaction_id)
 
     def test_expired_split_settlement_keeps_original_intent_and_can_be_abandoned(self):
+        self._assert_split_settlement_after_order_version_changes('expired')
+
+    def test_split_settlement_revalidates_and_pays_the_latest_order_version(self):
+        self._assert_split_settlement_after_order_version_changes('capture')
+
+    def test_split_order_with_new_square_pickup_releases_approvals_without_capture(self):
+        self._assert_split_settlement_after_order_version_changes('pickup_added')
+
+    def test_capture_racing_fully_authorized_split_cancellation(self):
+        self._assert_split_settlement_after_order_version_changes('racing_capture')
+
+    def _assert_split_settlement_after_order_version_changes(self, scenario):
         order = self._cashier_draft()
         first = order.payment_ids
         first.amount = 5
@@ -1699,6 +1711,14 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
         mutations = []
         settlement = []
         unavailable_order_reads = 0
+
+        def complete_order():
+            for payment in payments.values():
+                payment['status'] = 'COMPLETED'
+            provider_order.update(state='COMPLETED', version=3, tenders=[
+                {'type': 'CARD', 'payment_id': payment['id'], 'amount_money': payment['total_money']}
+                for payment in payments.values()
+            ])
 
         def square_response(method, url, **kwargs):
             nonlocal unavailable_order_reads
@@ -1734,15 +1754,27 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
                     raise ConnectionError('Square order status is unavailable')
                 payload = {'order': provider_order}
             elif (method, path) == ('POST', '/v2/orders/SPLITORDER/pay'):
+                self.assertIn(scenario, ('capture', 'expired'))
                 settlement.append(kwargs['json'])
                 self.assertEqual(settlement[0]['payment_ids'], ['TENDER-1', 'TENDER-2'])
                 self.assertTrue(settlement[0]['idempotency_key'])
+                self.assertEqual(settlement[-1]['order_version'], 2)
+                if scenario == 'capture':
+                    if len(settlement) == 1:
+                        raise ConnectionError('The first capture request never reached Square')
+                    complete_order()
+                    raise ConnectionError('Square captured the updated order before the response was lost')
                 payments['TENDER-1']['status'] = 'CANCELED'
                 unavailable_order_reads = 2
                 raise ConnectionError('A Square authorization expired before settlement')
-            elif (method, path) == ('POST', '/v2/payments/TENDER-2/cancel'):
-                payments['TENDER-2']['status'] = 'CANCELED'
-                payload = {'payment': payments['TENDER-2']}
+            elif method == 'POST' and path.startswith('/v2/payments/') and path.endswith('/cancel'):
+                payment_id = path.split('/')[-2]
+                self.assertEqual(payments[payment_id]['status'], 'APPROVED')
+                if scenario == 'racing_capture':
+                    complete_order()
+                    raise ConnectionError('Settlement completed before the release')
+                payments[payment_id]['status'] = 'CANCELED'
+                payload = {'payment': payments[payment_id]}
             elif (method, path) == ('PUT', '/v2/orders/SPLITORDER'):
                 self.assertTrue(all(payment['status'] == 'CANCELED' for payment in payments.values()))
                 provider_order.update(state='CANCELED', version=2)
@@ -1768,6 +1800,39 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             key = (order.uuid, second.uuid, approved['reference'])
             self.assertEqual(order.square_prepare_settlement(*key)['state'], 'settling')
             self.assertFalse(settlement)
+            provider_order['version'] = 2
+            if scenario == 'capture':
+                # Mismatched order details must not be captured even with the new version.
+                original_reference = provider_order['reference_id']
+                provider_order['reference_id'] = 'WRONGSALE'
+                self.assertEqual(order.square_settle_payment(*key)['state'], 'settling')
+                self.assertFalse(settlement)
+                provider_order['reference_id'] = original_reference
+                self.assertEqual(order.square_settle_payment(*key)['state'], 'settling')
+                self.assertEqual(order.square_settle_payment(*key)['state'], 'verified')
+                self.assertEqual(order.square_settle_payment(*key)['state'], 'verified')
+                self.assertEqual(len(settlement), 2)
+                self.assertEqual(settlement[0], settlement[1])
+                saved = order._square_current_attempts().square_order_link_id.settlement_request
+                self.assertEqual(saved['order_version'], 1)
+                self.assertNotEqual(saved['idempotency_key'], settlement[0]['idempotency_key'])
+                self.assertEqual(set(order.payment_ids.mapped('transaction_id')), {'TENDER-1', 'TENDER-2'})
+                return
+            if scenario == 'racing_capture':
+                self.assertEqual(order.square_cancel_payment(*key)['state'], 'verified')
+                self.assertEqual(set(order.payment_ids.mapped('transaction_id')), {'TENDER-1', 'TENDER-2'})
+                self.assertEqual(mutations[4:], ['/v2/payments/TENDER-1/cancel'])
+                return
+            if scenario == 'pickup_added':
+                provider_order['fulfillments'] = [{'uid': 'PICKUP', 'type': 'PICKUP', 'state': 'PROPOSED'}]
+                self.assertEqual(order.square_settle_payment(*key)['state'], 'settling')
+                self.assertEqual(order.square_cancel_payment(*key)['state'], 'cancelled')
+                self.assertEqual(mutations[-3:], [
+                    '/v2/payments/TENDER-1/cancel', '/v2/payments/TENDER-2/cancel', '/v2/orders/SPLITORDER',
+                ])
+                self.assertFalse(order.payment_ids.filtered('transaction_id'))
+                return
+
             self.assertEqual(order.square_settle_payment(*key)['state'], 'settling')
             self.assertEqual(order.square_cancel_payment(*key)['state'], 'settling')
             self.assertNotIn('/v2/payments/TENDER-2/cancel', mutations)
