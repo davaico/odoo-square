@@ -160,7 +160,8 @@ class SquareWebhookQueue(models.Model):
         """
         if not self.env.is_system() and not self.env.user.has_group("odoo_square.group_square_pos_service"):
             raise AccessError("Only Square administrators and the Square service can run webhook retries.")
-        return self.sudo()._process_pending_events()
+        company = self.env.company
+        return self.with_context({}, allowed_company_ids=company.ids).sudo()._process_pending_events()
 
     @api.model
     def _process_pending_events(self):

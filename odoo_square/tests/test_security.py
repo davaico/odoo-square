@@ -2,7 +2,8 @@ import json
 from datetime import timedelta
 from unittest.mock import patch
 
-from odoo import fields
+from odoo import Command, fields
+from odoo.exceptions import AccessError
 from odoo.tests.common import new_test_user, tagged
 from odoo.addons.odoo_square.models.square_api_client import SquareApiClient
 
@@ -176,6 +177,31 @@ class TestSquarePosSecurity(SquareHttpCase):
         self.assertEqual(self.queue.state, "failed")
         trusted = self.env["square.webhook.queue"].search([("verified", "=", True)])
         self.assertEqual(trusted.state, "completed")
+
+    def test_manual_webhook_retry_only_processes_the_authorized_company(self):
+        company = self.config.company_id
+        foreign = self.env["res.company"].create({"name": "Other Retry Company"})
+        operator = new_test_user(
+            self.env, login="square_retry_operator",
+            groups="base.group_user,odoo_square.group_square_pos_service",
+            company_id=company.id, company_ids=[Command.set(company.ids)],
+        )
+        queue = self.env["square.webhook.queue"]
+        foreign_pending = self.queue.copy({"company_id": foreign.id, "webhook_event_id": "FOREIGN-PENDING"})
+        foreign_completed = self.queue.copy({
+            "company_id": foreign.id, "webhook_event_id": "FOREIGN-COMPLETED",
+            "state": "completed", "processed_at": fields.Datetime.now() - timedelta(days=8),
+        })
+        retry = queue.with_user(operator)
+
+        for companies in (foreign.ids, (company | foreign).ids):
+            with self.assertRaises(AccessError):
+                retry.with_context(allowed_company_ids=companies).process_pending_events()
+
+        retry.with_context(allowed_company_ids=company.ids).process_pending_events()
+        self.assertEqual(self.queue.state, "failed")
+        self.assertEqual(foreign_pending.state, "pending")
+        self.assertTrue(foreign_completed.exists())
 
     def test_cron_runner_cannot_apply_legacy_payload_and_retries_signed_update(self):
         update = self._notification(

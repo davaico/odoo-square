@@ -2862,6 +2862,27 @@ class TestSquareTerminalCheckout(TestPointOfSaleHttpCommon):
             })],
         })
 
+    def test_checkout_uses_server_defaults_and_projects_only_its_own_tip(self):
+        other_order = self._cashier_draft(self.cash_method)
+        order = self._cashier_draft().with_context(
+            default_pricing_issue='client default', default_provider_status='client default',
+        )
+        payment = order.payment_ids
+
+        def square_response(method, url, **kwargs):
+            self.assertEqual((method, urlsplit(url).path), ('POST', '/v2/orders/calculate'))
+            return self._square_response({'order': self._draft_provider_order(kwargs['json']['order'], 1234)})
+
+        with patch('odoo.addons.pos_square_terminal.square_api.request', side_effect=square_response):
+            result = order.square_prepare_payment(order.uuid, payment.uuid)
+        attempt = order._square_attempts()
+        self.assertEqual(result['state'], 'prepared')
+        self.assertFalse(attempt.provider_status)
+
+        # A previously persisted invalid relation must be excluded from the response.
+        attempt.square_order_link_id.device_tip_line_id = other_order.lines
+        self.assertNotIn('device_tip_line', attempt._cashier_status())
+
     def test_cashier_cannot_forge_or_replace_square_payment(self):
         order = self._cashier_draft()
         payment = order.payment_ids

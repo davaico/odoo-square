@@ -240,7 +240,11 @@ class PaymentTransaction(models.Model):
         except SquareAPIError:
             raise ValidationError(_("Square is temporarily unavailable. Try another payment method.")) from None
         order._square_online_mark_checkout_change()
-        self.square_online_dispatch_at = fields.Datetime.now()
+        self.write({
+            "square_online_dispatch_at": fields.Datetime.now(),
+            "square_online_recovery_checkpoint": False,
+            "square_online_recovery_attempts": 0,
+        })
         self._set_pending(state_message=_("Square is processing your payment."))
         return True
 
@@ -316,7 +320,7 @@ class PaymentTransaction(models.Model):
         if self.state not in {"pending", target}:
             return False
 
-        values = {"provider_reference": payment["id"]}
+        values = {"provider_reference": payment["id"], "square_online_recovery_checkpoint": False}
         if payment.get("order_id"):
             values["square_online_order_reference"] = payment["order_id"]
         self.write({name: value for name, value in values.items() if self[name] != value})

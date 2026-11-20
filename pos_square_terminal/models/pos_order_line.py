@@ -32,7 +32,8 @@ class PosOrderLine(models.Model):
         return super().create(vals_list)
 
     def _square_create_device_tip(self, order, product, amount):
-        return super(PosOrderLine, self.sudo()).create({
+        lines = self.sudo().with_context({}, lang=self.env.lang).with_company(order.company_id)
+        return super(PosOrderLine, lines).create({
             'order_id': order.id,
             'product_id': product.id,
             'qty': 1,

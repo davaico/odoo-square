@@ -127,7 +127,7 @@ class PosOrder(models.Model):
                 }
                 if link.square_order_id:
                     checkout['order_id'] = link.square_order_id
-                attempt = attempts.create({
+                attempt = attempts.with_context({}, lang=self.env.lang).with_company(order.company_id).create({
                     'square_order_link_id': link.id,
                     'payment_id': payment.id,
                     'payment_uuid': payment.uuid,
@@ -158,7 +158,8 @@ class PosOrder(models.Model):
             create_request, pricing_snapshot = self._square_order_payload(location, reference, line_items)
         except SquareAPIError:
             raise UserError(_("Square could not check the catalog. Try again before sending the payment.")) from None
-        link = self.env['pos.square.order'].sudo().create({
+        links = self.env['pos.square.order'].sudo().with_context({}, lang=self.env.lang).with_company(self.company_id)
+        link = links.create({
             'order_id': self.id,
             'order_uuid': self.uuid,
             'company_id': self.company_id.id,
@@ -173,6 +174,7 @@ class PosOrder(models.Model):
             'total_minor': total_minor,
             'tip_minor': tip_minor,
             'device_tip_product_id': device_tip_product.id,
+            'device_tip_line_id': False,
             'create_request': create_request,
             'pricing_snapshot': pricing_snapshot,
             'split': split,
@@ -299,7 +301,7 @@ class PosOrder(models.Model):
         }
         try:
             with self.env.cr.savepoint():
-                attempt = previous.create({
+                attempt = previous.with_context({}, lang=self.env.lang).with_company(order.company_id).create({
                     'square_order_link_id': previous.square_order_link_id.id,
                     'payment_id': payment.id,
                     'payment_uuid': payment.uuid,

@@ -9,7 +9,7 @@
         "Follow the Square Online Payments guide in the repository to configure your "
         "Square application and test checkout in Sandbox."
     ),
-    "version": "19.0.1.0.0",
+    "version": "19.0.1.0.1",
     "category": "Accounting/Payment Providers",
     "author": "Davai",
     "website": "https://github.com/davaico/odoo-square",

@@ -533,8 +533,10 @@ class SquarePaymentAttempt(models.Model):
         status = self._cashier_tender_status()
         link = self.square_order_link_id
         tip_line = link.device_tip_line_id
-        if tip_line:
-            status['device_tip_line'] = tip_line._load_pos_data_read(tip_line, self.order_id.config_id)[0]
+        if tip_line and tip_line.order_id == self.order_id:
+            tip_line = tip_line.sudo(False)
+            if tip_line.has_access('read'):
+                status['device_tip_line'] = tip_line._load_pos_data_read(tip_line, self.order_id.config_id)[0]
         if link.split:
             status['cash_tenders'] = {
                 tender['native_uuid']: {
