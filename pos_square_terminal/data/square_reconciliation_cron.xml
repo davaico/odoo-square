@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo noupdate="1">
+    <record id="ir_cron_square_terminal_webhooks" model="ir.cron">
+        <field name="name">Square Terminal: Process verified notifications</field>
+        <field name="model_id" ref="model_pos_square_webhook_event"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_process_webhooks()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+    </record>
+    <record id="ir_cron_square_terminal_reconcile_payments" model="ir.cron">
+        <field name="name">Square Terminal: Reconcile payments</field>
+        <field name="model_id" ref="model_pos_square_payment_attempt"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_reconcile_payments()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+    </record>
+    <record id="ir_cron_square_terminal_handover" model="ir.cron">
+        <field name="name">Square Terminal: Record counter handover</field>
+        <field name="model_id" ref="model_pos_square_order"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_send_handover()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+    </record>
+</odoo>

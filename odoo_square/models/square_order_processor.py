@@ -103,7 +103,7 @@ class SquareOrderProcessor(models.Model):
     ):
         api_client = self.env["square.api.client"].sudo()
         config = api_client._website_routing_config(square_config)
-        routing, order_payload = api_client._route_website_order(order_id, config, order=verified_order)
+        routing, order_payload = api_client._route_pos_order(order_id, config, order=verified_order)
         if routing:
             return routing
 
@@ -271,7 +271,7 @@ class SquareOrderProcessor(models.Model):
         order_id = square_order_data.get("order_id") or square_order_data.get("id")
         api_client = self.env["square.api.client"].sudo()
         config = api_client._website_routing_config()
-        routing, order_payload = api_client._route_website_order(order_id, config)
+        routing, order_payload = api_client._route_pos_order(order_id, config)
         return routing or self._process_square_order(square_order_data, order_payload=order_payload)
 
     def _process_square_order(self, square_order_data, *, order_payload=None):
@@ -421,7 +421,7 @@ class SquareOrderProcessor(models.Model):
         order_id = square_order_data.get("order_id") or square_order_data.get("id")
         api_client = self.env["square.api.client"].sudo()
         config = api_client._website_routing_config()
-        routing, order_payload = api_client._route_website_order(order_id, config)
+        routing, order_payload = api_client._route_pos_order(order_id, config)
         return routing or self._process_square_order_update(
             square_order_data, sale_order, order_payload=order_payload,
         )
@@ -848,6 +848,9 @@ class SquareOrderProcessor(models.Model):
             # Fetch full order details from Square API to check for exchanges
             api_client = self.env["square.api.client"].sudo()
             routing, order_data = api_client._read_pos_order(order_id)
+            if not routing or routing["status"] == "retry":
+                config = api_client._website_routing_config()
+                routing = api_client._route_terminal_payment(payment_data, config) or routing
             if routing:
                 return routing
 

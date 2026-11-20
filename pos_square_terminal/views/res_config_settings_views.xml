@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="res_config_settings_view_form_square_terminal" model="ir.ui.view">
+        <field name="name">res.config.settings.form.square.terminal</field>
+        <field name="model">res.config.settings</field>
+        <field name="inherit_id" ref="point_of_sale.res_config_settings_view_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//setting[@id='iface_tipproduct']" position="before">
+                <setting string="Square Terminal Tips" help="Prompt each cardholder on the terminal. Select the receipt product under Tips.">
+                    <field name="pos_square_terminal_tipping"/>
+                </setting>
+            </xpath>
+            <xpath expr="//setting[@id='iface_tipproduct']/div[hasclass('content-group')]" position="attributes">
+                <attribute name="invisible">not pos_iface_tipproduct and not pos_square_terminal_tipping</attribute>
+            </xpath>
+        </field>
+    </record>
+</odoo>

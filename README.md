@@ -1,60 +1,33 @@
-# Square POS Integration
+# Square integrations for Odoo 18
 
 [![CI](https://github.com/davaico/odoo-square/actions/workflows/ci.yml/badge.svg)](https://github.com/davaico/odoo-square/actions/workflows/ci.yml)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 [![Odoo](https://img.shields.io/badge/Odoo-18.0-875A7B.svg)](https://www.odoo.com)
 
-Odoo 18 Community addon for integrating Square POS with Odoo Sales, Accounting, and Inventory.
+Choose the Odoo 18 Community addon for the register or storefront where the sale starts. You can install each independently or use all three in one database.
 
-Checkout, payment collection, and refund initiation take place in Square POS. The addon reflects that activity in Odoo sales orders, accounting records, and stock movements.
+| Where the sale starts | Addon | What it does |
+| --- | --- | --- |
+| Square POS | [Square POS Integration](#square-configuration) | Imports sales, EUR refunds and supported exchanges into Odoo Sales, Accounting and Inventory. Publishes warehouse stock to mapped Square locations. |
+| Odoo Point of Sale | [Square Terminal for Point of Sale](pos_square_terminal/README.md) | Sends the cashier’s card share to a paired terminal. The sale and itemized receipt stay in Odoo POS. |
+| Odoo website | [Square Online Payments](payment_square_online/README.md) | Collects website payments through Square and lets accounting staff refund the original payment. |
 
-For Odoo website checkout, install **Square Online Payments**. You can use either addon on its own or install both in the same database. See the [website setup and coexistence guide](payment_square_online/README.md).
+Each addon has its own Odoo Apps presentation. Choose by where the sale starts: **Square register** for sales synchronization, **Odoo register** for Terminal payments, or **Odoo website** for online checkout.
 
-## Features
+## Importer requirements
 
-- Secure Square webhook endpoint at `/square/webhook` with HMAC-SHA256 validation when a webhook signature key is configured.
-- Square order import and updates, including customer and product matching, deliveries from the mapped warehouse, and invoices and Odoo payment records for paid sales.
-- Full and partial EUR refunds and supported exchanges, with credit notes or invoices, Odoo payment records, and stock returns where applicable.
-- Square location to Odoo warehouse mapping for multi-location inventory workflows.
-- Inventory updates from Odoo stock movements and quantity adjustments to mapped Square locations.
-- Manual resync wizard for finding and replaying missing Square orders.
-- Integration log models and views for monitoring webhook, order, refund, exchange, and stock sync activity.
-- Docker Compose development and CI test setup.
-
-## Requirements
-
-- Odoo 18.0 Community and PostgreSQL. The included Compose setup tracks Odoo 18.0 and PostgreSQL 17 on Debian Bookworm.
+- Odoo 18 Community and PostgreSQL. The included Compose setup uses PostgreSQL 17.
 - Python package: `requests`, included in the official Odoo container
 - Square Developer account with an application, access token, location IDs, and webhook signature key
 - Docker and Docker Compose for the included local development environment
 
-## Compatibility
-
-This repository follows Odoo addon versioning. The current manifest version is `18.0.1.4.2`, where `18.0` is the Odoo series and `1.4.2` is the addon release version.
-
-The addon manifest declares the following Odoo dependencies:
-
-- `base`
-- `web`
-- `sale`
-- `sales_team`
-- `account`
-- `stock`
-- `sale_stock`
-- `payment`
-
 ## Quick Start
 
-Clone the Odoo 18 release branch:
+Clone the Odoo 18 release branch and create a local environment file.
 
 ```bash
 git clone --branch 18.0 https://github.com/davaico/odoo-square.git
 cd odoo-square
-```
-
-Create a local environment file:
-
-```bash
 cp .env.example .env
 ```
 
@@ -104,12 +77,6 @@ For production deployments, run Odoo behind HTTPS and keep `proxy_mode = True` i
 
 ## Development
 
-Start the local stack:
-
-```bash
-docker compose -p odoo-square-v18 up -d
-```
-
 To refresh the images and apply current operating system package updates, rebuild and recreate the services with their existing volumes.
 
 ```bash
@@ -141,40 +108,20 @@ For existing PostgreSQL 17 databases, review the [17.12 upgrade notes](https://w
 
 ## Testing
 
-Run the CI test service with its own Compose project, database, and volumes:
+The test service runs the importer by default. To exercise another addon combination, export the matching `modules` and `tags` values from the [CI matrix](.github/workflows/ci.yml) as `ODOO_INIT_MODULES` and `ODOO_TEST_TAGS`. Use a fresh Compose project for each selection.
 
 ```bash
 test_project=odoo-square-v18-test-$$
 export DB_PASSWORD=ci_odoo_test DB_NAME=odoo_square_v18_test
+export ODOO_TEST_DOCKERFILE=config/Dockerfile.test
 docker compose -p "$test_project" -f docker-compose.test.yml build --pull
 docker compose -p "$test_project" -f docker-compose.test.yml run --rm odoo
 docker compose -p "$test_project" -f docker-compose.test.yml down -v
 ```
 
-Set `ODOO_TEST_TAGS` for a focused run, for example `/odoo_square:TestSquareModuleContracts`.
+For a focused importer test, set `ODOO_TEST_TAGS=/odoo_square:TestSquareModuleContracts`. Check the test summary for a nonzero number of tests and no failures, errors or skipped addon tests. The concurrency suites use independent database connections and commit records. Run their dedicated Odoo shell commands from the [CI workflow](.github/workflows/ci.yml) in disposable databases.
 
-The suite includes HTTP webhook tests, Square order/refund integration scenarios, stock return behavior, manual resync behavior, and addon contract tests.
-
-## Project Structure
-
-```text
-odoo-square/
-├── odoo_square/
-│   ├── controllers/            # Public webhook endpoint
-│   ├── data/                   # Default users and Square products
-│   ├── models/                 # Odoo business models and services
-│   ├── security/               # ir.model.access.csv
-│   ├── static/description/     # Odoo app listing assets
-│   ├── tests/                  # Odoo TransactionCase and HttpCase tests
-│   └── views/                  # Backend UI views and menus
-├── config/                     # Odoo container configuration
-├── .github/workflows/          # CI
-├── docker-compose.yml          # Local development stack
-├── docker-compose.test.yml     # Test stack used by CI
-└── README.md
-```
-
-## Architecture
+## Importer data flow
 
 ```mermaid
 flowchart TB
@@ -204,14 +151,16 @@ flowchart TB
 
 ## Operational Notes
 
+When deploying Square POS Integration `18.0.1.4.3`, [upgrade the installed module](#development) before resuming stock synchronization. The upgrade adds stock-count metadata used by Square Terminal and preserves pending counts.
+
 When upgrading Square POS Integration to `18.0.1.4.2`, update the installed module to apply the refund schema change. Unverified legacy refunds retain their claimed Square ID and document links for review. Confirmed Square deliveries can use the same ID to record the verified refund. If your installation processed a signed replay on 18.0.1.4.1 and a historical refund was removed, consult a backup taken before that operation for its original links.
 
 - Configure the webhook signature key in Odoo before exposing the endpoint publicly.
 - Keep Square access tokens out of Git. Use Odoo configuration records, environment-specific secrets management, or encrypted backups.
 - Map every active Square location to the intended Odoo warehouse before enabling production inventory sync.
-- Automatic stock counts are queued with the stock change. The **Square POS: Send inventory counts** scheduled action sends committed warehouse quantities every minute and retries failed requests after five minutes. A newer observation replaces an older queued count for the same SKU and location. Square accepts observations up to 24 hours old. After that, or after correcting an ambiguous SKU, use **Synchronize All Products** to send a fresh count.
+- **Square POS: Send inventory counts** publishes the latest queued warehouse quantity for each mapped product and location. Odoo automatically takes a fresh measurement when a queued count is more than 24 hours old. If duplicate Square catalog SKUs paused a count, make the SKU unique and choose **Synchronize All Products** to send a fresh count.
 - Review the integration logs under **Square > Activity** and inspect out-of-order events under **Square > Webhook Queue**.
-- To recover orders missing from Odoo, open the configuration and choose **Manual Resync Orders**. Set a date range, choose **Scan Missing Orders**, select the orders to recover, then choose **Validate and Resync**.
+- To recover orders missing from Odoo, open the configuration and choose **Manual Resync Orders**. Set a date range and choose **Scan Missing Orders**. If references await ownership verification, choose **Scan Again** once Square access recovers, or recover the identified sales now and start a new scan later. Select the orders to recover and choose **Validate and Resync**.
 
 ## Contributing
 

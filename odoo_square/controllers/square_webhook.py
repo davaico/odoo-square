@@ -264,7 +264,7 @@ class SquareWebhookController(http.Controller):
 
             api_client = req_env["square.api.client"].sudo()
             config = api_client._website_routing_config(square_config)
-            routing = api_client._route_website_refund(refund_data, config, signed=signed)
+            routing = api_client._route_pos_refund(refund_data, config, signed=signed)
             if routing:
                 return routing
 
@@ -283,11 +283,11 @@ class SquareWebhookController(http.Controller):
             payment_id = refund_data.get("payment_id")
             sale_order = find("square_payment_id", payment_id) or find("square_order_id", order_id)
             if not sale_order:
-                refund = api_client._read_website_routing_resource("refunds", "refund", refund_id, config)
+                refund = api_client._read_routing_resource("refunds", "refund", refund_id, config)
                 api_payment_id = refund.get("payment_id")
                 sale_order = find("square_payment_id", api_payment_id)
                 if api_payment_id and not sale_order:
-                    payment = api_client._read_website_routing_resource("payments", "payment", api_payment_id, config)
+                    payment = api_client._read_routing_resource("payments", "payment", api_payment_id, config)
                     sale_order = find("square_order_id", payment.get("order_id"))
 
             if not sale_order:

@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 from time import monotonic
 from uuid import uuid4
 
+from psycopg2.extras import Json
+
 from odoo import api, fields, models
 from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 
@@ -25,6 +27,7 @@ class SquareStockCount(models.Model):
     counted_at = fields.Datetime(required=True)
     request_key = fields.Char(required=True)
     catalog_object_id = fields.Char()
+    terminal_orders = fields.Json()
     next_attempt = fields.Datetime(index=True)
 
     _sql_constraints = [
@@ -32,7 +35,7 @@ class SquareStockCount(models.Model):
     ]
 
     @api.model
-    def _queue_count(self, product, mapping, quantity):
+    def _queue_count(self, product, mapping, quantity, *, terminal_orders=None):
         # Updating one row per product/location also serializes concurrent bin changes.
         # PostgreSQL retries cannot publish counts from a rolled-back stock transaction.
         self.flush_model()
@@ -40,16 +43,23 @@ class SquareStockCount(models.Model):
         self.env.cr.execute("""
             INSERT INTO square_stock_count
                 (product_id, mapping_id, warehouse_id, square_location_id, sku, quantity,
-                 counted_at, request_key, next_attempt)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 counted_at, request_key, next_attempt, terminal_orders)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (product_id, mapping_id) DO UPDATE SET
                 warehouse_id = EXCLUDED.warehouse_id, square_location_id = EXCLUDED.square_location_id,
                 sku = EXCLUDED.sku, quantity = EXCLUDED.quantity, counted_at = EXCLUDED.counted_at,
                 request_key = EXCLUDED.request_key, catalog_object_id = NULL,
-                next_attempt = EXCLUDED.next_attempt
+                next_attempt = EXCLUDED.next_attempt,
+                terminal_orders = CASE
+                    WHEN square_stock_count.warehouse_id = EXCLUDED.warehouse_id
+                        AND square_stock_count.square_location_id = EXCLUDED.square_location_id
+                        AND square_stock_count.sku = EXCLUDED.sku
+                    THEN COALESCE(square_stock_count.terminal_orders, '{}'::jsonb) || EXCLUDED.terminal_orders
+                    ELSE EXCLUDED.terminal_orders
+                END
             RETURNING id
         """, (product.id, mapping.id, mapping.warehouse_id.id, mapping.square_location_id,
-              product.default_code, quantity, now, str(uuid4()), fields.Datetime.now()))
+              product.default_code, quantity, now, str(uuid4()), fields.Datetime.now(), Json(terminal_orders or {})))
         self.browse(self.env.cr.fetchone()[0]).invalidate_recordset(flush=False)
 
     @api.model
@@ -95,8 +105,9 @@ class SquareStockCount(models.Model):
             # measurement with its own timestamp and key before resolving the SKU.
             self._queue_count(product, mapping, service._get_warehouse_stock(product, self.warehouse_id))
         if config.id not in locations_by_config:
-            locations_by_config[config.id] = set(service._merchant_location_ids(active_config))
-        if self.square_location_id not in locations_by_config[config.id]:
+            locations_by_config[config.id] = service._active_merchant_locations(active_config)
+        location = locations_by_config[config.id].get(self.square_location_id)
+        if not location:
             self.next_attempt = fields.Datetime.now() + timedelta(minutes=5)
             return
         client = service.env["square.api.client"]
@@ -112,6 +123,10 @@ class SquareStockCount(models.Model):
                 service._record_count_result(product, self.square_location_id, False)
                 self.next_attempt = False if match.get("ambiguous") else fields.Datetime.now() + timedelta(minutes=5)
             return
+        if self.terminal_orders:
+            # Commit the effective count timestamp before dispatch, just like the variation.
+            self._order_count_after_terminal_sales(client, config, location)
+            return
         success = client._set_physical_count(
             self.catalog_object_id, self.square_location_id, self.quantity, self.sku,
             request_id=self.request_key, occurred_at=self.counted_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
@@ -121,3 +136,39 @@ class SquareStockCount(models.Model):
             self.unlink()
         else:
             self.next_attempt = fields.Datetime.now() + timedelta(minutes=5)
+
+    def _order_count_after_terminal_sales(self, client, config, location):
+        counted_at = self.counted_at
+        for order_id, scope in self.terminal_orders.items():
+            if self.catalog_object_id not in scope['variations'] or scope['environment'] != config.square_environment:
+                continue
+            if not location.get('merchant_id'):
+                self.next_attempt = fields.Datetime.now() + timedelta(minutes=5)
+                return
+            if scope['merchant_id'] != location['merchant_id']:
+                continue
+            order = client._get_order(order_id, square_config=config)
+            if (
+                not order or order.get('state') != 'COMPLETED'
+                or order.get('location_id') != self.square_location_id
+                or order.get('reference_id') != scope['reference_id']
+            ):
+                self.next_attempt = fields.Datetime.now() + timedelta(minutes=5)
+                return
+            try:
+                closed_at = datetime.fromisoformat(order.get('closed_at', '').replace('Z', '+00:00'))
+                if closed_at.tzinfo is None:
+                    raise ValueError('Square order completion must include a time zone')
+            except (AttributeError, ValueError):
+                self.next_attempt = fields.Datetime.now() + timedelta(minutes=5)
+                return
+            # A tracked Square variation is deducted when the order completes. Keep
+            # the warehouse observation after that event even if the clocks differ.
+            closed_at = closed_at.astimezone(timezone.utc).replace(tzinfo=None)
+            counted_at = max(counted_at, closed_at + timedelta(milliseconds=1))
+
+        if counted_at > datetime.now(timezone.utc).replace(tzinfo=None):
+            # Square rejects future physical counts. Leave the observation queued.
+            self.next_attempt = counted_at + timedelta(seconds=1)
+            return
+        self.write({'counted_at': counted_at, 'terminal_orders': {}})

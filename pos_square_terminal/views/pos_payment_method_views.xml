@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="pos_payment_method_view_form" model="ir.ui.view">
+        <field name="name">pos.payment.method.form.square.terminal</field>
+        <field name="model">pos.payment.method</field>
+        <field name="inherit_id" ref="point_of_sale.pos_payment_method_view_form"/>
+        <field name="arch" type="xml">
+            <field name="use_payment_terminal" position="after">
+                <field name="square_terminal_id" invisible="use_payment_terminal != 'square_terminal'"
+                       options="{'no_create': True}" groups="point_of_sale.group_pos_manager"/>
+                <field name="square_terminal_unavailable_reason" string="Square Readiness"
+                       invisible="use_payment_terminal != 'square_terminal' or not square_terminal_unavailable_reason"/>
+                <div class="text-success" invisible="use_payment_terminal != 'square_terminal' or square_terminal_unavailable_reason">
+                    Ready for Square Terminal
+                </div>
+            </field>
+        </field>
+    </record>
+</odoo>
