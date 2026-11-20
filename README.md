@@ -12,6 +12,8 @@ Choose the Odoo 18 Community addon for the register or storefront where the sale
 | Odoo Point of Sale | [Square Terminal for Point of Sale](pos_square_terminal/README.md) | Sends the cashier’s card share to a paired terminal. The sale and itemized receipt stay in Odoo POS. |
 | Odoo website | [Square Online Payments](payment_square_online/README.md) | Collects website payments through Square and lets accounting staff refund the original payment. |
 
+Each addon has its own Odoo Apps presentation. Choose by where the sale starts: **Square register** for sales synchronization, **Odoo register** for Terminal payments, or **Odoo website** for online checkout.
+
 ## Importer requirements
 
 - Odoo 18 Community and PostgreSQL. The included Compose setup uses PostgreSQL 17.
