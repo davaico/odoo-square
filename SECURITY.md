@@ -8,7 +8,7 @@ Security fixes are accepted for these Odoo addon series.
 | --- | --- | --- |
 | 17.0 | `17.0` | Square POS Integration |
 | 18.0 | `18.0` | Square POS Integration, Square Online Payments |
-| 19.0 | `19.0` | Square POS Integration, Square Online Payments |
+| 19.0 | `19.0` | Square POS Integration, Square Online Payments, Square Terminal for Point of Sale |
 
 ## Reporting a Vulnerability
 
@@ -26,7 +26,7 @@ If you are not sure whether an issue is security-sensitive, report it privately 
 
 ## Sensitive Data
 
-This addon handles Square credentials, webhook signatures, customer contact data, sales orders, invoices, refunds, and inventory records. Reports and pull requests must not include live access tokens, webhook signature keys, customer personal data, production database dumps, or unredacted webhook payloads.
+Redact access tokens, signing and encryption keys, pairing codes, card details, and customer data from reports and pull requests. Keep production database dumps and raw webhook payloads private.
 
 ## Operational Recommendations
 

@@ -479,14 +479,22 @@ class TestSquareOnlineRecovery(SquareOnlineCheckoutCase):
         self._configure_webhook()
         self.env["ir.config_parameter"].set_param("sale.automatic_invoice", "True")
         order, payment = self._accepted_charge_timeout(external)
+        tx = order.transaction_ids
+        tx.write({
+            "square_online_recovery_attempts": 12,
+            "square_online_recovery_checkpoint": {
+                "begin_time": "2026-01-07T14:15:00Z",
+                "end_time": "2026-01-07T14:16:00Z",
+            },
+        })
         self.authenticate(None, None)
 
         self.assertEqual(self._signed_webhook(payment).status_code, 200)
         native_post_process = self.env.ref("payment.cron_post_process_payment_tx")
         native_post_process.method_direct_trigger()
         self.env.invalidate_all()
-        tx = order.transaction_ids
         self.assertEqual(tx.state, "done")
+        self.assertFalse(tx.square_online_recovery_checkpoint)
         self.assertEqual(tx.provider_reference, payment["id"])
         self.assertEqual(tx.square_online_connection_id, self.connection)
         self.assertEqual(tx.payment_id.amount, 47)
@@ -641,6 +649,109 @@ class TestSquareOnlineRecovery(SquareOnlineCheckoutCase):
             "GET", "https://connect.squareupsandbox.com/v2/payments/" + payment["id"],
         ))
         self.assertEqual([call.args[0] for call in external.call_args_list], ["POST", "GET", "GET", "GET"])
+
+    @patch(square_boundary)
+    def test_scheduled_recovery_caps_list_pages_and_resumes_from_an_inclusive_timestamp(self, external):
+        order, payment = self._accepted_charge_timeout(external)
+        tx = order.transaction_ids
+        tx.square_online_dispatch_at = fields.Datetime.subtract(fields.Datetime.now(), hours=1)
+        timestamps = [
+            fields.Datetime.add(tx.square_online_dispatch_at, seconds=page).isoformat(timespec="seconds") + "Z"
+            for page in range(1, 5)
+        ]
+        cron = self.env.ref("payment_square_online.cron_square_online_recover_status")
+        external.reset_mock()
+        external.side_effect = [
+            self._square_response({
+                "payments": [{"created_at": created_at}],
+                "cursor": f"page-{page}",
+            })
+            for page, created_at in enumerate(timestamps, start=2)
+        ]
+        cron.method_direct_trigger()
+        self.env.invalidate_all()
+        self.assertEqual(tx.state, "pending")
+        self.assertFalse(tx.provider_reference)
+        self.assertEqual(tx.square_online_recovery_attempts, 1)
+        self.assertEqual(external.call_count, 4)
+        first_query = external.call_args_list[0].kwargs["params"]
+        self.assertEqual(tx.square_online_recovery_checkpoint, {
+            "begin_time": timestamps[-1], "end_time": first_query["end_time"],
+        })
+
+        tx.square_online_recovery_checked_at = fields.Datetime.subtract(fields.Datetime.now(), minutes=6)
+        external.side_effect = None
+        external.return_value = self._square_response({
+            "payments": [{**payment, "created_at": timestamps[-1]}],
+        })
+        cron.method_direct_trigger()
+        self.env.invalidate_all()
+        self.assertEqual(external.call_count, 5)
+        self.assertEqual(external.call_args.kwargs["params"], {**first_query, "begin_time": timestamps[-1]})
+        self.assertFalse(tx.square_online_recovery_checkpoint)
+        self.assertEqual(tx.state, "done")
+        self.assertEqual(tx.payment_id.amount, 47)
+        self.assertEqual(order.state, "sale")
+
+    @patch(square_boundary)
+    def test_recovery_pauses_after_automatic_limit_and_accounting_can_refresh(self, external):
+        order, payment = self._accepted_charge_timeout(external)
+        tx = order.transaction_ids
+        start = fields.Datetime.subtract(tx.square_online_dispatch_at, minutes=5)
+        checkpoint = {
+            "begin_time": start.isoformat(timespec="seconds") + "Z",
+            "end_time": fields.Datetime.now().isoformat(timespec="seconds") + "Z",
+        }
+        tx.write({
+            "square_online_recovery_attempts": 11,
+            "square_online_recovery_checkpoint": checkpoint,
+        })
+        cron = self.env.ref("payment_square_online.cron_square_online_recover_status")
+        external.reset_mock()
+        external.side_effect = [
+            self._square_response({
+                "payments": [{
+                    "created_at": fields.Datetime.add(start, seconds=2).isoformat(timespec="seconds") + "Z",
+                }],
+                "cursor": "page-2",
+            }),
+            self._square_response({"payments": [{"created_at": checkpoint["begin_time"]}], "cursor": "page-3"}),
+            self._square_response({"payments": [{}], "cursor": "page-4"}),
+            self._square_response({"payments": [], "cursor": "page-5"}),
+        ]
+        cron.method_direct_trigger()
+        self.env.invalidate_all()
+        self.assertEqual(external.call_count, 4)
+        self.assertEqual(tx.square_online_recovery_checkpoint, checkpoint)
+        self.assertEqual(tx.square_online_recovery_attempts, 12)
+        self.assertIn("Automatic Square recovery is paused.", tx.square_online_recovery_message)
+
+        tx.square_online_recovery_checked_at = fields.Datetime.subtract(fields.Datetime.now(), minutes=6)
+        external.reset_mock()
+        cron.method_direct_trigger()
+        external.assert_not_called()
+        self.assertEqual(tx.state, "pending")
+        self.assertFalse(tx.provider_reference)
+        self.assertFalse(tx.payment_id)
+        self.assertEqual(order.state, "draft")
+
+        manager = new_test_user(
+            self.env, login="square-recovery-account-manager", groups="account.group_account_manager",
+            company_id=self.company.id, company_ids=[Command.set(self.company.ids)],
+        )
+        self.authenticate(manager.login, manager.login)
+        external.side_effect = None
+        external.return_value = self._square_response({"payments": [payment]})
+        self.assertEqual(self._call_refresh(tx)["tag"], "reload")
+        self.env.invalidate_all()
+        external.assert_called_once()
+        self.assertNotIn("cursor", external.call_args.kwargs["params"])
+        self.assertEqual(external.call_args.kwargs["params"]["begin_time"], checkpoint["begin_time"])
+        self.assertEqual(tx.square_online_recovery_attempts, 12)
+        self.assertEqual(tx.state, "done")
+        self.assertEqual(tx.provider_reference, payment["id"])
+        self.assertFalse(tx.square_online_recovery_checkpoint)
+        self.assertFalse(tx.square_online_recovery_message)
 
     @patch(square_boundary)
     def test_refresh_and_history_require_accounting_role_and_the_current_company(self, external):

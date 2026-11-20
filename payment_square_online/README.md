@@ -105,11 +105,11 @@ Install both **Square Online Payments** and **Square POS Integration** in the sa
 | Website checkout, website payment recovery, and refunds for website payments | **Square Online** payment provider and its merchant-authorized OAuth connection, company, website, and bank journal | `/payment/square_online/webhook/<connection_id>` |
 | Import Square POS sales, payments, refunds, exchanges, and stock activity | **Square → Configuration**, with its own Square API token, payment journal, and location-to-warehouse mappings | `/square/webhook` |
 
-Create separate subscriptions and paste each subscription's signature key into the corresponding configuration. Keep each subscription and its credentials in the same Square environment. The two addons may use the same Square merchant and location. Keep configuring their credentials separately; the POS importer's credentials need access to retrieve orders and payments for its Square merchant.
+Create a separate subscription for each addon and save its signature key with the matching credentials and environment. Both addons can share the same merchant and location. The importer’s credentials need permission to retrieve that merchant’s orders and payments. If you also use Square at the Odoo register, follow the [Square Terminal setup guide](../pos_square_terminal/README.md).
 
 The website addon records the payment against the existing Odoo order. Odoo handles website invoicing and fulfillment through its normal workflow. A website refund posts the outgoing payment; create any credit note or goods return separately. POS imports genuine Square sales, refunds, and exchanges with its usual accounting and stock effects.
 
-POS skips activity belonging to a website payment, including separate Square return orders tied to that payment. The manual POS resync excludes identified website orders. If Square can't confirm an order or payment's ownership yet, the POS webhook returns HTTP 503 for Square to retry. Check Square API access on the POS configuration if the same notification keeps retrying. For a website transaction still in doubt, open its **Square Payment History** and use **Refresh status**.
+The importer skips website payments and their related Square return orders during webhook processing and manual resync. If ownership is unclear, Square retries the webhook and manual resync can recover other identified sales. Check the importer’s Square API access if a notification keeps retrying. For a website payment still in doubt, use **Refresh status** in **Square Payment History**.
 
 ## Recover and review online payments
 
@@ -140,47 +140,4 @@ Pending Square refunds reduce the available balance shown in Odoo. Completed Squ
 
 ## Run the automated Odoo 19 tests
 
-CI runs separate POS-only, standalone online, combined, and concurrent-refund jobs. It requires nonzero passing test results, rejects skipped addon tests, and checks that the browser and combined coexistence cases ran. Logs are attached to each job.
-
-Run the following commands from the repository root in Bash. The browser test image uses Linux amd64 and installs Google Chrome Stable from Google's signed package repository and `python3-websocket` from Ubuntu. To use another compatible Odoo 19 test image with Chrome or Chromium and `python3-websocket`, set `ODOO_TEST_IMAGE` to its local tag.
-
-```bash
-docker build --pull -f config/Dockerfile.test -t odoo-square-v19-browser-test config
-export ODOO_TEST_IMAGE=odoo-square-v19-browser-test
-
-run_square_tests() (
-  set -e -o pipefail
-  export SQUARE_ONLINE_TEST_ENCRYPTION_KEY
-  SQUARE_ONLINE_TEST_ENCRYPTION_KEY=$(python3 -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')
-  local compose=(docker compose --project-name "odoo-square-v19-test-$(date +%s)-$BASHPID" -f docker-compose.test.yml)
-  trap '"${compose[@]}" down --volumes' EXIT
-  "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_test \
-    --init="$1" --test-tags="$2" --workers=0 --stop-after-init --log-level=test 2>&1 | tee "$3"
-  grep -E '0 failed, 0 error\(s\) of [1-9][0-9]* tests when loading database' "$3"
-)
-
-run_square_tests payment_square_online,website_sale_stock,payment_demo \
-  /payment_square_online,-/payment_square_online:TestSquareOnlinePosCoexistence square-online-test.log
-run_square_tests payment_square_online,website_sale_stock,payment_demo,odoo_square \
-  /payment_square_online,/odoo_square square-combined-test.log
-```
-
-Each run uses fresh project-scoped database and filestore volumes and publishes no ports. `website_sale_stock` enables Odoo's website stock workflows used by some online tests. Odoo's `payment_demo` is a test fixture for a second provider with saved cards; the Square add-on does not require it. The standalone selection excludes the POS coexistence class because POS is absent. In the combined run, check that `TestSquareOnlinePosCoexistence` ran. Check both logs for skipped tests and confirm that the checkout browser case ran in Chrome. These suites exercise Odoo checkout, accounting, and POS workflows while simulating Square's SDK and API. Complete the [Sandbox payment and refund checks](#make-a-sandbox-payment) for evidence against Square itself.
-
-### Exercise concurrent refunds
-
-The concurrency fixture uses separate PostgreSQL connections to submit simultaneous Odoo refunds and overlap a Square refund with an Odoo request. It simulates Square's API and checks the posted refunds. It commits test records, so run it in a fresh disposable project with a USD company and bank journal.
-
-```bash
-(
-  set -e
-  export SQUARE_ONLINE_TEST_ENCRYPTION_KEY
-  SQUARE_ONLINE_TEST_ENCRYPTION_KEY=$(python3 -c 'import base64, secrets; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())')
-  compose=(docker compose --project-name "odoo-square-v19-test-race-$(date +%s)-$BASHPID" -f docker-compose.test.yml)
-  trap '"${compose[@]}" down --volumes' EXIT
-  "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_test \
-    --init=payment_square_online --stop-after-init --no-http
-  "${compose[@]}" run --rm -T odoo odoo shell --database=odoo_square_test --no-http \
-    < payment_square_online/tests/refund_race.py
-)
-```
+Use the online, combined, Terminal combined, or concurrent-refund entry in the [repository test instructions](../README.md#testing). The concurrent-refund selection also needs a disposable database with a USD company and bank journal. Use the [Sandbox checkout and refund checks](#make-a-sandbox-payment) to verify your Square configuration.

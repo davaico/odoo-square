@@ -88,6 +88,8 @@ class SquareManualResyncWizard(models.TransientModel):
         readonly=True,
     )
 
+    deferred_order_references = fields.Text(string="Orders Awaiting Ownership Verification", readonly=True)
+
     # Counters
     square_total = fields.Integer(
         string="Total Orders in Square",
@@ -218,16 +220,17 @@ class SquareManualResyncWizard(models.TransientModel):
             ])
             existing_order_ids = set(existing_orders.mapped("square_order_id"))
             line_vals = []
+            deferred = []
             for order_id in sorted(orders_by_id.keys() - existing_order_ids):
                 order = orders_by_id[order_id]
-                routing = self.env["square.order.processor"]._square_online_event_result(
+                routing = self.env["square.order.processor"]._square_pos_order_result(
                     order_id=order_id, location_id=order.get("location_id"),
                     square_config=config, full_order=order,
                 )
                 if routing:
-                    if routing["status"] == "ignored":
-                        continue
-                    raise UserError(routing["message"])
+                    if routing["status"] == "retry":
+                        deferred.append(order_id)
+                    continue
                 try:
                     created_at = _square_ts_to_odoo_naive(order.get("created_at"))
                 except (ValueError, TypeError, OverflowError):
@@ -243,6 +246,7 @@ class SquareManualResyncWizard(models.TransientModel):
 
             self.line_ids.unlink()
             self.line_ids = line_vals
+            self.deferred_order_references = "\n".join(deferred)
             self.odoo_total = len(existing_order_ids)
             self.square_total = self.odoo_total + len(line_vals)
             self.state = "results"

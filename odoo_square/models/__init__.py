@@ -6,6 +6,7 @@ from . import sale_order_line
 from . import square_event_receipt
 from . import square_order_processor
 from . import square_online_routing
+from . import square_terminal_routing
 from . import square_refund
 from . import square_stock_sync
 from . import square_stock_count

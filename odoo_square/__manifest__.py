@@ -3,13 +3,14 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 {
     "name": "Square POS Integration",
-    "version": "19.0.1.4.2",
+    "version": "19.0.1.4.3",
     "category": "Sales",
-    "summary": "Complete Square POS integration for orders, refunds, exchanges and inventory sync",
+    "summary": "Sync Square POS sales, refunds and stock with Odoo",
     "description": """
 Square POS Integration
 ======================
-A complete integration module connecting Odoo with Square POS system.
+Create sales and collect payments in Square POS, then synchronize the records into Odoo.
+Odoo serves as the back office for these Square-register sales.
 
 Features:
 - Webhook processing for orders, refunds, and exchanges
@@ -38,7 +39,7 @@ Features:
         "views/square_webhook_queue_views.xml",
         "views/square_manual_resync_views.xml",
     ],
-    "images": ["static/description/square-terminal.png"],
+    "images": ["static/description/square-register.png"],
     "installable": True,
     "auto_install": False,
     "application": True,

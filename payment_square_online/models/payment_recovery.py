@@ -1,5 +1,6 @@
 # License AGPL-3.0 or later (https://www.gnu.org/licenses/agpl).
 import logging
+from datetime import UTC, datetime
 
 from odoo import _, api, fields, models
 from odoo.exceptions import AccessError, UserError
@@ -9,6 +10,19 @@ from ..square_api import SquareAPIError
 
 
 _logger = logging.getLogger(__name__)
+_PAYMENT_RECOVERY_PAGES_PER_CHECK = 4
+_PAYMENT_RECOVERY_AUTOMATIC_CHECKS = 12
+
+
+def _payment_created_at(payment):
+    if isinstance(payment, dict):
+        try:
+            created_at = datetime.fromisoformat(payment.get("created_at"))
+            if created_at.tzinfo is not None:
+                return created_at.astimezone(UTC)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return None
 
 
 class PaymentTransaction(models.Model):
@@ -20,6 +34,8 @@ class PaymentTransaction(models.Model):
     square_online_recovery_checked_at = fields.Datetime(
         string="Last Square Status Check", readonly=True, copy=False,
     )
+    square_online_recovery_checkpoint = fields.Json(readonly=True, copy=False, groups="base.group_system")
+    square_online_recovery_attempts = fields.Integer(readonly=True, copy=False)
 
     @api.model
     def _square_online_handle_webhook(self, connection, event_type, object_data):
@@ -62,8 +78,24 @@ class PaymentTransaction(models.Model):
         self.sudo()._square_online_refresh_status()
         return {"type": "ir.actions.client", "tag": "reload"}
 
-    def _square_online_refresh_status(self):
+    def _square_online_refresh_status(self, *, automatic=False):
         self.ensure_one()
+        if self.operation == "online_direct" and not self.provider_reference:
+            # Serialize checkout recovery with other readers and signed provider updates.
+            self._square_online_lock_payment()
+            self.invalidate_recordset([
+                "provider_reference", "state", "square_online_recovery_attempts",
+                "square_online_recovery_checkpoint",
+            ])
+        listing = self.operation == "online_direct" and not self.provider_reference
+        if automatic and listing:
+            if (
+                self.state != "pending"
+                or self.square_online_recovery_attempts >= _PAYMENT_RECOVERY_AUTOMATIC_CHECKS
+            ):
+                return
+            # Count failed provider calls too, while keeping the claimant pending for review.
+            self.square_online_recovery_attempts += 1
         try:
             with self.env.cr.savepoint():
                 matched = self._square_online_read_status()
@@ -76,6 +108,11 @@ class PaymentTransaction(models.Model):
             message = False if matched else _(
                 "Odoo could not verify this operation in Square. Check the Square Dashboard and refresh later."
             )
+        if (
+            message and listing and self.state == "pending"
+            and self.square_online_recovery_attempts >= _PAYMENT_RECOVERY_AUTOMATIC_CHECKS
+        ):
+            message = _("Automatic Square recovery is paused. %(message)s", message=message)
         self.write({
             "square_online_recovery_checked_at": fields.Datetime.now(),
             "square_online_recovery_message": message,
@@ -92,15 +129,23 @@ class PaymentTransaction(models.Model):
             payment = connection._square_online_get_payment(self.provider_reference)
             return self._square_online_recover_payment(payment, connection)
 
-        # ListPayments is eventually consistent. An absent item cannot release the pending claim.
+        # Square cursors can expire before the next cron check. Resume from the
+        # last checked timestamp, including any payments tied at that timestamp.
         start = fields.Datetime.subtract(self.square_online_dispatch_at, minutes=5)
+        checkpoint = self.square_online_recovery_checkpoint or {}
+        begin_time = checkpoint.get("begin_time") or start.isoformat(timespec="seconds") + "Z"
+        end_time = checkpoint.get("end_time") or fields.Datetime.now().isoformat(timespec="seconds") + "Z"
         params = {
-            "begin_time": start.isoformat(timespec="seconds") + "Z",
+            "begin_time": begin_time,
+            "end_time": end_time,
             "location_id": self.square_online_location_id,
             "sort_order": "ASC",
         }
+        last_created_at = datetime.fromisoformat(begin_time)
+        window_end = datetime.fromisoformat(end_time)
+        timestamps_ordered = True
         seen_cursors = set()
-        while True:
+        for _page in range(_PAYMENT_RECOVERY_PAGES_PER_CHECK):
             page = connection._square_online_request("GET", "/v2/payments", params=params)
             payments = page.get("payments", [])
             if not isinstance(payments, list):
@@ -111,11 +156,26 @@ class PaymentTransaction(models.Model):
                     and self._square_online_matches_payment(payment, connection)
                 ):
                     return self._square_online_recover_payment(payment, connection)
+                if timestamps_ordered:
+                    created_at = _payment_created_at(payment)
+                    if created_at is None or not last_created_at <= created_at <= window_end:
+                        timestamps_ordered = False
+                    else:
+                        last_created_at = created_at
             cursor = page.get("cursor")
-            if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            if cursor in (None, ""):
+                # ListPayments is eventually consistent. A completed sweep can
+                # start over on the next bounded check to find late-visible payments.
+                self.square_online_recovery_checkpoint = False
                 return False
+            if not isinstance(cursor, str) or cursor in seen_cursors:
+                break
             seen_cursors.add(cursor)
             params = {**params, "cursor": cursor}
+        if timestamps_ordered:
+            begin_time = last_created_at.isoformat().replace("+00:00", "Z")
+        self.square_online_recovery_checkpoint = {"begin_time": begin_time, "end_time": end_time}
+        return False
 
     def _square_online_recover_payment(self, payment, connection):
         if not self._square_online_apply_payment(payment, connection):
@@ -133,8 +193,14 @@ class PaymentTransaction(models.Model):
 
     @api.model
     def _square_online_recovery_domain(self):
+        pending = Domain("state", "=", "pending") & (
+            Domain("operation", "!=", "online_direct")
+            | Domain("provider_reference", "!=", False)
+            | Domain("square_online_recovery_attempts", "=", False)
+            | Domain("square_online_recovery_attempts", "<", _PAYMENT_RECOVERY_AUTOMATIC_CHECKS)
+        )
         return self._square_online_refreshable_domain() & (
-            Domain("state", "=", "pending")
+            pending
             | Domain([("state", "=", "done"), ("is_post_processed", "=", False)])
             | Domain([("state", "=", "done"), ("square_online_unattributed_refund_minor", ">", 0)])
         )
@@ -156,7 +222,7 @@ class PaymentTransaction(models.Model):
             tx = tx.with_prefetch()
             if tx.filtered_domain(domain):
                 if tx.state == "pending" or tx.square_online_unattributed_refund_minor:
-                    tx._square_online_refresh_status()
+                    tx._square_online_refresh_status(automatic=True)
                 if tx.state == "done" and not tx.is_post_processed:
                     # Keep the authoritative status even if Odoo accounting needs attention.
                     try:

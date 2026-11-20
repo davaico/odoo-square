@@ -20,7 +20,7 @@ Use `feat/v19` for Odoo 19 work. See the [local setup](README.md#quick-start) an
 
 ## Tests
 
-Run the [full addon test suite](README.md#testing) on a fresh Odoo 19 Community database before opening a pull request.
+Before opening a pull request, run the full suite for each affected addon on a fresh Odoo 19 Community database. Include the relevant coexistence suites for shared workflows. [Test instructions](README.md#testing)
 
 Tests should be added or updated when a change affects:
 

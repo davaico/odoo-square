@@ -3,6 +3,7 @@ import requests
 import logging
 from datetime import datetime, timezone
 from uuid import uuid4
+from urllib.parse import quote
 from odoo.service.model import PG_CONCURRENCY_EXCEPTIONS_TO_RETRY
 from odoo import models, api
 from odoo.exceptions import UserError
@@ -86,7 +87,7 @@ class SquareApiClient(models.Model):
             dict: Complete order data from Square API
         """
         try:
-            endpoint = f"/v2/orders/{order_id}"
+            endpoint = f"/v2/orders/{quote(order_id, safe='')}"
             response = self._make_api_request(endpoint, square_config=square_config)
 
             if "order" in response:

@@ -5,7 +5,7 @@ from odoo import _, models
 class SquareOrderProcessor(models.Model):
     _inherit = "square.order.processor"
 
-    def _check_square_exchange_order(self, order_id, order, *, merchant_id=None, environment=None):
+    def _check_square_exchange_order(self, order_id, order, *, merchant_id=None, environment=None, read_order=None):
         has_returns = bool(
             order.get("returns")
             or order.get("return_line_items")
@@ -19,12 +19,12 @@ class SquareOrderProcessor(models.Model):
             return False, None
         return True, self._square_online_event_result(
             order_id=order_id, location_id=order.get("location_id"),
-            merchant_id=merchant_id, environment=environment, full_order=order,
+            merchant_id=merchant_id, environment=environment, full_order=order, read_order=read_order,
         )
 
     def _square_online_event_result(
         self, *, order_id=None, payment_id=None, refund_id=None, location_id=None,
-        merchant_id=None, environment=None, square_config=None, full_order=None,
+        merchant_id=None, environment=None, square_config=None, full_order=None, read_order=None,
     ):
         """Keep verified website activity out of the POS write paths."""
         transactions = self.env["payment.transaction"].sudo()
@@ -56,6 +56,7 @@ class SquareOrderProcessor(models.Model):
             elif order_id:
                 belongs_to_website = self._square_online_check_order(
                     transactions, scope, client, config, order_id, full_order=full_order,
+                    read_order=read_order or client.get_order,
                 )
             else:
                 return None
@@ -77,10 +78,10 @@ class SquareOrderProcessor(models.Model):
         return transactions._square_online_pos_owns_payment(scope, payment)
 
     def _square_online_check_order(
-        self, transactions, scope, client, config, order_id, *, full_order=None, follow_returns=True,
+        self, transactions, scope, client, config, order_id, *, read_order, full_order=None, follow_returns=True,
     ):
-        order = full_order if full_order is not None else client.get_order(order_id, square_config=config)
-        if not order or (order.get("id") or order.get("order_id")) != order_id:
+        order = full_order if full_order is not None else read_order(order_id, square_config=config)
+        if not isinstance(order, dict) or (order.get("id") or order.get("order_id")) != order_id:
             return None
         if order.get("location_id"):
             scope &= transactions._square_online_pos_scope(
@@ -103,7 +104,7 @@ class SquareOrderProcessor(models.Model):
                 if transactions._square_online_pos_knows(scope, order_id=source_id):
                     return True
                 source = self._square_online_check_order(
-                    transactions, scope, client, config, source_id, follow_returns=False,
+                    transactions, scope, client, config, source_id, read_order=read_order, follow_returns=False,
                 )
                 if source is True:
                     return True

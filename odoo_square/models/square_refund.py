@@ -134,11 +134,19 @@ class SquareRefund(models.Model):
 
         if not refund_id:
             return {"status": "error", "message": "No refund ID in Square webhook"}
-        routing = self.env["square.order.processor"]._square_online_event_result(
+        receipts = self.env["square.event.receipt"].sudo()
+        operation = f"refund.{event_type}"
+        if order_id and receipts._was_applied(operation, refund_id, webhook_event_id):
+            return {"status": "already_processed", "refund_id": refund_id}
+
+        processor = self.env["square.order.processor"]
+        routing = processor._square_online_event_result(
             order_id=order_id, payment_id=refund_data.get("payment_id"), refund_id=refund_id,
             location_id=refund_data.get("location_id"),
             merchant_id=merchant_id, environment=environment,
         )
+        if not routing or routing["status"] == "retry":
+            routing = processor._square_terminal_refund_result(refund_id) or routing
         if routing:
             return routing
         if not order_id:
@@ -149,11 +157,6 @@ class SquareRefund(models.Model):
             _logger.info(
                 f"Processing Square refund {refund_id} for order {order_id} with status {refund_status}"
             )
-
-            receipts = self.env["square.event.receipt"].sudo()
-            operation = f"refund.{event_type}"
-            if receipts._was_applied(operation, refund_id, webhook_event_id):
-                return {"status": "already_processed", "refund_id": refund_id}
 
             # Second check: look for existing refund record by Square refund ID
             # This handles the case where Square sends multiple webhooks for the same refund

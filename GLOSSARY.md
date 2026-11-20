@@ -1,22 +1,13 @@
 # Square–Odoo Integration
 
-Square sales are reflected in Odoo sales records, accounting, and inventory.
+**Square checkout** means completion of a sale started in Square POS. Square POS Integration imports these sales into Odoo.
 
-## Language
+**Square Terminal checkout** is a request from Odoo POS to collect one card share on a paired terminal. Multiple card shares can belong to the same Odoo sale and linked Square order.
 
-**Square checkout**:
-The completion of a customer's sale in Square POS. It is the checkout covered by this integration's acceptance criteria.
-_Avoid_: Odoo POS checkout, unqualified POS checkout
+**Square payment** is money collected from a customer through Square for a sale.
 
-**Square payment**:
-Money collected from a customer through Square for a sale.
+**Odoo payment record** is the accounting record in Odoo for money already collected or refunded through Square.
 
-**Odoo payment record**:
-The accounting record in Odoo representing money already collected or refunded through Square.
-_Avoid_: Square charge
+**Square refund** is money returned through Square against an original payment. For a Square Terminal payment, a manager reviews the refund in Odoo and decides which accounting correction or stock return to record.
 
-**Square refund**:
-A refund initiated in Square whose outcome is reflected in Odoo accounting and, where applicable, returned stock.
-
-**Version port**:
-An adaptation of the existing integration to another Odoo major version while preserving its supported business workflows. It does not include migrating an existing Odoo database.
+**Version port** is an adaptation of the integration to another Odoo major version that preserves the supported workflows on that version. Installed databases follow Odoo’s separate database upgrade process.
