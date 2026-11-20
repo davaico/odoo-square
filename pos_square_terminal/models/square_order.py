@@ -49,6 +49,8 @@ class SquareOrder(models.Model):
     pricing_issue = fields.Char(copy=False)
     square_order_id = fields.Char(index='btree_not_null', copy=False)
     split = fields.Boolean(copy=False)
+    immediate_split = fields.Boolean(copy=False)
+    original_order_retired = fields.Boolean(copy=False)
     cash_tenders = fields.Json(copy=False)
     cash_recording = fields.Boolean(copy=False)
     settlement_request = fields.Json(copy=False)
@@ -89,6 +91,35 @@ class SquareOrder(models.Model):
             self.pricing_issue = 'created_order_discrepancy'
             return False
         return True
+
+    def _collected_share_state(self):
+        self.ensure_one()
+        return 'captured' if self.immediate_split else 'authorized'
+
+    def _retire_linked_order(self):
+        self.ensure_one()
+        if not self.original_order_retired:
+            self.original_order_retired = self._cancel_provider_order(
+                self.square_order_id, self.reference, set(), request=True,
+            )
+        return self.original_order_retired
+
+    def _create_immediate_order(self, attempt):
+        self.ensure_one()
+        money = attempt.checkout_request['checkout']['amount_money']
+        line = {'name': 'Odoo POS card share', 'quantity': '1', 'base_price_money': money}
+        order = self.connection_id._request('POST', '/v2/orders', payload={
+            'idempotency_key': str(uuid5(NAMESPACE_URL, f'{attempt.reference}/share-order')),
+            'order': {'location_id': self.square_location_id, 'reference_id': attempt.reference, 'line_items': [line]},
+        }).get('order')
+        if not isinstance(order, dict) or not (
+            isinstance(order.get('id'), str) and order['id'] and order['id'] != self.square_order_id
+            and order.get('reference_id') == attempt.reference and order.get('location_id') == self.square_location_id
+            and order.get('state') == 'OPEN' and not order.get('tenders')
+            and matches_money(order.get('total_money'), money['amount'], self.currency_code)
+        ):
+            raise ValueError('Square did not confirm the original card share order')
+        return order['id']
 
     def _matches_order_totals(self, order, *, state='OPEN', tip_minor=0):
         self.ensure_one()
@@ -512,32 +543,35 @@ class SquareOrder(models.Model):
             self.cancelled = True
             return
 
-        path = '/v2/orders/' + quote(self.square_order_id, safe='')
+        if self._cancel_provider_order(self.square_order_id, self.reference, released_payment_ids, request=request):
+            self.cancelled = True
+
+    def _cancel_provider_order(self, order_id, reference, released_payment_ids, *, request):
+        path = '/v2/orders/' + quote(order_id, safe='')
         try:
-            order = self._read_unpaid_order(path, released_payment_ids)
+            order = self._read_unpaid_order(path, released_payment_ids, order_id, reference)
             if request and order and order['state'] == 'OPEN':
                 version = order.get('version')
                 if type(version) is not int or version < 1:
                     return
                 try:
                     self.connection_id._request('PUT', path, payload={
-                        'idempotency_key': str(uuid5(NAMESPACE_URL, f'{self.reference}/cancel/{version}')),
+                        'idempotency_key': str(uuid5(NAMESPACE_URL, f'{reference}/cancel/{version}')),
                         'order': {'location_id': self.square_location_id, 'version': version, 'state': 'CANCELED'},
                     })
                 except (SquareAPIError, UserError):
                     pass
-                order = self._read_unpaid_order(path, released_payment_ids)
-            if order and order['state'] == 'CANCELED':
-                self.cancelled = True
+                order = self._read_unpaid_order(path, released_payment_ids, order_id, reference)
+            return bool(order and order['state'] == 'CANCELED')
         except (SquareAPIError, UserError):
             # An ambiguous update remains reserved until a later authoritative read.
             return
 
-    def _read_unpaid_order(self, path, released_payment_ids):
+    def _read_unpaid_order(self, path, released_payment_ids, order_id, reference):
         order = self.connection_id._request('GET', path).get('order')
         if not (
-            isinstance(order, dict) and order.get('id') == self.square_order_id
-            and order.get('location_id') == self.square_location_id and order.get('reference_id') == self.reference
+            isinstance(order, dict) and order.get('id') == order_id
+            and order.get('location_id') == self.square_location_id and order.get('reference_id') == reference
             and order.get('state') in ('OPEN', 'CANCELED')
         ):
             return

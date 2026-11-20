@@ -36,7 +36,9 @@ class StockMove(models.Model):
             ('state', '=', 'verified'), ('company_id', '=', self.company_id.id), ('environment', '=', environment),
         ])
         by_location = {}
-        for link in attempts.square_order_link_id:
+        # Per-share summary orders contain no catalog items. The cancelled
+        # basket cannot cause a provider-side inventory deduction.
+        for link in attempts.square_order_link_id.filtered(lambda link: not link.immediate_split):
             variations = sorted({
                 line['catalog_object_id'] for line in link.create_request['order']['line_items']
                 if line.get('catalog_object_id')

@@ -613,6 +613,48 @@ registry.category("web_tour.tours").add("SquareTerminalSplitRecovery", {
     ].flat(),
 });
 
+registry.category("web_tour.tours").add("SquareTerminalImmediateSplit", {
+    steps: () => [
+        ...openDeskPadPaymentScreen(),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        PaymentScreen.enterPaymentLineAmount("Square Counter", "0.01"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        {
+            trigger: ".payment-screen .electronic_status:contains('Collected by Square')",
+            run() {
+                sessionStorage.setItem("squareImmediateOrder", window.posmodel.get_order().uuid);
+            },
+        },
+        ...reopenOrderAfterReload("squareImmediateOrder"),
+        { trigger: ".payment-screen .electronic_status:contains('Collected by Square')" },
+        { trigger: ".payment-screen .payment-status-remaining .amount:contains('0.01')" },
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "0.01"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        { trigger: ".payment-screen .electronic_status:contains('Card declined')" },
+        { trigger: ".payment-screen .paymentline.selected + .electronic_payment .square-check-status:contains('Check status')", run: "click" },
+        { trigger: ".payment-screen .square-check-status:contains('Retry')", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("0.02"),
+        { trigger: ".pos-receipt .orderline:contains('Desk Pad')" },
+    ].flat(),
+});
+
+registry.category("web_tour.tours").add("SquareTerminalImmediateMixed", {
+    steps: () => [
+        ...openDeskPadPaymentScreen(),
+        ...PaymentScreen.clickPaymentMethod("Checkout Cash"),
+        PaymentScreen.enterPaymentLineAmount("Checkout Cash", "20"),
+        ...PaymentScreen.clickPaymentMethod("Square Counter"),
+        ...PaymentScreen.selectedPaymentlineHas("Square Counter", "40.00"),
+        { trigger: ".payment-screen .send_payment_request", run: "click" },
+        ...ReceiptScreen.receiptIsThere(),
+        ...ReceiptScreen.receiptAmountTotalIs("60.00"),
+        { trigger: ".pos-receipt .paymentlines:contains('Checkout Cash')" },
+        { trigger: ".pos-receipt .paymentlines:contains('Square Counter')" },
+    ].flat(),
+});
+
 registry.category("web_tour.tours").add("SquareTerminalSplitDeviceTips", {
     steps: () => [
         ...openDeskPadPaymentScreen(),

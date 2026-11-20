@@ -19,7 +19,7 @@ class SquarePaymentAttempt(models.Model):
     _inherit = 'pos.square.payment.attempt'
 
     currency_id = fields.Many2one('res.currency', compute='_compute_reconciliation_amounts', compute_sudo=True)
-    square_order_id = fields.Char(related='square_order_link_id.square_order_id')
+    square_order_id = fields.Char(compute='_compute_square_order_id', store=True, index='btree_not_null')
     verified_base_minor = fields.Integer(copy=False)
     verified_tip_minor = fields.Integer(copy=False)
     has_verified_amounts = fields.Boolean(copy=False)
@@ -30,6 +30,11 @@ class SquarePaymentAttempt(models.Model):
     reconciliation_discrepancy = fields.Char(copy=False)
     order_pricing_discrepancy = fields.Char(compute='_compute_order_pricing_discrepancy', compute_sudo=True)
     next_reconciliation_at = fields.Datetime(default=fields.Datetime.now, index=True, copy=False)
+
+    @api.depends('share_order_id', 'square_order_link_id.square_order_id')
+    def _compute_square_order_id(self):
+        for attempt in self:
+            attempt.square_order_id = attempt.share_order_id or attempt.square_order_link_id.square_order_id
 
     @api.depends(
         'amount_minor', 'verified_base_minor', 'verified_tip_minor', 'currency_code', 'square_order_link_id.currency_digits',
@@ -57,7 +62,7 @@ class SquarePaymentAttempt(models.Model):
 
     @api.model
     def _square_reconcilable_states(self):
-        return ('dispatching', 'pending', 'declined', 'uncertain', 'timed_out', 'authorized', 'verified')
+        return ('dispatching', 'pending', 'declined', 'uncertain', 'timed_out', 'authorized', 'captured', 'verified')
 
     def _record_successful_check(self):
         self.write({'last_checked_at': fields.Datetime.now(), 'reconciliation_error': False})
@@ -67,7 +72,7 @@ class SquarePaymentAttempt(models.Model):
         if discrepancy:
             values['reconciliation_discrepancy'] = issue
         # A failed read cannot release an authorization or change previously verified evidence.
-        if self.state not in ('dispatching', 'timed_out', 'failed', 'authorized', 'verified'):
+        if self.state not in ('dispatching', 'timed_out', 'failed', 'authorized', 'captured', 'verified'):
             values['state'] = 'uncertain'
         self.write(values)
 

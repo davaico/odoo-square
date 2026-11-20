@@ -103,6 +103,14 @@ class SquarePaymentAttempt(models.Model):
                     issue = self._square_refund_verification_issue()
         self.refund_reconciliation_issue = issue or self._square_refund_total_issue(payment)
 
+    def _is_fully_refunded(self):
+        self.ensure_one()
+        captured = self.verified_base_minor + self.verified_tip_minor
+        return (
+            self.has_verified_amounts and captured > 0 and not self.refund_reconciliation_issue
+            and sum(self.refund_ids.mapped('amount_minor')) == captured
+        )
+
     def _square_refund_verification_issue(self):
         return _("Square returned a refund that could not be verified against the original payment.")
 
@@ -136,7 +144,7 @@ class SquarePaymentAttempt(models.Model):
     def _record_square_refund(self, refund):
         self.ensure_one()
         if (
-            self.state != 'verified' or refund.get('unlinked')
+            self.state not in ('captured', 'verified') or refund.get('unlinked')
             or refund.get('payment_id') != self.square_payment_id
             or refund.get('location_id', self.square_location_id) != self.square_location_id
         ):

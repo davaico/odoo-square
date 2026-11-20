@@ -2,6 +2,7 @@ import json
 from copy import deepcopy
 from datetime import timedelta, timezone
 from urllib.parse import quote
+from uuid import uuid4
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError
@@ -48,9 +49,11 @@ class SquarePaymentAttempt(models.Model):
         ('uncertain', 'Payment outcome uncertain'),
         ('timed_out', 'Square timeout awaiting confirmation'),
         ('authorized', 'Authorized by Square'),
+        ('captured', 'Card share collected'),
         ('verified', 'Payment verified'),
     ], required=True, default='prepared', index=True)
     active_device_key = fields.Char(compute='_compute_active_device_key', store=True)
+    share_order_id = fields.Char(index='btree_not_null', copy=False)
     square_checkout_id = fields.Char(index='btree_not_null', copy=False)
     observed_square_payment_ids = fields.Json(copy=False)
     checkout_payment_list_complete = fields.Boolean(copy=False)
@@ -61,6 +64,8 @@ class SquarePaymentAttempt(models.Model):
     _sql_constraints = [
         ('active_device_unique', 'unique(active_device_key)', 'The Square terminal already has an active checkout.'),
         ('reference_unique', 'unique(reference)', 'The Square checkout reference already exists.'),
+        ('share_order_unique', 'unique(environment, merchant_id, share_order_id)',
+         'This Square share order already belongs to another payment.'),
         ('square_checkout_unique', 'unique(environment, merchant_id, square_checkout_id)',
          'This Square checkout already belongs to another Odoo payment.'),
         ('square_payment_unique', 'unique(environment, merchant_id, square_payment_id)',
@@ -74,12 +79,36 @@ class SquarePaymentAttempt(models.Model):
     @api.depends('state', 'environment', 'merchant_id', 'square_device_id')
     def _compute_active_device_key(self):
         for attempt in self:
-            if attempt.state in ('blocked', 'failed', 'authorized', 'verified'):
+            if attempt.state in ('blocked', 'failed', 'authorized', 'captured', 'verified'):
                 attempt.active_device_key = False
             else:
                 attempt.active_device_key = self._device_key(
                     attempt.environment, attempt.merchant_id, attempt.square_device_id,
                 )
+
+    def _can_switch_to_immediate(self):
+        self.ensure_one()
+        link = self.square_order_link_id
+        return (
+            link.split and not link.immediate_split and not link.cancel_requested and not link.cancelled
+            and not self.square_checkout_id and not self._known_payment_ids()
+            and not link.cash_recording and not link.settlement_request
+            and self.checkout_request['checkout']['payment_options']['autocomplete'] is False
+            and self.order_id._square_reserved_attempts() == self
+        )
+
+    def _checkout_order_id(self):
+        self.ensure_one()
+        link = self.square_order_link_id
+        return self.share_order_id if link.immediate_split else link.square_order_id
+
+    def _prepare_immediate_checkout(self):
+        self.ensure_one()
+        payload = deepcopy(self.checkout_request)
+        payload['idempotency_key'] = str(uuid4())
+        payload['checkout'].pop('order_id', None)
+        payload['checkout']['payment_options']['autocomplete'] = True
+        self.write({'checkout_request': payload, 'state': 'prepared', 'provider_status': False})
 
     def _create_square_order(self):
         self.ensure_one()
@@ -87,14 +116,25 @@ class SquarePaymentAttempt(models.Model):
             return
         try:
             self._check_provider_scope()
-            amounts_match = self.square_order_link_id._create_square_order()
+            link = self.square_order_link_id
+            if link.immediate_split:
+                if not link._retire_linked_order():
+                    return
+                order_id = link._create_immediate_order(self)
+                if not order_id:
+                    return
+                self.share_order_id = order_id
+                amounts_match = True
+            else:
+                amounts_match = link._create_square_order()
+                order_id = link.square_order_id
         except (SquareAPIError, UserError, ValueError):
             return
         if not amounts_match:
             self.state = 'blocked'
             return
         request = deepcopy(self.checkout_request)
-        request['checkout']['order_id'] = self.square_order_link_id.square_order_id
+        request['checkout']['order_id'] = order_id
         self.write({'checkout_request': request, 'state': 'ready'})
 
     def _check_provider_scope(self):
@@ -129,11 +169,21 @@ class SquarePaymentAttempt(models.Model):
                 self._record_failed_check(
                     str(error) if isinstance(error, UserError) else _("Odoo could not send the checkout."),
                 )
-            elif isinstance(error, SquareAPIError) and error.status == 400 and error.error_only and (
-                set(error.codes) <= {'INVALID_FEES', 'INVALID_LOCATION'}
-                or (error.codes == ('PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED',) and self.square_order_link_id.split)
-            ):
-                self.write({'state': 'failed', 'provider_status': ', '.join(error.codes)})
+            elif isinstance(error, SquareAPIError) and error.status == 400 and error.error_only:
+                link = self.square_order_link_id
+                if (
+                    error.codes == ('PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED',)
+                    and self._can_switch_to_immediate()
+                ):
+                    # Commit the new request before creating a share order or sending another checkout.
+                    link.immediate_split = True
+                    self._prepare_immediate_checkout()
+                elif error.codes and set(error.codes) <= {
+                    'INVALID_FEES', 'INVALID_LOCATION', 'PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED',
+                }:
+                    self.write({'state': 'failed', 'provider_status': ', '.join(error.codes)})
+                else:
+                    self.state = 'uncertain'
             else:
                 self.state = 'uncertain'
             return
@@ -155,13 +205,13 @@ class SquarePaymentAttempt(models.Model):
             return True
         try:
             self._check_provider_scope()
-            if self.state in ('authorized', 'verified') and self.square_payment_id:
+            if self.state in ('authorized', 'captured', 'verified') and self.square_payment_id:
                 # Terminal checkouts expire. An authenticated payment ID remains a durable reference.
                 payment = self._read_payment(self.square_payment_id)
                 status = self._observe_payment(payment, final=True)
                 self._record_successful_check()
                 link = self.square_order_link_id
-                if self.state != 'verified' and link.settlement_request and status == 'COMPLETED':
+                if self.state == 'authorized' and link.settlement_request and status == 'COMPLETED':
                     link._settle(self.order_id._square_current_attempts(), allow_square_capture=False)
                 return status
             checkout = None
@@ -174,13 +224,13 @@ class SquarePaymentAttempt(models.Model):
                 except SquareAPIError as error:
                     if error.status != 404:
                         raise
-            elif self.square_order_link_id.square_order_id:
+            elif self._checkout_order_id():
                 checkout = self._find_original_checkout()
             if checkout is not None:
                 status = self._observe_checkout(checkout, authoritative=True)
                 if self.state != 'timed_out':
                     return status
-            if self.square_order_link_id.square_order_id:
+            if self._checkout_order_id():
                 return self._recover_original_payment()
         except SquareAPIError as error:
             issue = (
@@ -204,7 +254,8 @@ class SquarePaymentAttempt(models.Model):
     def _recover_original_payment(self):
         self.ensure_one()
         link = self.square_order_link_id
-        path = '/v2/orders/' + quote(link.square_order_id, safe='')
+        order_id = self._checkout_order_id()
+        path = '/v2/orders/' + quote(order_id, safe='')
         complete_list = self.checkout_payment_list_complete
         known_payment_ids = self._known_payment_ids()
         try:
@@ -222,8 +273,9 @@ class SquarePaymentAttempt(models.Model):
             # If the order supplies new or contradictory evidence we must validate it before using the list again.
             self.checkout_payment_list_complete = False
         if not (
-            isinstance(order, dict) and order.get('id') == link.square_order_id
-            and order.get('reference_id') == link.reference and order.get('location_id') == self.square_location_id
+            isinstance(order, dict) and order.get('id') == order_id
+            and order.get('reference_id') == (self.reference if self.share_order_id else link.reference)
+            and order.get('location_id') == self.square_location_id
             and order.get('state') in ('OPEN', 'COMPLETED', 'CANCELED')
         ):
             raise ValueError('Square order does not match the reserved checkout')
@@ -256,9 +308,21 @@ class SquarePaymentAttempt(models.Model):
         if cancellation_confirmed:
             if not payment:
                 self.state = 'failed'
-            link.cancel_requested = True
+            if not self.share_order_id:
+                link.cancel_requested = True
         self._record_successful_check()
         return status or True
+
+    def _retire_failed_share(self):
+        self.ensure_one()
+        if self.state != 'failed' or not self.share_order_id:
+            return False
+        if self.square_checkout_id or self._known_payment_ids():
+            if not self._refresh(recheck_failed=True) or self.state != 'failed':
+                return False
+        return self.square_order_link_id._cancel_provider_order(
+            self.share_order_id, self.reference, set(self._known_payment_ids()), request=True,
+        )
 
     def _cancel_checkout(self):
         self.ensure_one()
@@ -325,7 +389,7 @@ class SquarePaymentAttempt(models.Model):
         if not (
             isinstance(checkout_id, str) and checkout_id
             and (not self.square_checkout_id or checkout_id == self.square_checkout_id)
-            and checkout.get('order_id') == order.square_order_id
+            and checkout.get('order_id') == self._checkout_order_id()
             and checkout.get('reference_id') == self.reference
             and checkout.get('location_id') == self.square_location_id
             and checkout.get('app_id', self.application_id) == self.application_id
@@ -415,7 +479,7 @@ class SquarePaymentAttempt(models.Model):
         payment = self.connection_id._request('GET', path).get('payment')
         if not (
             isinstance(payment, dict) and payment.get('id') == payment_id
-            and payment.get('order_id') == self.square_order_link_id.square_order_id
+            and payment.get('order_id') == self._checkout_order_id()
             and payment.get('location_id') == self.square_location_id
         ):
             raise ValueError('Square payment does not match the reserved order')
@@ -449,7 +513,7 @@ class SquarePaymentAttempt(models.Model):
             and (allow_tipping or tip == self._requested_tip_minor() or (not tip and status in ('FAILED', 'CANCELED')))
             and matches_money(payment.get('total_money'), base + tip, self.currency_code)
             and (not self.has_verified_amounts or tip == self.verified_tip_minor)
-            and (self.state != 'authorized' or status not in ('APPROVED', 'COMPLETED')
+            and (self.state not in ('authorized', 'captured') or status not in ('APPROVED', 'COMPLETED')
                  or tip == self.authorized_tip_minor)
         ):
             raise SquarePaymentDiscrepancy(_("The Square payment total or tip differs from the original payment."))
@@ -467,15 +531,24 @@ class SquarePaymentAttempt(models.Model):
             if status != 'COMPLETED':
                 raise ValueError('Square no longer reports the verified payment as completed')
             self._observe_verified_payment(payment)
+        elif self.state == 'captured' and status != 'COMPLETED':
+            raise ValueError('Square no longer reports the captured share as completed')
         elif status == 'COMPLETED':
-            if not self.square_order_link_id.split:
+            if self.share_order_id:
+                self.write({
+                    'square_payment_id': payment_id,
+                    'state': 'captured',
+                    'authorized_tip_minor': payment.get('tip_money', {}).get('amount', 0),
+                })
+                self._observe_verified_payment(payment)
+            elif not self.square_order_link_id.split:
                 self._mark_verified(payment)
             else:
                 self.write({
                     'square_payment_id': payment_id,
                     'state': 'authorized' if self.square_order_link_id.settlement_request else 'uncertain',
                 })
-        elif status == 'APPROVED' and final and self.square_order_link_id.split:
+        elif status == 'APPROVED' and final and self.square_order_link_id.split and not self.share_order_id:
             self.write({
                 'square_payment_id': payment_id,
                 'state': 'authorized',
@@ -491,6 +564,31 @@ class SquarePaymentAttempt(models.Model):
             elif self.provider_status in ('PENDING', 'IN_PROGRESS'):
                 self.state = 'declined'
         return status
+
+    def _finalize_captured_share(self):
+        self.ensure_one()
+        self._check_provider_scope()
+        payment = self._read_settlement_payment()
+        if self.state != 'captured' or not self.share_order_id or payment['status'] != 'COMPLETED':
+            raise ValueError('Square has not completed the original card share')
+        path = '/v2/orders/' + quote(self.share_order_id, safe='')
+        order = self.connection_id._request('GET', path).get('order')
+        total = self._requested_base_minor() + self.authorized_tip_minor
+        if not (
+            isinstance(order, dict) and order.get('id') == self.share_order_id
+            and order.get('reference_id') == self.reference and order.get('location_id') == self.square_location_id
+            and order.get('state') == 'COMPLETED' and matches_money(order.get('total_money'), total, self.currency_code)
+            and self.square_order_link_id._matches_settlement_tenders(order, self, complete=True)
+        ):
+            raise ValueError('Square has not verified the payment on its original card share order')
+        self._observe_verified_payment(payment)
+        if (
+            self.refund_reconciliation_issue
+            or ('refunded_money' in payment and not matches_money(payment['refunded_money'], 0, self.currency_code))
+            or self.square_refund_ids.filtered_domain([('status', 'in', ('PENDING', 'COMPLETED'))])
+        ):
+            raise ValueError('The captured share has a refund or an unresolved refund discrepancy')
+        self._mark_verified(payment)
 
     def _mark_verified(self, payment):
         self.ensure_one()
@@ -514,7 +612,7 @@ class SquarePaymentAttempt(models.Model):
                 return 'settlement_blocked' if self.square_order_link_id.settlement_blocked else 'settling'
             if self.square_order_link_id.cash_recording:
                 return 'recording_cash'
-            if self.provider_status == 'PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED':
+            if self.provider_status == 'PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED' and not self._can_switch_to_immediate():
                 return 'unsupported_split'
         return self.state
 
@@ -531,7 +629,7 @@ class SquarePaymentAttempt(models.Model):
             status['cash_tenders'] = {
                 tender['native_uuid']: {
                     'reserved': not link.cancelled,
-                    'payment_id': tender.get('payment_id') if self.state == 'verified' else False,
+                    'payment_id': tender.get('payment_id', False) if self.state == 'verified' else False,
                 }
                 for tender in link.cash_tenders or []
             }
@@ -547,6 +645,6 @@ class SquarePaymentAttempt(models.Model):
         return {
             'state': self._cashier_state(),
             'reference': self.reference,
-            'payment_id': self.square_payment_id if self.state == 'verified' else False,
-            'amount': self.payment_id.amount if self.state == 'verified' else None,
+            'payment_id': self.square_payment_id if self.state in ('captured', 'verified') else False,
+            'amount': self.payment_id.amount if self.state in ('captured', 'verified') else None,
         }

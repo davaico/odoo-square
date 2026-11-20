@@ -69,17 +69,24 @@ class SquareOrder(models.Model):
 
     def _record_square_handover(self):
         self.ensure_one()
-        attempt = self.env['pos.square.payment.attempt'].search([
+        attempts = self.env['pos.square.payment.attempt'].search([
             ('square_order_link_id', '=', self.id), ('state', '=', 'verified'),
-        ], limit=1)
-        if not attempt:
+        ])
+        if not attempts:
             raise UserError(_("The original Square payment is not verified."))
-        attempt._check_provider_scope()
-        path = '/v2/orders/' + quote(self.square_order_id, safe='')
+        for attempt in attempts:
+            attempt._check_provider_scope()
+            if self.immediate_split:
+                self._record_order_handover(attempt.share_order_id, attempt.reference)
+        if not self.immediate_split:
+            self._record_order_handover(self.square_order_id, self.reference)
+
+    def _record_order_handover(self, order_id, reference):
+        path = '/v2/orders/' + quote(order_id, safe='')
         order = self.connection_id._request('GET', path).get('order')
         if not isinstance(order, dict) or (
-            order.get('id') != self.square_order_id or order.get('location_id') != self.square_location_id
-            or order.get('reference_id') != self.reference
+            order.get('id') != order_id or order.get('location_id') != self.square_location_id
+            or order.get('reference_id') != reference
         ):
             raise UserError(_("Square returned a different order than the original counter sale."))
         if order.get('state') != 'COMPLETED' or order.get('fulfillments'):
@@ -91,7 +98,7 @@ class SquareOrder(models.Model):
         attribute = self._read_optional_handover_resource(path, 'custom_attribute')
         if attribute is None:
             attribute = self.connection_id._request('POST', path, payload={
-                'idempotency_key': str(uuid5(NAMESPACE_URL, f'odoo-square:handover:{self.reference}')),
+                'idempotency_key': str(uuid5(NAMESPACE_URL, f'odoo-square:handover:{reference}')),
                 'custom_attribute': {'value': value},
             }).get('custom_attribute')
         if not isinstance(attribute, dict) or attribute.get('key') != ATTRIBUTE_KEY or attribute.get('value') != value:

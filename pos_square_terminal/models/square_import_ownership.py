@@ -24,6 +24,19 @@ class SquareImportOwnership(models.Model):
         ]
         if merchant_id:
             scope.append(('merchant_id', '=', merchant_id))
+        # A share order can reach the importer before its create response
+        # reaches Odoo. The attempt reference was committed before dispatch.
+        share_id = resource.get('order_id') if kind == 'payment' else resource_id
+        share_keys = [[('share_order_id', '=', share_id)]] if share_id else []
+        if resource.get('reference_id'):
+            share_keys.append([
+                ('reference', '=', resource['reference_id']), ('share_order_id', '=', False),
+                ('square_order_link_id.immediate_split', '=', True),
+            ])
+        if share_keys and self._square_terminal_find_import_resource(
+            expression.AND([scope, expression.OR(share_keys)]), model='pos.square.payment.attempt',
+        ):
+            return True
         if kind == 'payment':
             if self._square_terminal_find_import_resource(
                 scope + [('square_payment_id', '=', resource_id)], model='pos.square.payment.attempt',

@@ -146,6 +146,8 @@ class PosOrder(models.Model):
                     'state': 'blocked' if link.pricing_issue else 'ready' if link.square_order_id else 'prepared',
                     'checkout_request': {'idempotency_key': str(uuid4()), 'checkout': checkout},
                 })
+                if attempt.square_order_link_id.immediate_split:
+                    attempt._prepare_immediate_checkout()
                 attempt.flush_recordset(['active_device_key'])
         except UniqueViolation as error:
             if error.diag.constraint_name != 'pos_square_payment_attempt_active_device_unique':
@@ -276,7 +278,8 @@ class PosOrder(models.Model):
         order._square_check_session()
         attempts = order._square_current_attempts()
         order._square_check_reserved_amounts(attempts)
-        if any(attempt.state != 'authorized' for attempt in attempts - previous):
+        if any(attempt.state != previous.square_order_link_id._collected_share_state()
+               for attempt in attempts - previous):
             raise UserError(_("Check the other Square card share before retrying this payment."))
         method = payment.payment_method_id
         if (
@@ -295,6 +298,12 @@ class PosOrder(models.Model):
         if previous.search_count([('active_device_key', '=', device_key)], limit=1):
             return {**previous._cashier_status(), 'busy': True}
 
+        if previous.share_order_id and not previous._retire_failed_share():
+            return previous._cashier_status()
+        switch_to_immediate = (
+            previous.provider_status == 'PARTIAL_PAYMENT_DELAY_CAPTURE_NOT_SUPPORTED'
+            and previous._can_switch_to_immediate()
+        )
         reference = 'odoo-' + uuid4().hex
         request = {
             **previous.checkout_request,
@@ -316,6 +325,10 @@ class PosOrder(models.Model):
                     'checkout_request': request,
                     'state': 'ready',
                 })
+                if switch_to_immediate:
+                    previous.square_order_link_id.immediate_split = True
+                if attempt.square_order_link_id.immediate_split:
+                    attempt._prepare_immediate_checkout()
                 attempt.flush_recordset(['active_device_key'])
         except UniqueViolation as error:
             if error.diag.constraint_name != 'pos_square_payment_attempt_active_device_unique':
@@ -340,13 +353,13 @@ class PosOrder(models.Model):
         attempt = self._square_requested_attempt(order_uuid, payment_uuid, must_be_open=False)
         link = attempt.square_order_link_id
         if (
-            attempt.reference == attempt_reference and attempt.state == 'authorized'
+            attempt.reference == attempt_reference and attempt.state == link._collected_share_state()
             and link.split and not link.cancel_requested and not link.settlement_request
             and not link.cash_recording
         ):
             order = attempt.order_id.with_user(self.env.user)
             attempts = order._square_current_attempts()
-            if all(share.state == 'authorized' for share in attempts):
+            if all(share.state == attempt.state for share in attempts):
                 pending = order.payment_ids - attempts.payment_id - link._cash_payment_lines()
                 if any(line.payment_method_id.use_payment_terminal == 'square_terminal' for line in pending):
                     return attempt._cashier_status()
@@ -358,7 +371,17 @@ class PosOrder(models.Model):
                     order._square_check_session()
                     link._reserve_cash_tenders(cash, attempts)
                     order._square_check_reserved_amounts(attempts)
-                    if link.cash_tenders:
+                    if link.immediate_split:
+                        # All provider charges have already completed. Verify each one
+                        # before atomically publishing the native tenders and receipt.
+                        try:
+                            with self.env.cr.savepoint():
+                                for share in attempts:
+                                    share._finalize_captured_share()
+                                order.sudo()._square_project_device_tip(link)
+                        except (SquareAPIError, UserError, ValueError):
+                            pass
+                    elif link.cash_tenders:
                         # Commit the recording intent before issuing any Cash CreatePayment.
                         link.cash_recording = True
                     else:
@@ -402,6 +425,11 @@ class PosOrder(models.Model):
                 outcome = link._settle(order._square_current_attempts(), allow_square_capture=False, for_release=True)
                 if outcome not in ('authorizations_only', 'released_tender_confirmed'):
                     return attempt._cashier_status()
+            if link.immediate_split:
+                captured = order._square_current_attempts().filtered_domain([('state', '=', 'captured')])
+                for share in captured:
+                    if not share._refresh() or not share._is_fully_refunded():
+                        return attempt._cashier_status()
             link.cancel_requested = True
             order._square_finish_cancellation(attempt, request=True)
         return attempt._cashier_status()
@@ -416,6 +444,21 @@ class PosOrder(models.Model):
                 share._cancel_checkout()
             else:
                 share._refresh(recheck_failed=True)
+        if link.immediate_split:
+            refunded = related_attempts.filtered(lambda share: share.state == 'captured' and share._is_fully_refunded())
+            unpaid = related_attempts - refunded
+            if any(share.state not in ('failed', 'blocked') for share in unpaid):
+                return
+            attempt._check_provider_scope()
+            for share in unpaid.filtered('share_order_id'):
+                if not link._cancel_provider_order(
+                    share.share_order_id, share.reference, share._known_payment_ids(), request=request,
+                ):
+                    return
+            if link._retire_linked_order():
+                link.cancelled = True
+                self._square_lock_checkout(touch=True)
+            return
         if any(candidate.state not in ('failed', 'blocked') for candidate in related_attempts):
             return
         try:
@@ -915,7 +958,7 @@ class PosOrder(models.Model):
         cash = self._square_cash_tenders(pending - cards, link.currency_digits)
         if (
             self.state != 'draft' or not link.split or link.cancel_requested or link.settlement_request
-            or link.cash_recording or any(attempt.state != 'authorized' for attempt in attempts)
+            or link.cash_recording or any(attempt.state != link._collected_share_state() for attempt in attempts)
             or payment not in pending or len(cards) > 1
             or any(card.is_change or not card.uuid for card in cards)
             or any(minor_units(card.amount, link.currency_digits) <= 0 for card in cards)
@@ -958,8 +1001,10 @@ class PosOrder(models.Model):
                 not attempts or any(attempt.state != 'verified' for attempt in attempts)
                 or (link.split and (
                     sum(attempts.mapped('amount_minor')) + link._cash_total_minor() != link.total_minor + link.tip_minor
-                    or link._settlement_payment_ids(attempts) != (link.settlement_request or {}).get('payment_ids')
-                    or not link._matches_native_cash(link._cash_payment_lines(), verified=True)
+                    or (not link.immediate_split and (
+                        link._settlement_payment_ids(attempts) != (link.settlement_request or {}).get('payment_ids')
+                    ))
+                    or not link._matches_native_cash(link._cash_payment_lines(), verified=not link.immediate_split)
                 ))
             ):
                 raise UserError(_("Square has not verified payment for this sale."))

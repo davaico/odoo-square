@@ -139,9 +139,9 @@ class SquareWebhookEvent(models.Model):
         if not attempt or attempt.state not in attempt._square_reconcilable_states():
             return True
         attempt._lock_reconciliation()
-        if attempt.state != 'verified':
+        if attempt.state not in ('captured', 'verified'):
             attempt._refresh()
-            if attempt.state != 'verified':
+            if attempt.state not in ('captured', 'verified'):
                 return False
         if attempt.square_payment_id != payment_id:
             return True
