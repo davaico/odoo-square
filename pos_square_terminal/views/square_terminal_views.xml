@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="square_connection_list" model="ir.ui.view">
+        <field name="name">pos.square.connection.list</field>
+        <field name="model">pos.square.connection</field>
+        <field name="arch" type="xml">
+            <list>
+                <field name="name"/>
+                <field name="company_id" groups="base.group_multi_company"/>
+                <field name="environment"/>
+                <field name="merchant_id"/>
+                <field name="authorization_result"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="square_connection_form" model="ir.ui.view">
+        <field name="name">pos.square.connection.form</field>
+        <field name="model">pos.square.connection</field>
+        <field name="arch" type="xml">
+            <form>
+                <header>
+                    <button name="action_authorize" type="object" string="Authorize or Reconnect with Square"
+                            class="oe_highlight"/>
+                    <button name="action_refresh_locations" type="object" string="Refresh Locations"
+                            invisible="not merchant_id"/>
+                </header>
+                <sheet>
+                    <field name="active" invisible="1"/>
+                    <widget name="web_ribbon" title="Archived" bg_color="text-bg-danger" invisible="active"/>
+                    <div class="oe_title">
+                        <label for="name"/>
+                        <h1><field name="name" placeholder="e.g. Main Street Square account"/></h1>
+                    </div>
+                    <group>
+                        <group>
+                            <field name="company_id" readonly="merchant_id" groups="base.group_multi_company"/>
+                            <field name="environment" readonly="merchant_id"/>
+                            <field name="application_id" readonly="merchant_id"/>
+                            <field name="new_application_secret" string="New Application Secret" password="True"
+                                   placeholder="Enter the secret to set or replace it"/>
+                        </group>
+                        <group>
+                            <field name="callback_url" string="OAuth Redirect URL" widget="CopyClipboardChar"/>
+                            <field name="merchant_id"/>
+                            <field name="authorization_result"/>
+                        </group>
+                    </group>
+                    <group string="Square Locations" invisible="not merchant_id">
+                        <field name="location_ids" nolabel="1">
+                            <list create="0" edit="0" delete="0">
+                                <field name="name"/>
+                                <field name="country_code"/>
+                                <field name="currency_code"/>
+                                <field name="is_available"/>
+                                <field name="unavailable_reason"/>
+                            </list>
+                        </field>
+                    </group>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="square_terminal_list" model="ir.ui.view">
+        <field name="name">pos.square.terminal.list</field>
+        <field name="model">pos.square.terminal</field>
+        <field name="arch" type="xml">
+            <list>
+                <field name="name"/>
+                <field name="connection_id"/>
+                <field name="location_id"/>
+                <field name="readiness"/>
+                <field name="unavailable_reason"/>
+                <field name="last_checked_at"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="square_terminal_form" model="ir.ui.view">
+        <field name="name">pos.square.terminal.form</field>
+        <field name="model">pos.square.terminal</field>
+        <field name="arch" type="xml">
+            <form>
+                <header>
+                    <button name="action_create_pairing_code" type="object" string="Generate Pairing Code"
+                            class="oe_highlight" invisible="environment != 'production' or device_id or not active"/>
+                    <button name="action_check_readiness" type="object" string="Check Readiness"
+                            invisible="environment != 'production' or not pairing_code_id or not active"/>
+                    <button name="action_use_sandbox_device" type="object" string="Use Sandbox Simulator"
+                            class="oe_highlight" invisible="environment != 'sandbox' or not active"/>
+                </header>
+                <sheet>
+                    <field name="active" invisible="1"/>
+                    <field name="pairing_code_id" invisible="1"/>
+                    <widget name="web_ribbon" title="Archived" bg_color="text-bg-danger" invisible="active"/>
+                    <div class="oe_title">
+                        <label for="name"/>
+                        <h1><field name="name" placeholder="e.g. Counter"/></h1>
+                    </div>
+                    <group>
+                        <group>
+                            <field name="connection_id" readonly="pairing_code_id or device_id"
+                                   options="{'no_create': True}"/>
+                            <field name="location_id" readonly="pairing_code_id or device_id"
+                                   domain="[('connection_id', '=', connection_id)]" options="{'no_create': True}"/>
+                            <field name="environment"/>
+                        </group>
+                        <group>
+                            <field name="readiness"/>
+                            <field name="unavailable_reason" invisible="not unavailable_reason"/>
+                            <field name="pairing_code" invisible="not pairing_code" widget="CopyClipboardChar"/>
+                            <field name="pair_by" invisible="not pair_by"/>
+                            <field name="device_id" invisible="not device_id"/>
+                            <field name="application_version" invisible="not application_version"/>
+                            <field name="last_checked_at" invisible="not last_checked_at"/>
+                        </group>
+                    </group>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_square_connection" model="ir.actions.act_window">
+        <field name="name">Square Connections</field>
+        <field name="res_model">pos.square.connection</field>
+        <field name="view_mode">list,form</field>
+    </record>
+    <record id="action_square_terminal" model="ir.actions.act_window">
+        <field name="name">Square Terminals</field>
+        <field name="res_model">pos.square.terminal</field>
+        <field name="view_mode">list,form</field>
+    </record>
+    <menuitem id="menu_square_connection" name="Square Connections" parent="point_of_sale.menu_point_config_product"
+              action="action_square_connection" groups="point_of_sale.group_pos_manager" sequence="30"/>
+    <menuitem id="menu_square_terminal" name="Square Terminals" parent="point_of_sale.menu_point_config_product"
+              action="action_square_terminal" groups="point_of_sale.group_pos_manager" sequence="31"/>
+</odoo>

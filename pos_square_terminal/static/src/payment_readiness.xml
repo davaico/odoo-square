@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<templates xml:space="preserve">
+    <t t-name="pos_square_terminal.PaymentScreenMethods" t-inherit="point_of_sale.PaymentScreenMethods" t-inherit-mode="extension">
+        <xpath expr="//div[hasclass('paymentmethod')]" position="attributes">
+            <attribute name="t-att-class">
+                {'opacity-50': (this.pos.paymentTerminalInProgress and paymentMethod.use_payment_terminal) or this.squareUnavailableReason(paymentMethod)}
+            </attribute>
+            <attribute name="t-att-aria-disabled">this.squareUnavailableReason(paymentMethod) ? 'true' : undefined</attribute>
+        </xpath>
+        <xpath expr="//div[hasclass('payment-method-display')]" position="after">
+            <small class="d-block text-wrap text-start lh-sm mt-1"
+                   t-if="this.squareUnavailableReason(paymentMethod)"
+                   t-esc="this.squareUnavailableReason(paymentMethod)"/>
+        </xpath>
+    </t>
+</templates>

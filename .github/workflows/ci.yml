@@ -8,8 +8,45 @@ on:
 permissions:
   contents: read
 
+env:
+  # GitHub-hosted jobs have separate Docker daemons. Use the same image tags in each.
+  COMPOSE_PROJECT_NAME: odoo-square-v18-ci-${{ github.run_id }}
+  DB_PASSWORD: ci_odoo_test
+  DB_NAME: odoo_square_v18_test
+  ODOO_TEST_DOCKERFILE: config/Dockerfile.test
+
 jobs:
+  build-test-images:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build PostgreSQL and Odoo 18 with Chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f docker-compose.test.yml)
+          "${compose[@]}" build --pull db
+          if ! "${compose[@]}" build --pull odoo; then
+            snapshot=$(date -u -d '6 hours ago' +%Y%m%dT%H%M%SZ)
+            echo "Retrying the Odoo test image with Ubuntu's official snapshot from $snapshot."
+            "${compose[@]}" build --pull --build-arg "UBUNTU_SNAPSHOT=$snapshot" odoo
+          fi
+          docker image save odoo-square-v18-test "${COMPOSE_PROJECT_NAME}-db" \
+            | gzip -1 > "$RUNNER_TEMP/odoo18-test-images.tar.gz"
+
+      - name: Share test images
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ runner.temp }}/odoo18-test-images.tar.gz
+          archive: false
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: error
+
   odoo-tests:
+    needs: build-test-images
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     strategy:
@@ -24,58 +61,106 @@ jobs:
             tags: standard/payment_square_online
           - suite: combined
             modules: payment_square_online,sale_stock,odoo_square
-            tags: standard/payment_square_online,standard/odoo_square,square_coexistence
+            tags: standard/payment_square_online,standard/odoo_square,square_coexistence,-/payment_square_online:TestSquareCoexistence.test_website_and_terminal_ownership_coexist_at_the_same_square_location
+          - suite: terminal
+            modules: pos_square_terminal
+            tags: /pos_square_terminal
+          - suite: terminal-importer
+            modules: pos_square_terminal,odoo_square
+            tags: standard/pos_square_terminal,standard/odoo_square,square_terminal_import
+          - suite: terminal-combined
+            modules: pos_square_terminal,payment_square_online,sale_stock,odoo_square
+            tags: standard/pos_square_terminal,standard/payment_square_online,standard/odoo_square,square_coexistence,square_terminal_import
+          - suite: terminal-discounts
+            modules: pos_square_terminal,pos_discount
+            tags: square_terminal_discount/pos_square_terminal:TestSquareTerminalGlobalDiscount.test_global_discount_reaches_square_with_tax_and_itemized_odoo_receipt
+          - suite: terminal-admission-races
+            modules: pos_square_terminal,l10n_generic_coa
+            tags: ''
           - suite: refund-races
             modules: payment_square_online,sale_stock
             tags: ''
     env:
-      COMPOSE_PROJECT_NAME: odoo-square-v18-test-${{ matrix.suite }}-${{ github.run_id }}-${{ github.run_attempt }}
       ODOO_INIT_MODULES: ${{ matrix.modules }}
       ODOO_TEST_TAGS: ${{ matrix.tags }}
       TEST_SUITE: ${{ matrix.suite }}
-      DB_PASSWORD: ci_odoo_test
-      DB_NAME: odoo_square_v18_test
-      ODOO_TEST_DOCKERFILE: config/Dockerfile.test
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build PostgreSQL and Odoo 18 with Chrome
-        run: docker compose -f docker-compose.test.yml build --pull
+      - name: Download test images
+        uses: actions/download-artifact@v8
+        with:
+          name: odoo18-test-images.tar.gz
+          path: ${{ runner.temp }}
+
+      - name: Load test images
+        run: docker image load --input "$RUNNER_TEMP/odoo18-test-images.tar.gz"
+
       - name: Install and exercise the selected workflow
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p test-results
           compose=(docker compose -f docker-compose.test.yml)
-          if [[ "$TEST_SUITE" == refund-races ]]; then
-            "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_v18_test \
+          if [[ "$TEST_SUITE" == *-races ]]; then
+            "${compose[@]}" run --rm -T --pull never odoo odoo --database=odoo_square_v18_test \
               --init="$ODOO_INIT_MODULES" --stop-after-init --no-http 2>&1 \
               | tee test-results/install.log
-            printf '%s\n' \
-              'from odoo.addons.payment_square_online.tests.test_refund_concurrency import run' \
-              'run(env.registry)' \
-              | "${compose[@]}" run --rm -T odoo odoo shell --database=odoo_square_v18_test --no-http 2>&1 \
-              | tee test-results/refund-races.log
-            grep -Eq '^Ran 2 tests in ' test-results/refund-races.log
-            grep -Eq '^OK$' test-results/refund-races.log
+            case "$TEST_SUITE" in
+              refund-races)
+                suite_module=payment_square_online.tests.test_refund_concurrency
+                suite_result='^Ran 2 tests in '
+                ;;
+              terminal-admission-races)
+                suite_module=pos_square_terminal.tests.test_terminal_admission_concurrency
+                suite_result='^Ran 1 test in '
+                ;;
+            esac
+            printf '%s\n' "from odoo.addons.$suite_module import run" 'run(env.registry)' \
+              | "${compose[@]}" run --rm -T --pull never odoo odoo shell --database=odoo_square_v18_test --no-http 2>&1 \
+              | tee "test-results/$TEST_SUITE.log"
+            grep -Eq "$suite_result" "test-results/$TEST_SUITE.log"
+            grep -Eq '^OK$' "test-results/$TEST_SUITE.log"
           else
-            "${compose[@]}" run --rm -T odoo odoo --database=odoo_square_v18_test \
+            "${compose[@]}" run --rm -T --pull never odoo odoo --database=odoo_square_v18_test \
               --init="$ODOO_INIT_MODULES" --test-tags="$ODOO_TEST_TAGS" \
               --workers=0 --stop-after-init --log-level=test 2>&1 | tee test-results/odoo-tests.log
             log=test-results/odoo-tests.log
             grep -Eq '(^|[[:space:]])0 failed, 0 error\(s\) of [1-9][0-9]* tests when loading database' "$log"
-            if grep -Eq 'odoo\.addons\.(odoo_square|payment_square_online)\.tests\..*: skipped ' "$log"; then
+            if grep -Eq 'odoo\.addons\.(odoo_square|payment_square_online|pos_square_terminal)\.tests\..*: skipped ' "$log"; then
               echo 'A required addon test was skipped.' >&2
               exit 1
             fi
-            if [[ "$TEST_SUITE" != pos ]]; then
-              grep -Fq 'Starting TestSquareCheckout.test_mobile_browser_can_cancel_and_complete_square_authentication ' "$log"
-            fi
-            if [[ "$TEST_SUITE" != online ]]; then
-              grep -Eq 'odoo\.addons\.odoo_square\.tests\..*: Starting ' "$log"
-            fi
-            if [[ "$TEST_SUITE" == combined ]]; then
-              grep -Fq 'Starting TestSquareCoexistence.' "$log"
+            case "$TEST_SUITE" in
+              online|combined|terminal-combined)
+                grep -Fq 'Starting TestSquareCheckout.test_mobile_browser_can_cancel_and_complete_square_authentication ' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              pos|combined|terminal-importer|terminal-combined)
+                grep -Eq 'odoo\.addons\.odoo_square\.tests\..*: Starting ' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              combined|terminal-combined)
+                grep -Fq 'Starting TestSquareCoexistence.' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              terminal|terminal-importer|terminal-combined)
+                grep -Fq 'Starting TestSquareTerminalCheckout.test_first_card_is_verified_on_original_sale ' "$log"
+                ;;
+              terminal-discounts)
+                grep -Fq 'Starting TestSquareTerminalGlobalDiscount.test_global_discount_reaches_square_with_tax_and_itemized_odoo_receipt ' "$log"
+                ;;
+            esac
+            case "$TEST_SUITE" in
+              terminal-importer|terminal-combined)
+                grep -Fq 'Starting TestSquareTerminalImport.' "$log"
+                ;;
+            esac
+            if [[ "$TEST_SUITE" == terminal-combined ]]; then
+              grep -Fq 'Starting TestSquareCoexistence.test_website_and_terminal_ownership_coexist_at_the_same_square_location ' "$log"
             fi
           fi
 

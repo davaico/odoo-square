@@ -2,7 +2,7 @@
 
 Thank you for helping improve the Odoo Square Integration.
 
-This project is an Odoo addon, so changes should follow Odoo module conventions, preserve upgrade safety, and include tests for behavior that affects accounting, inventory, webhooks, or data synchronization.
+Follow Odoo module conventions and preserve upgrade safety for installed addons.
 
 ## Development Principles
 
@@ -20,7 +20,7 @@ Follow the [Quick Start](README.md#quick-start) for Odoo 18 Community and the [d
 
 ## Tests
 
-Run the [full addon test suite](README.md#testing) on a fresh database before opening a pull request.
+Before opening a pull request, run the full suite for each affected addon on a fresh database. For changes to shared workflows, include the relevant coexistence suites. [Test instructions](README.md#testing)
 
 Tests should be added or updated when a change affects:
 
